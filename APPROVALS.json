@@ -137,6 +137,42 @@
       "reason": "The old status just alternated two words; a real spinner clearly communicates the agent is alive and working.",
       "effect": "Verified under a PTY: frames like '⠋ connecting… 0s (ctrl-c to interrupt)' render and advance during a live GROQ call.",
       "status": "done"
+    },
+    {
+      "id": "A016",
+      "date": "2026-09-11",
+      "category": "feature",
+      "what": "Add session persistence: /save [name], /resume [name], /list, /delete <name>, /new commands, an automatic same-conversation snapshot (~/.vibecoder/last.json) saved after every turn and on exit, and a --resume CLI flag. Sessions live in ~/.vibecoder/sessions/*.json and are restored with provider, model, cwd, system prompt and full message history.",
+      "reason": "Vibecoder had zero memory — closing the app lost the whole conversation, which made multi-session coding work impossible.",
+      "effect": "Verified live: /save sessdemo + /list work; restarting with --resume restored the conversation and the resumed model remembered and continued the earlier task.",
+      "status": "done"
+    },
+    {
+      "id": "A017",
+      "date": "2026-09-11",
+      "category": "feature",
+      "what": "Add two new tools: list_dir (directory listing with subdirectories first and file sizes, defaults to the working directory) and fetch_url (transfers an HTTP URL's body as text, with HTTP status, content-type, byte count and a maxChars cap).",
+      "reason": "The agent could grep/glob but could not see a plain directory listing or read web docs — both are core coding-agent capabilities.",
+      "effect": "Verified live: the agent used list_dir on src/tools and fetch_url on example.com in one session, correctly.",
+      "status": "done"
+    },
+    {
+      "id": "A018",
+      "date": "2026-09-11",
+      "category": "feature",
+      "what": "Loop polish: --max-steps CLI flag (bounded agent loop), temperature + max_tokens passed from config into every LLM request, a much richer default system prompt (tool roles, safety rules, retry-don't-give-up guidance), and reasoning_content passthrough for providers that stream chain-of-thought (displayed dimly as '[reasoning]').",
+      "reason": "Let the user tune how far the agent recurses, keep generation settings in one place, give the model better operating instructions, and surface hidden reasoning from supporting models.",
+      "effect": "All parameterised from config.json/CLI; verified by tests + typecheck (live reasoning display depends on a reasoning-capable provider).",
+      "status": "done"
+    },
+    {
+      "id": "A019",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Remove the default max_tokens=4096 I briefly added to config.json — GROQ's free tier limits output tokens per minute to 1000, so it immediately 429-rate-limited every request. max_tokens stays optional/plumbed but is NOT sent unless the user sets it.",
+      "reason": "A global 4096-token generation ceiling broke the only working provider (GROQ) that has an API key in this environment.",
+      "effect": "GROQ prompts work again immediately (verified live). Temperature stays configurable.",
+      "status": "done"
     }
   ]
 }

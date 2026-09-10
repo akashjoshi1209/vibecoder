@@ -18,6 +18,7 @@ export interface ChatChunk {
   content: string;
   tool_calls?: Partial<ToolCall>[];
   finish_reason?: string | null;
+  reasoning?: string;
 }
 
 export interface ChatOptions {
@@ -54,6 +55,7 @@ export interface StreamResult {
   text: string;
   toolCalls: ToolCall[];
   finishReason: string | null;
+  reasoning?: string;
 }
 
 export interface LLMProvider {

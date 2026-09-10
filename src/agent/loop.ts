@@ -4,6 +4,7 @@ import { parseToolCalls } from "./tool-call";
 
 export interface AgentCallbacks {
   onModelText?: (text: string) => void;
+  onReasoning?: (text: string) => void;
   onToolStart?: (name: string, args: Record<string, unknown>) => void;
   onToolEnd?: (name: string, result: string) => void;
   onDone?: (result: StreamResult) => void;
@@ -26,6 +27,7 @@ export async function runAgent(
     initialMessages: Message[];
     toolCtx: ToolContext;
     signal?: AbortSignal;
+    chatOptions?: Partial<ChatOptions>;
   },
   callbacks: AgentCallbacks = {},
 ): Promise<AgentResult> {
@@ -45,11 +47,13 @@ export async function runAgent(
       messages,
       tools: toolDefs,
       signal: options.signal,
+      ...options.chatOptions,
     };
 
     let result: StreamResult;
     try {
       result = await options.provider(chatOpts, (chunk) => {
+        if (chunk.reasoning) callbacks.onReasoning?.(chunk.reasoning);
         if (chunk.content) callbacks.onModelText?.(chunk.content);
       });
     } catch (err: any) {

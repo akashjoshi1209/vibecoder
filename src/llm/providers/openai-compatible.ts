@@ -88,6 +88,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     let text = "";
     const toolCalls: ToolCall[] = [];
     let finishReason: string | null = null;
+    let reasoning = "";
 
     const processLine = (line: string) => {
       if (!line.startsWith("data:")) return;
@@ -106,6 +107,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
       if (delta.content) {
         text += delta.content;
         onChunk({ content: delta.content });
+      }
+
+      const reason = delta.reasoning_content ?? delta.reasoning;
+      if (reason) {
+        reasoning += reason;
+        onChunk({ content: "", reasoning: reason });
       }
 
       if (delta.tool_calls) {
@@ -140,6 +147,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const rest = buffer.trim();
     if (rest) processLine(rest);
 
-    return { text, toolCalls, finishReason };
+    return { text, toolCalls, finishReason, reasoning: reasoning || undefined };
   }
 }

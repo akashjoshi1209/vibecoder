@@ -1,7 +1,61 @@
 import { registerTool, type ToolContext } from "./registry";
 import { resolve } from "./fs-utils";
-import { dirname } from "node:path";
-import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { mkdirSync, readdirSync, statSync } from "node:fs";
+
+function formatSize(n: number): string {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}K`;
+  return `${(n / (1024 * 1024)).toFixed(1)}M`;
+}
+
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "list_dir",
+      description:
+        "List the contents of a directory (non-recursive). Subdirectories are shown first with a trailing slash, then files with their size.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Directory to list (optional, defaults to the working directory)" },
+        },
+        required: [],
+      },
+    },
+  },
+  async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    const p = args.path ? resolve(String(args.path), ctx) : ctx.cwd;
+    let entries;
+    try {
+      entries = readdirSync(p, { withFileTypes: true });
+    } catch (err: any) {
+      return `ERROR: cannot list directory: ${err?.message ?? String(err)}`;
+    }
+    const rows: string[] = [];
+    for (const e of entries.sort((a, b) => {
+      if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    })) {
+      if (e.isDirectory()) {
+        rows.push(`${e.name}/`);
+      } else if (e.isFile()) {
+        let size = "";
+        try {
+          const st = statSync(join(p, e.name));
+          size = formatSize(st.size);
+        } catch {
+          size = "?";
+        }
+        rows.push(`${e.name}\t${size}`);
+      } else {
+        rows.push(`${e.name}  (${e.isSymbolicLink() ? "symlink" : "special"})`);
+      }
+    }
+    return rows.length ? rows.join("\n") : `(empty directory: ${p})`;
+  },
+});
 
 registerTool({
   definition: {

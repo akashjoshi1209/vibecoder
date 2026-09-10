@@ -8,6 +8,8 @@ export interface RootConfig {
   model: string;
   providers: Record<string, ProviderConfig>;
   systemPrompt?: string;
+  temperature?: number;
+  maxTokens?: number;
 }
 
 const DEFAULT_CONFIG_PATH = (() => {

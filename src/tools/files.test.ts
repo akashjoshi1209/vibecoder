@@ -105,3 +105,31 @@ describe("edit_file", () => {
     expect(res).toMatch("ERROR");
   });
 });
+
+describe("list_dir", () => {
+  test("lists subdirectories first, then files with sizes", async () => {
+    setup();
+    await executeTool("write_file", { path: join(tmpDir, "zz.txt"), content: "12345" }, ctx);
+    await executeTool("write_file", { path: join(tmpDir, "sub", "inner.txt"), content: "x" }, ctx);
+    const res = await executeTool("list_dir", {}, ctx);
+    expect(res).toContain("sub/");
+    expect(res).toContain("zz.txt");
+    // subdirectory sorts before files
+    expect(res.indexOf("sub/")).toBeLessThan(res.indexOf("zz.txt"));
+    // file has a human-readable size
+    expect(res).toMatch(/zz\.txt\s+5B/);
+  });
+
+  test("lists an explicit path argument", async () => {
+    setup();
+    await executeTool("write_file", { path: join(tmpDir, "sub", "inner.txt"), content: "x" }, ctx);
+    const res = await executeTool("list_dir", { path: "sub" }, ctx);
+    expect(res).toContain("inner.txt");
+  });
+
+  test("returns an error for a missing directory", async () => {
+    setup();
+    const res = await executeTool("list_dir", { path: join(tmpDir, "missing") }, ctx);
+    expect(res).toMatch("ERROR");
+  });
+});
