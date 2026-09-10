@@ -1,0 +1,31 @@
+{
+  "provider": "groq",
+  "model": "qwen/qwen3.8-27b",
+  "providers": {
+    "groq": {
+      "type": "openai-compatible",
+      "baseURL": "https://api.groq.com/openai/v1",
+      "apiKeyEnv": "GROQ_API_KEY",
+      "models": ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound"]
+    },
+    "ollama": {
+      "type": "openai-compatible",
+      "baseURL": "http://localhost:11434/v1",
+      "apiKeyEnv": "",
+      "models": ["qwen2.5:1.5b", "llama3.1"]
+    },
+    "openai": {
+      "type": "openai-compatible",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "models": ["gpt-4o", "gpt-4o-mini"]
+    },
+    "anthropic": {
+      "type": "anthropic",
+      "baseURL": "https://api.anthropic.com/v1",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "models": ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"]
+    }
+  },
+  "systemPrompt": "You are Vibecoder, an autonomous AI coding agent. You help the user write, read, and modify code. You have access to tools (bash, read_file, write_file, edit_file, glob, grep). Think step by step, decide what to do, call the tools you need, observe the results, and keep going until the task is complete."
+}

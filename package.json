@@ -1,0 +1,21 @@
+{
+  "name": "vibecoder",
+  "version": "0.1.0",
+  "description": "A custom AI coding agent - fully yours, no limitations",
+  "type": "module",
+  "bin": {
+    "vibecoder": "./bin/vibecoder.js"
+  },
+  "scripts": {
+    "dev": "bun run src/cli.ts",
+    "start": "bun run src/cli.ts",
+    "build": "bun build src/cli.ts --outdir dist --target bun",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}
