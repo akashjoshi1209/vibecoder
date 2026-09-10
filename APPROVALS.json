@@ -119,6 +119,24 @@
       "reason": "The new timeout/abort/injection logic needs regression coverage.",
       "effect": "bun test now runs 70 tests, all passing (added --timeout=30000 to the test script because every subprocess spawn costs ~5s in this proot environment).",
       "status": "done"
+    },
+    {
+      "id": "A014",
+      "date": "2026-09-11",
+      "category": "feature",
+      "what": "Add scrollback to the TUI: PageUp/PageDown scroll through conversation history (also while the agent is busy), with a live indicator in the status bar (e.g. ↑20/62) showing how far up you are.",
+      "reason": "Long agent output scrolled off screen with no way to re-read it.",
+      "effect": "Verified in a real PTY: PageUp 2x then PageDown restores earlier content and the ↑20/62 marker updates correctly.",
+      "status": "done"
+    },
+    {
+      "id": "A015",
+      "date": "2026-09-11",
+      "category": "feature",
+      "what": "Add an animated spinner (⠋⠙⠹…) plus an elapsed-seconds counter to the status bar while the agent is working, alongside the existing ctrl-c hint.",
+      "reason": "The old status just alternated two words; a real spinner clearly communicates the agent is alive and working.",
+      "effect": "Verified under a PTY: frames like '⠋ connecting… 0s (ctrl-c to interrupt)' render and advance during a live GROQ call.",
+      "status": "done"
     }
   ]
 }

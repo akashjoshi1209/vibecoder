@@ -85,6 +85,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
     print(`  ${colors.green}/clear${colors.reset}            clear conversation + screen`);
     print(`  ${colors.green}/help${colors.reset}             this help`);
+    print(`  ${colors.dim}PageUp/PageDown${colors.reset}       scroll back through the conversation`);
     print(`  ${colors.green}ctrl-c${colors.reset}            interrupt running task · clear input · exit\n`);
     return true;
   }
@@ -148,11 +149,14 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
   activeAbort = ac;
   const startedAt = Date.now();
   let streaming = false;
+  const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let spin = 0;
   const statusTimer = tui
     ? setInterval(() => {
         const secs = Math.round((Date.now() - startedAt) / 1000);
-        tui?.setStatus(`${streaming ? "thinking" : "connecting"}… ${secs}s (ctrl-c to interrupt)`, 8);
-      }, 100)
+        const label = streaming ? "thinking" : "connecting";
+        tui?.setStatus(`${spinnerFrames[spin++ % spinnerFrames.length]} ${label}… ${secs}s (ctrl-c to interrupt)`, 8);
+      }, 120)
     : null;
 
   try {

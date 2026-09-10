@@ -28,6 +28,7 @@ export class TUI {
   scrollback: StreamLine[] = [];
   private stream: StreamLine = { text: "" };
   private status: StatusLine = { text: "" };
+  private scrollOffset = 0;
   private input = "";
   private cursor = 0;
   private history: string[] = [];
@@ -80,6 +81,8 @@ export class TUI {
       if (this.busy) {
         if (ev.kind === "ctrl-c") this.callbacks.onAbort();
         else if (ev.kind === "ctrl-l") this.render();
+        else if (ev.kind === "pageup") { this.scrollBy(this.pageSize()); this.render(); }
+        else if (ev.kind === "pagedown") { this.scrollBy(-this.pageSize()); this.render(); }
         continue;
       }
       this.handleIdle(ev);
@@ -177,6 +180,12 @@ export class TUI {
       case "ctrl-l":
         this.render();
         break;
+      case "pageup":
+        this.scrollBy(this.pageSize());
+        break;
+      case "pagedown":
+        this.scrollBy(-this.pageSize());
+        break;
       case "esc":
       default:
         break;
@@ -196,6 +205,14 @@ export class TUI {
         this.printToScrollback(paint(`  ${matches.join("  ")}`, 7), true);
       }
     }
+  }
+
+  private pageSize(): number {
+    return Math.max(1, this.rows - 4);
+  }
+
+  private scrollBy(delta: number): void {
+    this.scrollOffset = Math.max(0, this.scrollOffset + delta);
   }
 
   private submit(): void {
@@ -255,6 +272,7 @@ export class TUI {
   clearScrollback(): void {
     this.scrollback = [];
     this.stream = { text: "" };
+    this.scrollOffset = 0;
     this.render();
   }
 
@@ -307,7 +325,11 @@ export class TUI {
         rendered.push(this.stream.color !== undefined ? paint(s, this.stream.color) : s);
       }
     }
-    const vis = rendered.slice(-contentRows);
+    const total = rendered.length;
+    this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, total - contentRows));
+    const endIdx = total - this.scrollOffset;
+    const startIdx = Math.max(0, endIdx - contentRows);
+    const vis = rendered.slice(startIdx, endIdx);
 
     // Move to origin (top of alt screen) and repaint
     let output = "\x1b[H";
@@ -317,9 +339,13 @@ export class TUI {
       output += line ? line + "\x1b[K" : "\x1b[K";
     }
 
-    // status row
+    // status row (with a scroll-back indicator when the user has paged up)
+    let statusText = this.status.text;
+    if (this.scrollOffset > 0) {
+      statusText = `${statusText}  ${ansi.dim}↑${this.scrollOffset}/${total}${ansi.reset}`;
+    }
     output += `\x1b[${this.rows - 1};1H`;
-    output += this.status.text ? paint(this.status.text.slice(0, colW), this.status.color) + "\x1b[K" : "\x1b[K";
+    output += statusText ? paint(statusText.slice(0, colW), this.status.color) + "\x1b[K" : "\x1b[K";
 
     // input row
     const inputRow = this.rows;
