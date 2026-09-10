@@ -113,8 +113,8 @@ export class OpenAICompatibleProvider implements LLMProvider {
           const idx = tc.index ?? 0;
           while (toolCalls.length <= idx) toolCalls.push({ id: "", name: "", arguments: "" });
           const current = toolCalls[idx];
-          if (tc.id) current.id += tc.id;
-          if (tc.function?.name) current.name += tc.function.name;
+          if (tc.id && !current.id) current.id = tc.id;
+          if (tc.function?.name && !current.name) current.name = tc.function.name;
           if (tc.function?.arguments) current.arguments += tc.function.arguments;
         }
         onChunk({
@@ -136,6 +136,9 @@ export class OpenAICompatibleProvider implements LLMProvider {
         if (trimmed) processLine(trimmed);
       }
     }
+
+    const rest = buffer.trim();
+    if (rest) processLine(rest);
 
     return { text, toolCalls, finishReason };
   }

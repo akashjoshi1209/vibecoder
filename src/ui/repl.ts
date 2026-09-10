@@ -162,7 +162,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
         systemPrompt,
         model: llmModel,
         initialMessages: messages,
-        toolCtx: { cwd },
+        toolCtx: { cwd, signal: ac.signal },
         signal: ac.signal,
       },
       {

@@ -10,7 +10,8 @@
     "dev": "bun run src/cli.ts",
     "start": "bun run src/cli.ts",
     "build": "bun build src/cli.ts --outdir dist --target bun",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test --timeout=30000"
   },
   "dependencies": {},
   "devDependencies": {

@@ -65,6 +65,60 @@
       "reason": "Every fix needs regression coverage so future changes cannot silently break it.",
       "effect": "bun test now runs 57 tests, all passing.",
       "status": "done"
+    },
+    {
+      "id": "A008",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Fix streaming provider tool-call parsing: tool call id and name are now set once (idempotent) instead of being re-appended on every chunk, and the last partial SSE line is flushed before the stream ends.",
+      "reason": "Multi-chunk tool calls could get mangled ids/names like 'call_abcall_ab', and a final partial chunk could be silently dropped, making tool calls fail only sometimes.",
+      "effect": "Tool calls now parse correctly for any streaming length (verified live on GROQ: grep + read_file both worked).",
+      "status": "done"
+    },
+    {
+      "id": "A009",
+      "date": "2026-09-11",
+      "category": "robustness",
+      "what": "Add an AbortSignal to the tool context and wire it into the bash tool: Ctrl+C / client abort now kills the running shell (process group) instead of leaving it orphaned.",
+      "reason": "A hanging command previously kept running after the user aborted, wasting resources.",
+      "effect": "Cancel is clean and immediate.",
+      "status": "done"
+    },
+    {
+      "id": "A010",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Make the bash tool actually enforce its timeout: a command that runs too long is killed (whole process group, so grandchildren die too) and the result notes 'timed out'.",
+      "reason": "The timeout parameter was declared but never enforced — a hanging command could block the agent forever.",
+      "effect": "Hangs are now bounded and reported as timed out.",
+      "status": "done"
+    },
+    {
+      "id": "A011",
+      "date": "2026-09-11",
+      "category": "security",
+      "what": "Harden the grep tool against shell injection: it now spawns grep directly (execve style) with '--' so patterns starting with a dash are safe, and patterns containing shell metacharacters can no longer run arbitrary commands.",
+      "reason": "The model trusts the user's prompt; a malicious pattern could have executed shell commands on the host.",
+      "effect": "Patterns like 'x$(touch /tmp/pwned)' are inert (covered by a test).",
+      "status": "done"
+    },
+    {
+      "id": "A012",
+      "date": "2026-09-11",
+      "category": "robustness",
+      "what": "Gracefully report grep/glob failures as clear ERROR messages instead of crashing, and validate config/repl path handling.",
+      "reason": "A missing directory or bad glob used to throw raw errors out of the agent loop.",
+      "effect": "The agent gets a readable 'ERROR: ...' result to react to.",
+      "status": "done"
+    },
+    {
+      "id": "A013",
+      "date": "2026-09-11",
+      "category": "test",
+      "what": "Add tests for the bash and search tools (13 new tests): output capture, stderr + exit codes, timeout kill, workdir, grep include filter, injection safety, dash-prefixed patterns, missing dirs, and glob behaviour.",
+      "reason": "The new timeout/abort/injection logic needs regression coverage.",
+      "effect": "bun test now runs 70 tests, all passing (added --timeout=30000 to the test script because every subprocess spawn costs ~5s in this proot environment).",
+      "status": "done"
     }
   ]
 }

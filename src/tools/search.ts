@@ -23,8 +23,12 @@ registerTool({
     const pattern = String(args.pattern ?? "");
     const dir = args.cwd ? String(args.cwd) : ctx.cwd;
     const matches: string[] = [];
-    const r = new Bun.Glob(pattern).scan({ cwd: dir, onlyFiles: true });
-    for await (const m of r) matches.push(m);
+    try {
+      const r = new Bun.Glob(pattern).scan({ cwd: dir, onlyFiles: true });
+      for await (const m of r) matches.push(m);
+    } catch (err: any) {
+      return `ERROR: glob failed: ${err?.message ?? String(err)}`;
+    }
     const list = matches.slice(0, MAX_RESULTS);
     let out = list.sort().join("\n");
     if (matches.length === 0) out = "(no matches)";
@@ -54,23 +58,25 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const pattern = String(args.pattern ?? "");
     const dir = args.path ? String(args.path) : ctx.cwd;
-    const include = args.include ? String(args.include) : undefined;
+    const include = args.include ? String(args.include) : "*";
 
     const proc = Bun.spawn({
-      cmd: ["bash", "-lc", `LC_ALL=C grep -rn --include='${include ?? "*"}' -E "${pattern.replace(/"/g, '\\"')}" "${dir}" || true`],
+      cmd: ["grep", "-rn", "-E", "-e", pattern, `--include=${include}`, "--", dir],
       stdout: "pipe",
       stderr: "pipe",
       env: { ...process.env, NO_COLOR: "1" },
     });
-    const [out, err] = await Promise.all([
+    const [out, err, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
+      proc.exited,
     ]);
-    await proc.exited;
     const lines = out.split("\n").filter(Boolean);
     const shown = lines.slice(0, MAX_RESULTS);
-    let result = shown.join("\n") || "(no matches)";
-    if (lines.length > MAX_RESULTS) result += `\n...(${lines.length - MAX_RESULTS} more)`;
+    let result = shown.join("\n");
+    if (exitCode !== 0 && !lines.length) result += (err.trim() ? `ERROR: ${err.trim()}` : "");
+    if (!lines.length) result = result.trim() || "(no matches)";
+    else if (lines.length > MAX_RESULTS) result += `\n...(${lines.length - MAX_RESULTS} more)`;
     return result;
   },
 });

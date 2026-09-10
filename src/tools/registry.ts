@@ -2,6 +2,7 @@ import type { ToolDefinition } from "../llm/types";
 
 export interface ToolContext {
   cwd: string;
+  signal?: AbortSignal;
 }
 
 export interface Tool {

@@ -23,7 +23,7 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const command = String(args.command ?? "");
     const cwd = args.workdir ? String(args.workdir) : ctx.cwd;
-    const timeout = Number(args.timeout ?? 120000);
+    const timeout = Math.max(0, Number(args.timeout ?? 120000));
 
     const proc = Bun.spawn({
       cmd: ["bash", "-lc", command],
@@ -31,20 +31,40 @@ registerTool({
       stdout: "pipe",
       stderr: "pipe",
       env: { ...process.env, NO_COLOR: "1" },
+      detached: true,
     });
 
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
+    const killTree = () => {
+      try { process.kill(-proc.pid, "SIGKILL"); } catch {
+        try { proc.kill(); } catch {}
+      }
+    };
 
-    let output = "";
-    if (stdout) output += stdout;
-    if (stderr) output += stderr ? (output ? "\n" : "") + stderr : "";
-    if (exitCode !== 0) output += (output ? "\n" : "") + `[exit code: ${exitCode}]`;
-    if (!output) output = "(no output)";
+    let timedOut = false;
+    const timer = timeout > 0 ? setTimeout(() => {
+      timedOut = true;
+      killTree();
+    }, timeout) : null;
+    ctx.signal?.addEventListener("abort", killTree, { once: true });
 
-    return output.length > MAX_OUTPUT ? output.slice(0, MAX_OUTPUT) + `\n...[truncated ${output.length - MAX_OUTPUT} chars]` : output;
+    try {
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+
+      let output = "";
+      if (stdout) output += stdout;
+      if (stderr) output += stderr ? (output ? "\n" : "") + stderr : "";
+      if (exitCode !== 0) output += (output ? "\n" : "") + `[exit code: ${exitCode}]`;
+      if (timedOut) output += (output ? "\n" : "") + `[killed: timed out after ${timeout}ms]`;
+      if (!output) output = "(no output)";
+
+      return output.length > MAX_OUTPUT ? output.slice(0, MAX_OUTPUT) + `\n...[truncated ${output.length - MAX_OUTPUT} chars]` : output;
+    } finally {
+      if (timer) clearTimeout(timer);
+      ctx.signal?.removeEventListener("abort", killTree);
+    }
   },
 });
