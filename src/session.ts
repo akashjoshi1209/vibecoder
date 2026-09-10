@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Message } from "./llm/types";
@@ -68,7 +68,6 @@ export function deleteSession(id: string): boolean {
   const f = sessionFile(id);
   if (!existsSync(f)) return false;
   try {
-    const { rmSync } = require("node:fs") as typeof import("node:fs");
     rmSync(f, { force: true });
     return true;
   } catch {

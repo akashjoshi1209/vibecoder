@@ -173,6 +173,24 @@
       "reason": "A global 4096-token generation ceiling broke the only working provider (GROQ) that has an API key in this environment.",
       "effect": "GROQ prompts work again immediately (verified live). Temperature stays configurable.",
       "status": "done"
+    },
+    {
+      "id": "A020",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Change the ollama provider baseURL from http://localhost:11434/v1 to http://127.0.0.1:11434/v1 (the server binds IPv4 only, so 'localhost' could fail on hosts that resolve it to ::1). Also strengthen the system prompt with an explicit tool-path rule: paths are relative to the project directory, never prefixed with a leading slash.",
+      "reason": "The localhost → ::1 ambiguity is a classic silent failure; and a small 1.5b local model produced '/src/tools' during e2e, so the prompt now states the relative-path rule explicitly.",
+      "effect": "Ollama e2e verified: vibecoder --provider ollama ran list_dir('src/tools') and answered with the correct count of 9 .ts files.",
+      "status": "done"
+    },
+    {
+      "id": "A021",
+      "date": "2026-09-11",
+      "category": "docs",
+      "what": "Update README: document the session commands (/save /resume /list /delete /new), --resume, --max-steps, PageUp/PageDown scrollback, temperature config option, and the new list_dir / fetch_url tools and net.ts / session.ts modules.",
+      "reason": "The README documented the app before Phases 3-4 added scrollback, sessions and new tools.",
+      "effect": "Docs now match the implemented behavior.",
+      "status": "done"
     }
   ]
 }

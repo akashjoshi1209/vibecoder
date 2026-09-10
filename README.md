@@ -15,6 +15,9 @@ bun link   # puts the `vibecoder` command on your PATH (re-run after changes to 
 vibecoder                        # interactive TUI REPL
 vibecoder --prompt "task"        # single-shot (auto-falls back to line REPL when no TTY)
 vibecoder --provider ollama --model qwen2.5:1.5b --prompt "task"
+vibecoder --resume               # resume your most recent conversation
+vibecoder --resume mysession     # resume a named saved session
+vibecoder --max-steps 10         # cap the agent loop (default 40)
 vibecoder --cwd /some/path
 bun run dev                      # equivalent to `vibecoder` from the repo dir
 ```
@@ -31,6 +34,7 @@ Keys
 - `ctrl-c` — interrupt a running task · clear the input line · exit when idle
 - arrows / Home / End / `ctrl-left` / `ctrl-right` — move the cursor
 - `Up` / `Down` — history; `Tab` — command completion
+- `PageUp` / `PageDown` — scroll through the conversation scrollback (`↑N/M` indicator in the status bar)
 - `ctrl-w` kill word · `ctrl-u` clear line · `ctrl-l` redraw
 
 Input and commands
@@ -38,6 +42,11 @@ Input and commands
 - `/provider <name>` — switch provider (groq, ollama, openai, anthropic…)
 - `/model <id>` — switch model
 - `/approve [on|off]` — toggle per-tool approval prompts. Default **off** = no limits (agents act freely). With it on, each tool call asks `[y/n/a]` — `a` approves the rest of the run.
+- `/save [name]` — save this conversation (auto-saved snapshots kept in `~/.vibecoder/last.json`)
+- `/resume [name]` — resume a saved conversation (or the last one)
+- `/list` — list saved conversations (saved to `~/.vibecoder/sessions/`)
+- `/delete <name>` — delete a saved conversation
+- `/new` — start a fresh conversation (keeps provider/model)
 - `/clear` — clear the conversation and screen
 - `/help` — command help
 - `exit` or `quit` — leave the REPL outside the TUI; `ctrl-c` when idle inside the TUI
@@ -45,6 +54,7 @@ Input and commands
 ## Configuration (`config.json`)
 
 - `provider` / `model` — defaults
+- `temperature` — model sampling temperature (optional; passed through on every request)
 - `providers` — add any OpenAI-compatible endpoint (GROQ, Ollama, OpenAI, NVIDIA NIM, local vLLM, etc.) or Anthropic. One entry per provider.
 - `systemPrompt` — your agent's system instructions. Change it to change behavior entirely.
 
@@ -85,14 +95,16 @@ src/
 │   └── providers/  openai-compatible.ts, anthropic.ts
 ├── tools/
 │   ├── registry.ts tool registry (this is the extension point)
-│   ├── bash.ts     shell commands
-│   ├── files.ts    read_file / write_file / edit_file
+│   ├── bash.ts     shell commands (timeout + process-group kill)
+│   ├── files.ts    read_file / write_file / edit_file / list_dir
 │   ├── search.ts   glob / grep
+│   ├── net.ts      fetch_url (read web pages/docs, capped output)
 │   └── fs-utils.ts
+├── session.ts      conversation persistence (~/.vibecoder/sessions/)
 └── ui/
-    ├── tui.ts      full-screen terminal UI (render, keys, streaming, approvals)
+    ├── tui.ts      full-screen terminal UI (render, keys, scrolling, streaming, approvals)
     ├── terminal.ts low-level terminal layer (raw mode, keys, ANSI-aware wrapping)
-    └── repl.ts     TUI ⇄ line-mode dispatch, slash commands, agent wiring
+    └── repl.ts     TUI ⇄ line-mode dispatch, slash commands, session mgmt, agent wiring
 ```
 
 ## Extension points (no-limitation design)
