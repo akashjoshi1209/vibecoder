@@ -31,5 +31,6 @@ export function createProvider(config: RootConfig, providerName?: string): { pro
   } else {
     provider = new OpenAICompatibleProvider(pc);
   }
-  return { provider, model: config.model, name };
+  const model = pc.models.includes(config.model) ? config.model : (pc.models[0] ?? config.model);
+  return { provider, model, name };
 }

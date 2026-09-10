@@ -1,5 +1,7 @@
 import { registerTool, type ToolContext } from "./registry";
 import { resolve } from "./fs-utils";
+import { dirname } from "node:path";
+import { mkdirSync } from "node:fs";
 
 registerTool({
   definition: {
@@ -51,6 +53,7 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const p = resolve(String(args.path), ctx);
     const content = String(args.content ?? "");
+    mkdirSync(dirname(p), { recursive: true });
     await Bun.write(p, content);
     return `Wrote ${content.length} bytes to ${p}`;
   },

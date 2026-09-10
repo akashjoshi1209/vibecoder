@@ -20,11 +20,11 @@
       "apiKeyEnv": "OPENAI_API_KEY",
       "models": ["gpt-4o", "gpt-4o-mini"]
     },
-    "anthropic": {
+"anthropic": {
       "type": "anthropic",
       "baseURL": "https://api.anthropic.com/v1",
       "apiKeyEnv": "ANTHROPIC_API_KEY",
-      "models": ["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"]
+      "models": ["claude-sonnet-4-5", "claude-3-5-haiku-latest"]
     }
   },
   "systemPrompt": "You are Vibecoder, an autonomous AI coding agent. You help the user write, read, and modify code. You have access to tools (bash, read_file, write_file, edit_file, glob, grep). Think step by step, decide what to do, call the tools you need, observe the results, and keep going until the task is complete."

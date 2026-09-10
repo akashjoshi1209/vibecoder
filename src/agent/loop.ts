@@ -89,6 +89,17 @@ export async function runAgent(
 
     for (const call of parsed) {
       toolCalls++;
+      if (!call.name) {
+        const id = call.id || `call_${toolCalls}`;
+        messages.push({
+          role: "tool",
+          tool_call_id: id,
+          content:
+            "ERROR: the model emitted a tool call with no function name. Reissue a valid tool call or finish by responding with plain text.",
+          name: "unknown",
+        });
+        continue;
+      }
       callbacks.onToolStart?.(call.name, call.args);
       let output: string;
       let approved = true;

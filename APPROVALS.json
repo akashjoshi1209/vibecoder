@@ -20,6 +20,51 @@
       "reason": "Vibecoder had no version control, so every future improvement is hard to review or roll back.",
       "effect": "Every improvement from now on is a clean, reviewable git change.",
       "status": "done"
+    },
+    {
+      "id": "A003",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Fix provider/model selection: switching provider (--provider or /provider) now automatically uses a valid model for that provider instead of always reusing the GROQ default model.",
+      "reason": "Sending a GROQ model id to OpenAI, Anthropic or Ollama was guaranteed to fail, so provider switching was broken.",
+      "effect": "`vibecoder --provider ollama` now correctly uses qwen2.5:1.5b, `--provider anthropic` uses claude-sonnet-4-5, etc.",
+      "status": "done"
+    },
+    {
+      "id": "A004",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Make the write_file tool create missing parent directories automatically.",
+      "reason": "The tool description promised it creates parent directories but the code crashed when they were missing.",
+      "effect": "Writing to new nested paths (e.g. src/utils/deep/file.ts) now works.",
+      "status": "done"
+    },
+    {
+      "id": "A005",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Harden the agent loop against malformed tool calls: a tool call with no function name now gets a helpful error message back to the model instead of being executed as garbage.",
+      "reason": "A model sometimes streams an empty tool name; the old code would execute an unknown empty-named tool and create noise.",
+      "effect": "The agent tells the model to reissue a valid call or finish — no more silent confusion.",
+      "status": "done"
+    },
+    {
+      "id": "A006",
+      "date": "2026-09-11",
+      "category": "bug-fix",
+      "what": "Refresh the Anthropic model list in config.json to current model aliases (claude-sonnet-4-5, claude-3-5-haiku-latest).",
+      "reason": "The old claude-3-5-sonnet-latest alias is being retired by Anthropic.",
+      "effect": "Anthropic provider now defaults to a current, available model.",
+      "status": "done"
+    },
+    {
+      "id": "A007",
+      "date": "2026-09-11",
+      "category": "test",
+      "what": "Add tests for the new provider/model logic, file tools, and the malformed-tool-call parser (23 new tests).",
+      "reason": "Every fix needs regression coverage so future changes cannot silently break it.",
+      "effect": "bun test now runs 57 tests, all passing.",
+      "status": "done"
     }
   ]
 }
