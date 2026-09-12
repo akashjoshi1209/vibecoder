@@ -2,6 +2,20 @@ import { registerTool, type ToolContext } from "./registry";
 import { resolve } from "./fs-utils";
 import { dirname, join } from "node:path";
 import { mkdirSync, readdirSync, statSync } from "node:fs";
+import { isSelfFile, isProtectedFile, auditSelfEdit } from "../self-edit";
+
+function protectedError(p: string): string {
+  return `ERROR: SELF-EDIT PROTECTED — ${p} is the append-only audit ledger. It cannot be modified or deleted; self-edits are recorded there automatically.`;
+}
+
+async function preWriteNote(p: string, content: string): Promise<{ ok: boolean; note: string }> {
+  if (isProtectedFile(p)) return { ok: false, note: protectedError(p) };
+  if (isSelfFile(p)) {
+    const before = (await Bun.file(p).exists()) ? await Bun.file(p).text() : "";
+    return { ok: true, note: auditSelfEdit("write_file", p, before, content, `wrote ${content.length} bytes`) };
+  }
+  return { ok: true, note: "" };
+}
 
 function formatSize(n: number): string {
   if (n < 1024) return `${n}B`;
@@ -107,9 +121,11 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const p = resolve(String(args.path), ctx);
     const content = String(args.content ?? "");
+    const guard = await preWriteNote(p, content);
+    if (!guard.ok) return guard.note;
     mkdirSync(dirname(p), { recursive: true });
     await Bun.write(p, content);
-    return `Wrote ${content.length} bytes to ${p}`;
+    return `Wrote ${content.length} bytes to ${p}${guard.note ? "\n" + guard.note : ""}`;
   },
 });
 
@@ -136,6 +152,7 @@ registerTool({
     const oldString = String(args.oldString ?? "");
     const newString = String(args.newString ?? "");
     if (!(await Bun.file(p).exists())) return `ERROR: file not found: ${p}`;
+    if (isProtectedFile(p)) return protectedError(p);
     const text = await Bun.file(p).text();
     if (!oldString) return `ERROR: oldString cannot be empty`;
     const count = text.split(oldString).length - 1;
@@ -143,6 +160,9 @@ registerTool({
     if (count > 1) return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique)`;
     const updated = text.replace(oldString, newString);
     await Bun.write(p, updated);
-    return `Edited ${p}: replaced 1 occurrence`;
+    const note = isSelfFile(p)
+      ? auditSelfEdit("edit_file", p, text, updated, "replaced 1 occurrence")
+      : "";
+    return `Edited ${p}: replaced 1 occurrence${note ? "\n" + note : ""}`;
   },
 });

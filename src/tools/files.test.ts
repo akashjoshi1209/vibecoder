@@ -6,16 +6,22 @@ import { executeTool, type ToolContext } from "./registry";
 
 // importing files.ts triggers side-effect registration
 import "./files";
+import { ledgerPath, readLedger } from "../self-edit";
 
 let tmpDir: string;
+let prevRepoRoot: string | undefined;
 const ctx: ToolContext = { get cwd() { return tmpDir; } };
 
 afterEach(() => {
   if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+  if (prevRepoRoot !== undefined) process.env.VIBECODER_REPO_ROOT = prevRepoRoot;
+  else delete process.env.VIBECODER_REPO_ROOT;
 });
 
 function setup() {
   tmpDir = mkdtempSync(join(tmpdir(), "vc-files-test-"));
+  prevRepoRoot = process.env.VIBECODER_REPO_ROOT;
+  process.env.VIBECODER_REPO_ROOT = tmpDir;
 }
 
 describe("write_file", () => {
@@ -103,6 +109,50 @@ describe("edit_file", () => {
     setup();
     const res = await executeTool("edit_file", { path: join(tmpDir, "nope.txt"), oldString: "x", newString: "y" }, ctx);
     expect(res).toMatch("ERROR");
+  });
+});
+
+describe("self-edit guardrails", () => {
+  test("write to config.json is audited in the ledger but still applies", async () => {
+    setup();
+    const cfgPath = join(tmpDir, "config.json");
+    await executeTool("write_file", { path: cfgPath, content: `{"a":1}` }, ctx);
+    const res = await executeTool("write_file", { path: cfgPath, content: `{"a":2}` }, ctx);
+    expect(res).toContain("SELF-EDIT recorded");
+    expect(readFileSync(cfgPath, "utf8")).toBe(`{"a":2}`);
+    const ledger = readLedger();
+    expect(ledger.length).toBe(2); // creation + update, both audited
+    expect(ledger[0].file).toBe("config.json");
+    expect(ledger[0].tool).toBe("write_file");
+    expect(ledger[0].beforeSha).not.toBe(ledger[0].afterSha);
+  });
+
+  test("edit to config.json is audited", async () => {
+    setup();
+    const cfgPath = join(tmpDir, "config.json");
+    await executeTool("write_file", { path: cfgPath, content: `{"temperature":0.7}` }, ctx);
+    const res = await executeTool("edit_file", { path: cfgPath, oldString: "0.7", newString: "0.2" }, ctx);
+    expect(res).toContain("SELF-EDIT recorded");
+    expect(readFileSync(cfgPath, "utf8")).toBe(`{"temperature":0.2}`);
+    expect(readLedger(10).some((e) => e.tool === "edit_file")).toBe(true);
+  });
+
+  test("ledger itself is protected from write_file and edit_file", async () => {
+    setup();
+    const lp = ledgerPath();
+    const w = await executeTool("write_file", { path: lp, content: "tampered\n" }, ctx);
+    expect(w).toContain("PROTECTED");
+    expect(existsSync(lp)).toBe(false);
+    const e = await executeTool("edit_file", { path: lp, oldString: "tampered", newString: "x" }, ctx);
+    expect(e).toContain("ERROR");
+    expect(existsSync(lp)).toBe(false);
+  });
+
+  test("ordinary files outside self-files are not audited", async () => {
+    setup();
+    const res = await executeTool("write_file", { path: join(tmpDir, "src", "x.txt"), content: "hi" }, ctx);
+    expect(res).not.toContain("SELF-EDIT");
+    expect(readLedger().length).toBe(0);
   });
 });
 

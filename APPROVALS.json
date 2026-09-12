@@ -335,6 +335,42 @@
       "reason": "Block-based trimming and the new pacer are core free-tier reliability logic and need coverage like everything else.",
       "effect": "bun test now runs 119 tests, all passing; typecheck clean.",
       "status": "done"
+    },
+    {
+      "id": "A038",
+      "date": "2026-09-13",
+      "category": "feature",
+      "what": "Add self-knowledge: src/llm/model-cards.ts (honest per-model cards), self_about tool + /about command reporting runtime provider/model, model card, config, tools, and boundaries; setRuntimeIdentity synced on provider/model switches.",
+      "reason": "Let vibecoder answer 'who/what are you' with facts instead of deflecting — feasible-by-design, honest about unknown fields.",
+      "effect": "Verified live: agent self-identified as NVIDIA Nemotron 3 Ultra (550B) with correct capacity boundaries from the self_about tool.",
+      "status": "done"
+    },
+    {
+      "id": "A039",
+      "date": "2026-09-13",
+      "category": "feature",
+      "what": "Add self-edit guardrails: src/self-edit.ts with append-only SELF_EDITS.jsonl audit ledger (before/after SHA-256), isSelfFile/isProtectedFile checks, git-backed restoreSelfFiles; write_file/edit_file block ledger edits and audit config.json/.env self-edits.",
+      "reason": "Self-modification must be logged, auditable, and revertible without allowing the agent to erase the audit trail.",
+      "effect": "Live-verified in the real repo: config.json edit was sha-logged and staged, ledger write was BLOCKED, git restore returned config.json to the last approved (committed) state.",
+      "status": "done"
+    },
+    {
+      "id": "A040",
+      "date": "2026-09-13",
+      "category": "feature",
+      "what": "Add /reload-config (human approve-before-live step), /review-self-edits (ledger + pending diff), /undo-self-edits (reset to git HEAD) REPL commands; inject SELF_EDIT_PROTOCOL immutably into the system prompt.",
+      "reason": "Guardrails require an explicit human approval step before staged self-edits go live and a permanently-available reset command.",
+      "effect": "Config.change lifecycle is now: agent edits (audited+staged) → human /review-self-edits → /reload-config (live) or /undo-self-edits (revert).",
+      "status": "done"
+    },
+    {
+      "id": "A041",
+      "date": "2026-09-13",
+      "category": "test",
+      "what": "Add 13 tests: model card lookups (exact/substring/unknown), self-edit helpers (path classification, ledger round-trip, limit, shaOf, auditSelfEdit note, summary), file-tool self-edit guardrails (audit on config.json write/edit, ledger protection, no audit for normal files).",
+      "reason": "Self-knowledge and self-modification guardrails are behavior-critical and need regression coverage.",
+      "effect": "bun test now runs 132 tests, all passing; typecheck clean.",
+      "status": "done"
     }
   ]
 }

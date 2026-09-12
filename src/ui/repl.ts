@@ -9,6 +9,9 @@ import { saveSession, saveLast, loadSession, loadLast, listSessions, deleteSessi
 import { resolve } from "../tools/fs-utils";
 import { hasControllingTty } from "./terminal";
 import { TUI } from "./tui";
+import { setRuntimeIdentity, buildSelfReport, SELF_EDIT_PROTOCOL } from "../self-knowledge";
+import { appendLedger, restoreSelfFiles, selfFileDiffStat, ledgerSummary } from "../self-edit";
+import "../self-knowledge";
 
 const colors = {
   dim: "\x1b[2m",
@@ -98,7 +101,8 @@ async function init() {
   const resolved = createProvider(config);
   providerName = resolved.name;
   llmModel = resolved.model;
-  systemPrompt = config.systemPrompt ?? "You are Vibecoder.";
+  systemPrompt = (config.systemPrompt ?? "You are Vibecoder.") + SELF_EDIT_PROTOCOL;
+  setRuntimeIdentity(providerName, llmModel);
   chatTemperature = config.temperature;
   chatMaxTokens = config.maxTokens;
   maxInputTokens = config.maxInputTokens ?? (config.provider === "groq" ? 5000 : undefined);
@@ -114,6 +118,7 @@ async function init() {
     if (mIdx !== -1 && process.argv[mIdx + 1]) llmModel = process.argv[mIdx + 1];
     else llmModel = r.model;
   }
+  setRuntimeIdentity(providerName, llmModel);
 
   const dirArg = process.argv.indexOf("--cwd");
   if (dirArg !== -1 && process.argv[dirArg + 1]) {
@@ -155,6 +160,10 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/resume [name]${colors.reset}    resume a saved conversation (or the last one)`);
     print(`  ${colors.green}/list${colors.reset}             list saved conversations`);
     print(`  ${colors.green}/delete <name>${colors.reset}    delete a saved conversation`);
+    print(`  ${colors.green}/about${colors.reset}             self-knowledge report (model, config, tools)`);
+    print(`  ${colors.green}/reload-config${colors.reset}     approve staged config edits — make them live`);
+    print(`  ${colors.green}/review-self-edits${colors.reset} show audit ledger + pending config diff`);
+    print(`  ${colors.green}/undo-self-edits${colors.reset}   reset config.json to last approved state (git)`);
     print(`  ${colors.green}/new${colors.reset}              start a fresh conversation (keeps provider/model)`);
     print(`  ${colors.green}/clear${colors.reset}            clear conversation + screen`);
     print(`  ${colors.green}/help${colors.reset}             this help`);
@@ -224,7 +233,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     messages = [];
     sessionId = "";
     const config = await loadConfig();
-    if (config.systemPrompt) systemPrompt = config.systemPrompt;
+    if (config.systemPrompt) systemPrompt = config.systemPrompt + SELF_EDIT_PROTOCOL;
     tui?.clearScrollback();
     if (tui) {
       for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b);
@@ -236,6 +245,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   if (line.startsWith("/model ")) {
     llmModel = line.slice(7).trim();
     if (!llmModel) return true;
+    setRuntimeIdentity(providerName, llmModel);
     setStatus();
     print(`${colors.dim}model set to ${llmModel}${colors.reset}`);
     return true;
@@ -246,6 +256,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     providerName = r.name;
     llmModel = r.model;
     providerStream = r.provider.streamChat.bind(r.provider);
+    setRuntimeIdentity(providerName, llmModel);
     setStatus();
     print(`${colors.dim}provider set to ${providerName}, model ${llmModel}${colors.reset}`);
     return true;
@@ -259,6 +270,58 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
       setStatus();
       print(`${colors.dim}tool approval: ${tui.approveMode === "on" ? "on (you approve each tool call)" : "off (agents act freely)"}${colors.reset}`);
     }
+    return true;
+  }
+  if (line.trim() === "/about") {
+    print(await buildSelfReport());
+    const staged = selfFileDiffStat();
+    print(
+      staged
+        ? `\n  pending config diff (not yet live):\n${staged}`
+        : `\n  ${colors.dim}pending config diff: none${colors.reset}`,
+    );
+    if (staged) print(`  ${colors.dim}→ run /reload-config to approve and make live, or /undo-self-edits to revert${colors.reset}`);
+    return true;
+  }
+  if (line.startsWith("/reload-config")) {
+    const cfg = await loadConfig().catch(() => null);
+    if (!cfg) {
+      print(`${colors.red}config.json is not valid JSON right now — fix it first.${colors.reset}`);
+      return true;
+    }
+    systemPrompt = (cfg.systemPrompt ?? "You are Vibecoder.") + SELF_EDIT_PROTOCOL;
+    chatTemperature = cfg.temperature;
+    chatMaxTokens = cfg.maxTokens;
+    maxInputTokens = cfg.maxInputTokens ?? undefined;
+    maxInputTokensPerMinute = cfg.maxInputTokensPerMinute ?? undefined;
+    rootConfig = cfg;
+    appendLedger({ tool: "/reload-config", file: "config.json", beforeSha: "", afterSha: "", note: "staged config edits approved and applied by human" });
+    setStatus();
+    print(`${colors.green}approved & applied${colors.reset} — config is now live (${cfg.model ?? "model from config"}).${colors.dim} Consider ${colors.reset}${colors.green}git add config.json && git commit${colors.reset}${colors.dim} to mark this as the new approved baseline.${colors.reset}`);
+    return true;
+  }
+  if (line.startsWith("/undo-self-edits")) {
+    const res = restoreSelfFiles();
+    if (res.ok) {
+      appendLedger({ tool: "/undo-self-edits", file: "config.json", beforeSha: "", afterSha: "", note: "config.json reset to last approved (git HEAD) state by human" });
+      const cfg = await loadConfig().catch(() => null);
+      if (cfg) {
+        systemPrompt = (cfg.systemPrompt ?? "You are Vibecoder.") + SELF_EDIT_PROTOCOL;
+        rootConfig = cfg;
+      }
+      print(`${colors.green}config.json reset to the last approved state.${colors.reset}${res.out ? ` (${res.out})` : ""}`);
+      print(`  ${colors.dim}run /reload-config to reload the restored values.${colors.reset}`);
+    } else {
+      print(`${colors.red}reset failed:${colors.reset} ${res.out || "git restore errored"}`);
+    }
+    return true;
+  }
+  if (line.trim() === "/review-self-edits") {
+    print(`\n${colors.bold}Self-edit audit ledger${colors.reset}${ledgerSummary(10).length ? "" : ` ${colors.dim}(empty)${colors.reset}`}`);
+    for (const l of ledgerSummary(10)) print(l);
+    const staged = selfFileDiffStat();
+    print(`\n${colors.bold}Pending config changes (staged, not live)${colors.reset}:${staged ? "\n" + staged : ` ${colors.dim}none${colors.reset}`}`);
+    if (staged) print(`  ${colors.dim}/reload-config to approve · /undo-self-edits to revert${colors.reset}`);
     return true;
   }
   if (line.trim() === "/clear") {

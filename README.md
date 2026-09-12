@@ -48,7 +48,23 @@ Input and commands
 - `/delete <name>` — delete a saved conversation
 - `/new` — start a fresh conversation (keeps provider/model)
 - `/clear` — clear the conversation and screen
+- `/about` — self-knowledge report: who vibecoder is, the model card (architecture, params, context, cutoff, license, limits), runtime config, and its tools
+- `/reload-config` — **human approval step**: apply staged `config.json` edits made by the agent so they go live
+- `/review-self-edits` — show the append-only audit ledger and the pending `config.json` diff
+- `/undo-self-edits` — reset `config.json` to the last approved state (git HEAD restore)
 - `/help` — command help
+
+## Self-knowledge & self-editing
+
+Vibecoder knows what it is and can answer "who/what are you?" factually — the `self_about` tool (model-facing) and `/about` (human-facing) report the actual runtime provider, model ID, model card from `src/llm/model-cards.ts`, config values, and tool list. The same honest caveat applies: vibecoder cannot change its own weights. "Self-edits" mean changes to `config.json`, its tools, or its source — all of which live in this repo.
+
+Self-edits to `config.json` / `.env` are **staged, audited, and revertible**, never silently live:
+
+- Every write/edit to a self-file is recorded in `SELF_EDITS.jsonl` (append-only, git-tracked) with before/after SHA-256 hashes, tool, and timestamp.
+- A `config.json` edit only takes effect after the human runs `/reload-config` — that is the explicit approve-before-live step.
+- `/undo-self-edits` restores `config.json` from git (the last commit = last approved state).
+- The audit ledger cannot be modified or deleted through the file tools; the reset/reload commands live in code that is itself git-tracked, so any attempt to remove them shows up in `git diff` and is revertible. (An agent with free `bash` access can still bypass file-tool blocking — that residual risk is documented here.)
+- The SEP is also injected into every system prompt as an immutable preamble (`SELF_EDIT_PROTOCOL`) that config edits can't remove.
 - `exit` or `quit` — leave the REPL outside the TUI; `ctrl-c` when idle inside the TUI
 
 ## Configuration (`config.json`)
