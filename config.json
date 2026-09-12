@@ -8,6 +8,12 @@
       "apiKeyEnv": "GROQ_API_KEY",
       "models": ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound"]
     },
+    "nvidia": {
+      "type": "openai-compatible",
+      "baseURL": "https://integrate.api.nvidia.com/v1",
+      "apiKeyEnv": "NVIDIA_API_KEY",
+      "models": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-super-120b-a12b"]
+    },
     "ollama": {
       "type": "openai-compatible",
       "baseURL": "http://127.0.0.1:11434/v1",
