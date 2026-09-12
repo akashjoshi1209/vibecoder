@@ -1,21 +1,28 @@
-import type { ChatOptions, ChatChunk, StreamResult, ToolCall, LLMProvider, ProviderConfig } from "../types";
+import { ContextTooLargeError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig } from "../types";
 import { withTimeout, LLMTimeoutError, type TimeoutSpec } from "../timeout";
 import { isTransientRateLimit, parseRetryAfter, sleepAbortable } from "../retry";
 
-function mapToAnthropic(messages: ChatOptions["messages"]): any[] {
-  return messages.map((m) => {
+export function mapToAnthropic(messages: ChatOptions["messages"]): any[] {
+  const out: any[] = [];
+
+  for (const m of messages) {
     if (m.role === "tool") {
-      return {
-        role: "user",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: m.tool_call_id,
-            content: m.content ?? "",
-          },
-        ],
+      // Anthropic requires all tool_result blocks for one assistant turn to be
+      // grouped in a SINGLE user message. Consecutive tool messages are merged.
+      const result = {
+        type: "tool_result" as const,
+        tool_use_id: m.tool_call_id,
+        content: m.content ?? "",
       };
+      const last = out[out.length - 1];
+      if (last && last.role === "user" && last._toolGroup) {
+        last.content.push(result);
+      } else {
+        out.push({ role: "user", content: [result], _toolGroup: true });
+      }
+      continue;
     }
+
     const content: any[] = [];
     if (m.content) content.push({ type: "text", text: m.content });
     if (m.tool_calls && m.tool_calls.length) {
@@ -28,9 +35,15 @@ function mapToAnthropic(messages: ChatOptions["messages"]): any[] {
         });
       }
     }
-    const role = m.role === "system" ? "user" : m.role;
-    return { role: role === "assistant" ? role : role, content };
-  });
+    // A persisted assistant message may have neither text nor tool calls;
+    // Anthropic rejects an empty content array, so emit a placeholder block.
+    if (content.length === 0) content.push({ type: "text", text: "" });
+    out.push({ role: m.role, content });
+  }
+
+  // Strip the internal grouping marker.
+  for (const m of out) delete m._toolGroup;
+  return out;
 }
 
 export class AnthropicProvider implements LLMProvider {
@@ -92,6 +105,13 @@ export class AnthropicProvider implements LLMProvider {
             await sleepAbortable(parseRetryAfter(res, text), signal);
             markData();
             continue;
+          }
+          if (res.status === 413 || res.status === 400) {
+            const text = await res.text().catch(() => "");
+            if (res.status === 413 || /(prompt_too_long|request_too_large|too_many_tokens|maximum context|too long)/i.test(text)) {
+              throw new ContextTooLargeError(res.status, `Context too large (HTTP ${res.status}): ${text.slice(0, 500)}`);
+            }
+            throw new Error(`Anthropic request failed (${res.status}): ${text.slice(0, 500)}`);
           }
           markData();
           if (!res.ok || !res.body) {

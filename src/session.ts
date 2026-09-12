@@ -37,6 +37,24 @@ export function sanitizeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
+export interface ResumeArg {
+  resume: boolean;
+  name: string | null;
+}
+
+/**
+ * Parses process argv for a `--resume [name]` value. The value is only treated
+ * as a session name when it does not start with `-` (so flags like `--prompt`
+ * are never swallowed as a name).
+ */
+export function resolveResumeArg(argv: string[]): ResumeArg {
+  const idx = argv.indexOf("--resume");
+  if (idx === -1) return { resume: false, name: null };
+  const raw = argv[idx + 1];
+  const name = raw && !raw.startsWith("-") ? raw : null;
+  return { resume: true, name };
+}
+
 function lastFile(): string {
   return join(root(), "last.json");
 }

@@ -193,22 +193,28 @@ function ttyStty(args: string[]): string {
 }
 
 export function getSize(): { rows: number; cols: number } {
-  let rows = 24;
-  let cols = 80;
+  // Fast path: no subprocess spawn when the TTY exposes its size.
+  const cols = process.stdout.columns;
+  const rows = process.stdout.rows;
+  if (Number.isFinite(rows) && Number.isFinite(cols) && rows > 0 && cols > 0 && rows >= 8 && cols >= 20) {
+    return { rows, cols };
+  }
+  let r = 24;
+  let c = 80;
   try {
     const size = ttyStty(["size"]).split(" ");
     if (size.length >= 2 && /^\d+$/.test(size[0]) && /^\d+$/.test(size[1])) {
-      rows = parseInt(size[0], 10);
-      cols = parseInt(size[1], 10);
+      r = parseInt(size[0], 10);
+      c = parseInt(size[1], 10);
     }
   } catch {
     /* keep defaults */
   }
-  if (rows < 8 || cols < 20) {
+  if (r < 8 || c < 20) {
     // size unknown / unusably small (e.g. pty reports 0x0) -> sensible default
     return { rows: 24, cols: 80 };
   }
-  return { rows, cols };
+  return { rows: r, cols: c };
 }
 
 export function enableRawMode(): void {

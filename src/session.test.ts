@@ -11,6 +11,7 @@ import {
   deleteSession,
   saveLast,
   loadLast,
+  resolveResumeArg,
   type SessionData,
 } from "./session";
 
@@ -86,5 +87,23 @@ describe("session persistence", () => {
     const l = loadLast();
     expect(l).not.toBeNull();
     expect(l!.title).toBe("Last thing I did");
+  });
+});
+
+describe("resolveResumeArg", () => {
+  test("no --resume flag means no resume", () => {
+    expect(resolveResumeArg(["vibecoder", "--prompt", "x"])).toEqual({ resume: false, name: null });
+  });
+
+  test("bare --resume means resume the last conversation", () => {
+    expect(resolveResumeArg(["vibecoder", "--resume"])).toEqual({ resume: true, name: null });
+  });
+
+  test("--resume <name> targets the named session", () => {
+    expect(resolveResumeArg(["vibecoder", "--resume", "mysession"])).toEqual({ resume: true, name: "mysession" });
+  });
+
+  test("a following flag is not swallowed as a session name", () => {
+    expect(resolveResumeArg(["vibecoder", "--resume", "--prompt", "x"])).toEqual({ resume: true, name: null });
   });
 });

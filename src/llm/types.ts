@@ -61,3 +61,12 @@ export interface StreamResult {
 export interface LLMProvider {
   streamChat(options: ChatOptions, onChunk: (chunk: ChatChunk) => void): Promise<StreamResult>;
 }
+
+export class ContextTooLargeError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "ContextTooLargeError";
+    this.status = status;
+  }
+}

@@ -55,6 +55,8 @@ Input and commands
 
 - `provider` / `model` — defaults
 - `temperature` — model sampling temperature (optional; passed through on every request)
+- `maxInputTokens` — input token budget per request (optional). When set, the agent trims the conversation history (keeping your first task message and the most recent turns) to fit within this budget, and if the provider still returns a "context too large" (HTTP 413) error it trims harder and retries once. Defaults to `5000` on GROQ. Trimming preserves whole tool-call/tool-result pairs so the provider never sees a broken tool sequence, and a safety factor keeps the real request comfortably under the provider's hard cap.
+- `maxInputTokensPerMinute` — optional per-minute input-token cap (e.g. GROQ's free-tier 7000 ITPM). When set, requests are paced with a free delay so the rolling-minute total stays under the cap instead of burning requests on 429 rate-limit errors. Defaults to `6500` on GROQ. Remove it (set to `null`) and the agent instead relies on the existing rate-limit backoff.
 - `providers` — add any OpenAI-compatible endpoint (GROQ, Ollama, OpenAI, NVIDIA NIM, local vLLM, etc.) or Anthropic. One entry per provider.
 - `systemPrompt` — your agent's system instructions. Change it to change behavior entirely.
 

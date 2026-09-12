@@ -1,6 +1,31 @@
 import { describe, expect, test } from "bun:test";
-import { parseToolCalls } from "./tool-call";
+import { normalizeToolCalls, parseToolCalls } from "./tool-call";
 import type { ToolCall } from "../llm/types";
+
+describe("normalizeToolCalls", () => {
+  test("keeps existing ids unchanged", () => {
+    const input: ToolCall[] = [{ id: "call_9", name: "bash", arguments: "{}" }];
+    const result = normalizeToolCalls(input, 3);
+    expect(result[0].id).toBe("call_9");
+  });
+
+  test("fabricates a stable id when the provider omits one", () => {
+    const input: ToolCall[] = [{ id: "", name: "bash", arguments: "{}" }];
+    const result = normalizeToolCalls(input, 2);
+    expect(result[0].id).toBe("call_2_0");
+  });
+
+  test("produces unique ids per index within a step", () => {
+    const input: ToolCall[] = [
+      { id: "", name: "bash", arguments: "{}" },
+      { id: "", name: "grep", arguments: "{}" },
+    ];
+    const result = normalizeToolCalls(input, 1);
+    expect(result[0].id).toBe("call_1_0");
+    expect(result[1].id).toBe("call_1_1");
+    expect(result[0].id).not.toBe(result[1].id);
+  });
+});
 
 describe("parseToolCalls", () => {
   test("parses valid tool calls", () => {

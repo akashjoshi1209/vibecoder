@@ -191,6 +191,150 @@
       "reason": "The README documented the app before Phases 3-4 added scrollback, sessions and new tools.",
       "effect": "Docs now match the implemented behavior.",
       "status": "done"
+    },
+    {
+      "id": "A022",
+      "date": "2026-09-12",
+      "category": "bug-fix",
+      "what": "Fix --resume <name>: named session was ignored whenever last.json existed. The named session is now preferred when an arg is given; a following flag (--prompt etc.) is no longer swallowed as a session name. A clear 'no previous conversation found' message is printed when neither exists.",
+      "reason": "The original code tried loadLast() first unconditionally, so `vibecoder --resume mysession` always restored the last conversation instead of the named one.",
+      "effect": "README's promised --resume behavior now works correctly.",
+      "status": "done"
+    },
+    {
+      "id": "A023",
+      "date": "2026-09-12",
+      "category": "bug-fix",
+      "what": "Wrap handleCommand + runPrompt in try/catch in both TUI and readline onSubmit paths so /provider <invalid> prints a red error instead of silently failing.",
+      "reason": "An unhandled rejection from createProvider inside an async IIFE produced no user-visible feedback.",
+      "effect": "/provider bogus now prints 'Unknown provider ...' to scrollback/console and returns to a healthy prompt.",
+      "status": "done"
+    },
+    {
+      "id": "A024",
+      "date": "2026-09-12",
+      "category": "bug-fix",
+      "what": "Anthropic: merge consecutive tool_result blocks into a single user message instead of emitting separate messages. This fixes the 400 error that occurred when the agent executed 2+ tool calls in one step.",
+      "reason": "Each tool result was mapped to a separate user message; Anthropic requires all tool_result blocks for one assistant turn to share a single user message.",
+      "effect": "Multi-tool-step Anthropic sessions now produce a valid message sequence.",
+      "status": "done"
+    },
+    {
+      "id": "A025",
+      "date": "2026-09-12",
+      "category": "bug-fix",
+      "what": "Anthropic: emit a placeholder text block when a persisted assistant message has no content and no tool_calls, preventing an empty content array that the API rejects.",
+      "reason": "A resumable conversation could contain an assistant message with content:null and no tool_calls; Anthropic API returns 400 for an empty content array.",
+      "effect": "Old sessions resume cleanly without Anthropic 400 errors.",
+      "status": "done"
+    },
+    {
+      "id": "A026",
+      "date": "2026-09-12",
+      "category": "robustness",
+      "what": "Normalize tool-call ids across the assistant message and its tool results: a stable id is fabricated when the provider omits one, ensuring consistent pairing on the next API request.",
+      "reason": "Some providers return empty tool-call ids; the assistant message and tool results must use the same id for the API to pair them.",
+      "effect": "Tool calls work reliably with providers that omit ids (covered by new tests).",
+      "status": "done"
+    },
+    {
+      "id": "A027",
+      "date": "2026-09-12",
+      "category": "robustness",
+      "what": "Add a default 20s timeout to fetch_url and guard against pre-aborted signals in both bash and fetch_url tools.",
+      "reason": "A hung URL could stall the agent loop forever; and if a signal was already aborted before a tool started, its listener never fired.",
+      "effect": "fetch_url is now time-bounded; abort-before-listener races are eliminated.",
+      "status": "done"
+    },
+    {
+      "id": "A028",
+      "date": "2026-09-12",
+      "category": "performance",
+      "what": "getSize() in terminal.ts: prefer process.stdout.columns/rows (no subprocess spawn) over stty size; keep stty as a fallback when the fast path is unavailable.",
+      "reason": "Each stty spawnSync has a fixed environment cost; the TTY's own columns/rows are available in a real terminal without spawning.",
+      "effect": "TUI startup is faster in environments where process.stdout.columns is populated; no behaviour change otherwise.",
+      "status": "done"
+    },
+    {
+      "id": "A029",
+      "date": "2026-09-12",
+      "category": "test",
+      "what": "Add 14 regression tests across 3 new/updated files: Anthropic mapToAnthropic grouping (7 tests), normalizeToolCalls id fallback (3 tests), and resolveResumeArg name-vs-flag precedence (4 tests).",
+      "reason": "Each of the bugs fixed in A022-A028 lacked test coverage; regression tests ensure they cannot re-emerge.",
+      "effect": "bun test now runs 93 tests, all passing.",
+      "status": "done"
+    },
+    {
+      "id": "A030",
+      "date": "2026-09-12",
+      "category": "feature",
+      "what": "Add an input token budget to the agent loop (new src/llm/tokens.ts): a `maxInputTokens` config option that trims the conversation history to fit before each request. Trimming keeps the first user task message and the most recent turns, truncates oversized tool results, and clones messages so the saved session is never mutated.",
+      "reason": "GROQ free tier caps input tokens at 7000/min; a growing conversation re-sent on every agent step quickly exceeded it (the user hit 413 'Request too large, requested 7394').",
+      "effect": "A 19,776-token conversation is trimmed to ~6,000 tokens before being sent — comfortably under the 7000 free-tier cap, so vibecoder stays usable with no paid tier.",
+      "status": "done"
+    },
+    {
+      "id": "A031",
+      "date": "2026-09-12",
+      "category": "bug-fix",
+      "what": "Handle 'context too large' (HTTP 413 and wording-matched 400) in both provider clients: throw a distinct ContextTooLargeError instead of a generic hard failure, and have the agent loop catch it, trim the history harder, and retry once.",
+      "reason": "A 413 previously killed the whole run with no recovery; now it self-heals by shrinking context and re-sending.",
+      "effect": "Context-too-large errors are transient again: the loop trims and retries automatically (verified by 7 new provider tests).",
+      "status": "done"
+    },
+    {
+      "id": "A032",
+      "date": "2026-09-12",
+      "category": "docs",
+      "what": "Document maxInputTokens in README config section; update config.json with maxInputTokens: 6000.",
+      "reason": "Users need to know the knob exists and the default that keeps free-tier GROQ within limits.",
+      "effect": "Config docs match the new token-budget behavior.",
+      "status": "done"
+    },
+    {
+      "id": "A033",
+      "date": "2026-09-12",
+      "category": "test",
+      "what": "Add 17 tests: tokens.ts heuristics + trim behavior (8 tests) and 413/ContextTooLargeError mapping across openai-compatible and anthropic providers (7 tests) plus updated totals.",
+      "reason": "New token budgeting + 413 retry logic must have regression coverage like everything else.",
+      "effect": "bun test now runs 110 tests, all passing; typecheck clean.",
+      "status": "done"
+    },
+    {
+      "id": "A034",
+      "date": "2026-09-13",
+      "category": "behavior",
+      "what": "Rewrite trimMessages to trim whole atomic tool-exchange blocks (assistant tool_use + its tool results kept/dropped together) and treat orphan tool results as their own block.",
+      "reason": "Message-granular trimming could drop an assistant tool_use while keeping its orphaned tool result, which GROQ rejected with HTTP 400 tool_use_failed (observed live).",
+      "effect": "Trimming can no longer break tool_use/tool_result pairing; lower budget handling reduced to 3-msg floor in extreme-cases test.",
+      "status": "done"
+    },
+    {
+      "id": "A035",
+      "date": "2026-09-13",
+      "category": "behavior",
+      "what": "Recalibrate token estimates: per-char-class conservative weights (CJK~1, letters/digits 0.25, whitespace 0.5, punctuation 0.55). Calibrated live against GROQ real prompt_tokens.",
+      "reason": "The previous over-weighting under-counted code/JSON-heavy traffic by ~1.26x, so 6000-budgeted requests still hit GROQ's 7000 hard cap with a 413.",
+      "effect": "Real requests now estimate close to actual: a trimmed 3846-budget request measured 4153 real prompt_tokens, with 2847 headroom under the 7000 cap.",
+      "status": "done"
+    },
+    {
+      "id": "A036",
+      "date": "2026-09-13",
+      "category": "behavior",
+      "what": "Add per-minute input-token pacing: new RatePacer (src/llm/pace.ts) sleeps a free abortable delay before each request so the rolling-minute estimate stays under a provider cap; maxInputTokensPerMinute config opt (default 6500 on GROQ). Also trim to maxInputTokens/1.3 safety factor.",
+      "reason": "GROQ's 7000 ITPM is a rolling-minute budget, not per-request; even a single large request leaves too little for the next step, and multi-step runs burn themselves on 429s (limit error observed live: Used 2898 + Requested 6295 > 7000).",
+      "effect": "Multi-step runs pace themselves under free-tier limits instead of failing; the existing 429 backoff remains as a safety net.",
+      "status": "done"
+    },
+    {
+      "id": "A037",
+      "date": "2026-09-13",
+      "category": "test",
+      "what": "Add 9 tests: complete pairs atomic trimming regression, tiny-budget pair handling, orphan tool results, RatePacer window/delay/expiry, paceWait no-op cases.",
+      "reason": "Block-based trimming and the new pacer are core free-tier reliability logic and need coverage like everything else.",
+      "effect": "bun test now runs 119 tests, all passing; typecheck clean.",
+      "status": "done"
     }
   ]
 }

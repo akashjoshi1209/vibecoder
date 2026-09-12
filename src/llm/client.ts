@@ -10,6 +10,9 @@ export interface RootConfig {
   systemPrompt?: string;
   temperature?: number;
   maxTokens?: number;
+  maxInputTokens?: number;
+  /** Optional per-minute input-token cap for pacing (e.g. GROQ free-tier ITPM). */
+  maxInputTokensPerMinute?: number;
 }
 
 const DEFAULT_CONFIG_PATH = (() => {

@@ -45,7 +45,9 @@ registerTool({
       timedOut = true;
       killTree();
     }, timeout) : null;
-    ctx.signal?.addEventListener("abort", killTree, { once: true });
+    const onAbort = () => killTree();
+    if (ctx.signal?.aborted) onAbort();
+    else ctx.signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
@@ -59,12 +61,13 @@ registerTool({
       if (stderr) output += stderr ? (output ? "\n" : "") + stderr : "";
       if (exitCode !== 0) output += (output ? "\n" : "") + `[exit code: ${exitCode}]`;
       if (timedOut) output += (output ? "\n" : "") + `[killed: timed out after ${timeout}ms]`;
+      if (ctx.signal?.aborted) output += (output ? "\n" : "") + "[killed: interrupted]";
       if (!output) output = "(no output)";
 
       return output.length > MAX_OUTPUT ? output.slice(0, MAX_OUTPUT) + `\n...[truncated ${output.length - MAX_OUTPUT} chars]` : output;
     } finally {
       if (timer) clearTimeout(timer);
-      ctx.signal?.removeEventListener("abort", killTree);
+      ctx.signal?.removeEventListener("abort", onAbort);
     }
   },
 });

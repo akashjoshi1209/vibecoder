@@ -1,4 +1,4 @@
-import type { ChatOptions, ChatChunk, StreamResult, ToolCall, LLMProvider, ProviderConfig } from "../types";
+import { ContextTooLargeError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig } from "../types";
 import { withTimeout, LLMTimeoutError, type TimeoutSpec } from "../timeout";
 import { isTransientRateLimit, parseRetryAfter, sleepAbortable } from "../retry";
 
@@ -61,6 +61,13 @@ export class OpenAICompatibleProvider implements LLMProvider {
             await sleepAbortable(parseRetryAfter(res, text), signal);
             markData();
             continue;
+          }
+          if (res.status === 413 || res.status === 400) {
+            const text = await res.text().catch(() => "");
+            if (res.status === 413 || /(context_length|context length|too large|prompt too long|maximum context)/i.test(text)) {
+              throw new ContextTooLargeError(res.status, `Context too large (HTTP ${res.status}): ${text.slice(0, 500)}`);
+            }
+            throw new Error(`LLM request failed (${res.status}): ${text.slice(0, 500)}`);
           }
           markData();
           if (!res.ok || !res.body) {

@@ -5,7 +5,7 @@ import "../tools/bash";
 import "../tools/files";
 import "../tools/search";
 import "../tools/net";
-import { saveSession, saveLast, loadSession, loadLast, listSessions, deleteSession, type SessionData } from "../session";
+import { saveSession, saveLast, loadSession, loadLast, listSessions, deleteSession, resolveResumeArg, type SessionData } from "../session";
 import { resolve } from "../tools/fs-utils";
 import { hasControllingTty } from "./terminal";
 import { TUI } from "./tui";
@@ -32,6 +32,8 @@ let activeAbort: AbortController | null = null;
 let chatTemperature: number | undefined;
 let chatMaxTokens: number | undefined;
 let maxSteps = 40;
+let maxInputTokens: number | undefined;
+let maxInputTokensPerMinute: number | undefined;
 let sessionId = "";
 let rootConfig: RootConfig | null = null;
 
@@ -99,6 +101,8 @@ async function init() {
   systemPrompt = config.systemPrompt ?? "You are Vibecoder.";
   chatTemperature = config.temperature;
   chatMaxTokens = config.maxTokens;
+  maxInputTokens = config.maxInputTokens ?? (config.provider === "groq" ? 5000 : undefined);
+  maxInputTokensPerMinute = config.maxInputTokensPerMinute ?? (config.provider === "groq" ? 6500 : undefined);
   providerStream = resolved.provider.streamChat.bind(resolved.provider);
 
   const pIdx = process.argv.indexOf("--provider");
@@ -313,6 +317,8 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
           temperature: chatTemperature,
           max_tokens: chatMaxTokens,
         },
+        maxInputTokens,
+        maxInputTokensPerMinute,
       },
       {
         maxSteps,
@@ -339,6 +345,11 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
           const firstLine = resultText.split("\n")[0].slice(0, 90);
           if (tui) tui.printToScrollback(`${colors.gray}  └ ${firstLine}${resultText.includes("\n") ? "…" : ""}${colors.reset}`);
           else process.stdout.write(`${colors.gray}[${name} → ${firstLine}${resultText.includes("\n") ? "…" : ""}]${colors.reset}\n`);
+        },
+        onTrimmed: (trimmed, truncatedChars) => {
+          const note = `(trimmed ${trimmed} message(s)${truncatedChars ? `, truncated ${truncatedChars} chars` : ""} to fit the input token budget)`;
+          if (tui) tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
+          else process.stdout.write(`${colors.dim}${note}${colors.reset}\n`);
         },
         confirmTool: async (name, args) => {
           if (!tui || tui.approveMode === "off") return true;
@@ -377,9 +388,13 @@ function mainTUI(): void {
   const tui = new TUI(24, 80, {
     onSubmit: (line) => {
       void (async () => {
-        if (await handleCommand(line, tui)) return;
-        if (tui.busy) return;
-        await runPrompt(line, tui);
+        try {
+          if (await handleCommand(line, tui)) return;
+          if (tui.busy) return;
+          await runPrompt(line, tui);
+        } catch (err: any) {
+          tui.printToScrollback(`${colors.red}${err?.message ?? String(err)}${colors.reset}`);
+        }
       })();
     },
     onAbort: () => {
@@ -417,8 +432,12 @@ function mainLineInteractive(): void {
     rl.question(`${colors.green}❯${colors.reset} `, async (input) => {
       const line = input.trim();
       if (!line) return ask();
-      if (await handleCommand(line)) return ask();
-      await runPrompt(line);
+      try {
+        if (await handleCommand(line)) return ask();
+        await runPrompt(line);
+      } catch (err: any) {
+        console.error(`${colors.red}${err?.message ?? String(err)}${colors.reset}`);
+      }
       ask();
     });
   rl.on("close", () => {
@@ -431,11 +450,15 @@ function mainLineInteractive(): void {
 async function main() {
   await init();
 
-  const resumeIdx = process.argv.indexOf("--resume");
-  if (resumeIdx !== -1) {
-    const resumed = loadLast() ?? (process.argv[resumeIdx + 1] ? loadSession(process.argv[resumeIdx + 1]) : null);
-    if (resumed && !applySession(resumed)) {
-      console.log(`could not load the saved session${resumed.id ? ` "${resumed.id}"` : ""}`);
+  const resume = resolveResumeArg(process.argv);
+  if (resume.resume) {
+    const resumed = resume.name ? loadSession(resume.name) : loadLast();
+    if (resumed) {
+      if (!applySession(resumed)) {
+        console.log(`could not load the saved session${resumed.id ? ` "${resumed.id}"` : ""}`);
+      }
+    } else {
+      console.log(`no previous conversation${resume.name ? ` named "${resume.name}"` : ""} found — use /save to keep one, or /list to browse`);
     }
   }
 
