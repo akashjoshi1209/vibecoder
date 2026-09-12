@@ -4,7 +4,16 @@ import fs from "node:fs";
 export type KeyEvent =
   | { kind: "char"; char: string }
   | { kind: "enter" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" | "tab" | "esc" | "ctrl-c" | "ctrl-l" | "ctrl-w" | "ctrl-u" | "ctrl-right" | "ctrl-left" }
+  | { kind: "scrollup" | "scrolldown" }
   | { kind: "unknown"; raw: string };
+
+/** Enable SGR mouse reporting (motion + wheel). Call on TUI start, disable on exit. */
+export function enableMouse(): void {
+  out("\x1b[?1000h\x1b[?1006h");
+}
+export function disableMouse(): void {
+  out("\x1b[?1000l\x1b[?1006l");
+}
 
 const WIDE =
   /[\u1100-\u115F\u2300-\u23FF\u2500-\u25FF\u2700-\u27BF\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/;
@@ -287,6 +296,14 @@ function csiKey(bytes: number[]): KeyEvent {
   const params = paramStr;
   const mod = params.length >= 2 ? parseInt(params[1], 10) : undefined;
   const ctrl = mod === 5 || mod === 2 ? true : false;
+
+  // SGR mouse reports: CSI < b ; x ; y M|m   (wheel: button 64/65)
+  if (params[0]?.startsWith("<")) {
+    const btn = parseInt(params[0].slice(1), 10);
+    if (btn === 64) return { kind: "scrollup" };
+    if (btn === 65) return { kind: "scrolldown" };
+    return { kind: "unknown", raw: params.join(";") + String.fromCharCode(final) };
+  }
 
   if (final === 0x41) return { kind: "up" };
   if (final === 0x42) return { kind: "down" };

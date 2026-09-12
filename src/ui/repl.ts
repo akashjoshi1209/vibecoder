@@ -346,7 +346,9 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
   if (!tui) {
     process.stdout.write(`${colors.cyan}● ${providerName}/${llmModel}${colors.reset}\n`);
   } else {
-    tui.printToScrollback(`${colors.cyan}❯ ${userInput}${colors.reset}`);
+    tui.printToScrollback("");
+    tui.separator();
+    tui.printToScrollback(`${colors.bold}${colors.cyan}❯ ${userInput}${colors.reset}`);
     tui.busy = true;
     tui.setStatus("thinking…  (ctrl-c to interrupt)", 8);
   }
@@ -440,7 +442,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     persistLast();
     if (tui) {
       tui.busy = false;
-      tui.setStatus(`provider ${providerName} · model ${llmModel} · approve ${tui.approveMode === "on" ? "on" : "off"}`, 8);
+      tui.setStatus(`provider ${providerName} · model ${llmModel} · approve ${tui.approveMode === "on" ? "on" : "off"} · PgUp/PgDn scroll`, 8);
     } else {
       process.stdout.write("\n");
     }
@@ -476,7 +478,7 @@ function mainTUI(): void {
 
   tui.start();
   for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b, true);
-  tui.setStatus(`provider ${providerName} · model ${llmModel} · approve off`, 8);
+  tui.setStatus(`provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`, 8);
 }
 
 function mainLine(): void {

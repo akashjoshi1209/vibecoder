@@ -26,16 +26,18 @@ Config is found relative to the installed script (override with `VIBECODER_CONFI
 
 ## Interactive mode
 
-`bun run dev` on a terminal launches a full-screen TUI: scrollback + input line, streaming responses, status bar.
+`bun run dev` on a terminal launches a full-screen TUI: scrollback + input, streaming responses, status bar.
 
 Keys
 
-- type a message and press Enter to run it
+- type a message and press Enter to run it — the prompt area auto-wraps to multiple rows so a long message stays fully visible while you type
 - `ctrl-c` — interrupt a running task · clear the input line · exit when idle
 - arrows / Home / End / `ctrl-left` / `ctrl-right` — move the cursor
 - `Up` / `Down` — history; `Tab` — command completion
-- `PageUp` / `PageDown` — scroll through the conversation scrollback (`↑N/M` indicator in the status bar)
+- `PageUp` / `PageDown` or the mouse wheel — scroll through the conversation scrollback (`↑N/M` indicator in the status bar)
 - `ctrl-w` kill word · `ctrl-u` clear line · `ctrl-l` redraw
+
+Each exchange is visually separated: a divider row and a bold `❯` header mark your message, tool calls appear as `⚡ name … └ result` lines, and the assistant's reply streams in the area below.
 
 Input and commands
 

@@ -371,6 +371,15 @@
       "reason": "Self-knowledge and self-modification guardrails are behavior-critical and need regression coverage.",
       "effect": "bun test now runs 132 tests, all passing; typecheck clean.",
       "status": "done"
+    },
+    {
+      "id": "A042",
+      "date": "2026-09-13",
+      "category": "behavior",
+      "what": "TUI input/UX rework: the prompt area auto-wraps across multiple bottom rows so long messages stay fully visible while typing (no more single-line truncation that 'changed the page'); each exchange is visually separated by a divider row plus a bold ❯ user header distinct from ⚡ tool lines and streamed replies; scrolling now also works via the mouse wheel (SGR mouse reporting) in addition to PageUp/PageDown, with a PgUp/PgDn+scroll hint in the idle status bar.",
+      "reason": "User report: sent messages blended into process/tool output, long prompts got truncated into a single scrolling line, and scroll support wasn't obvious.",
+      "effect": "133 tests pass (added SGR wheel parsing coverage), typecheck clean; verified rendering layout in the new render() path.",
+      "status": "done"
     }
   ]
 }

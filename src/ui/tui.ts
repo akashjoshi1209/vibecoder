@@ -1,4 +1,4 @@
-import { KeyReader, type KeyEvent, ansi, displayWidth, enableRawMode, getSize, out, paint, restoreTerminal, wrapAnsi, wrapText } from "./terminal";
+import { KeyReader, type KeyEvent, ansi, disableMouse, displayWidth, enableMouse, enableRawMode, getSize, out, paint, restoreTerminal, wrapAnsi, wrapText } from "./terminal";
 
 export type ConfirmAnswer = "yes" | "no" | "all";
 
@@ -20,6 +20,8 @@ interface StatusLine {
 }
 
 const MAX_SCROLLBACK = 2000;
+const WHEEL_STEP = 4;
+const INPUT_PREFIX_COLS = 3; // "❯ " => wide glyph (2) + space
 
 export class TUI {
   private rows: number;
@@ -29,6 +31,7 @@ export class TUI {
   private stream: StreamLine = { text: "" };
   private status: StatusLine = { text: "" };
   private scrollOffset = 0;
+  private inputOffset = 0;
   private input = "";
   private cursor = 0;
   private history: string[] = [];
@@ -53,6 +56,7 @@ export class TUI {
     out("\x1b[?1049h"); // alternate screen
     out("\x1b[?25l"); // hide cursor
     enableRawMode();
+    enableMouse();
     out("\x1b[H\x1b[2J");
     this.render();
     process.stdout.on("resize", this.onWinch);
@@ -83,6 +87,8 @@ export class TUI {
         else if (ev.kind === "ctrl-l") this.render();
         else if (ev.kind === "pageup") { this.scrollBy(this.pageSize()); this.render(); }
         else if (ev.kind === "pagedown") { this.scrollBy(-this.pageSize()); this.render(); }
+        else if (ev.kind === "scrollup") { this.scrollBy(WHEEL_STEP); this.render(); }
+        else if (ev.kind === "scrolldown") { this.scrollBy(-WHEEL_STEP); this.render(); }
         continue;
       }
       this.handleIdle(ev);
@@ -186,6 +192,12 @@ export class TUI {
       case "pagedown":
         this.scrollBy(-this.pageSize());
         break;
+      case "scrollup":
+        this.scrollBy(WHEEL_STEP);
+        break;
+      case "scrolldown":
+        this.scrollBy(-WHEEL_STEP);
+        break;
       case "esc":
       default:
         break;
@@ -211,6 +223,20 @@ export class TUI {
     return Math.max(1, this.rows - 4);
   }
 
+  /** Where (visual row 0-based within the wrapped input, column) the text cursor sits. */
+  private cursorVisPos(): { line: number; col: number } {
+    const lines = wrapText(this.input, Math.max(8, this.cols - 1 - INPUT_PREFIX_COLS));
+    let acc = 0;
+    for (let li = 0; li < lines.length; li++) {
+      if (this.cursor <= acc + lines[li].length) {
+        return { line: li, col: displayWidth(lines[li].slice(0, this.cursor - acc)) };
+      }
+      acc += lines[li].length;
+    }
+    const last = Math.max(0, lines.length - 1);
+    return { line: last, col: displayWidth(lines[last]) };
+  }
+
   private scrollBy(delta: number): void {
     this.scrollOffset = Math.max(0, this.scrollOffset + delta);
   }
@@ -219,6 +245,7 @@ export class TUI {
     const line = this.input;
     this.input = "";
     this.cursor = 0;
+    this.inputOffset = 0;
     this.history.push(line);
     if (this.history.length > 100) this.history.shift();
     this.histIdx = -1;
@@ -229,6 +256,11 @@ export class TUI {
 
   printToScrollback(text: string, clamp?: boolean): void {
     this.pushStreamLines(text, clamp);
+  }
+
+  /** Full-width dim divider row, to visually separate each exchange. */
+  separator(): void {
+    this.printToScrollback(ansi.dim + "─".repeat(Math.max(10, this.cols - 1)) + ansi.reset);
   }
 
   streamText(text: string, color?: number): void {
@@ -306,9 +338,25 @@ export class TUI {
   // ---- rendering ----
 
   private render(): void {
-    const bottomRows = 2; // status + input
-    const contentRows = Math.max(1, this.rows - bottomRows);
     const colW = Math.max(10, this.cols - 1);
+
+    // Input block: the prompt auto-wraps across as many bottom rows as fit, so
+    // the whole message stays visible while typing.
+    const maxInputRows = Math.max(1, this.rows - 4);
+    const inputLines = wrapText(this.input, Math.max(8, colW - INPUT_PREFIX_COLS));
+    const shownInputRows = Math.min(inputLines.length, maxInputRows);
+    const cpos = this.cursorVisPos();
+    if (shownInputRows > 1) {
+      if (cpos.line < this.inputOffset) this.inputOffset = cpos.line;
+      if (cpos.line - this.inputOffset >= shownInputRows) {
+        this.inputOffset = cpos.line - shownInputRows + 1;
+      }
+    } else {
+      this.inputOffset = 0;
+    }
+    const inputTop = this.rows - shownInputRows + 1;
+    const statusRow = inputTop - 1;
+    const contentRows = Math.max(1, statusRow - 1);
 
     const rendered: string[] = [];
     for (const l of this.scrollback) {
@@ -344,43 +392,27 @@ export class TUI {
     if (this.scrollOffset > 0) {
       statusText = `${statusText}  ${ansi.dim}↑${this.scrollOffset}/${total}${ansi.reset}`;
     }
-    output += `\x1b[${this.rows - 1};1H`;
+    output += `\x1b[${statusRow};1H`;
     output += statusText ? paint(statusText.slice(0, colW), this.status.color) + "\x1b[K" : "\x1b[K";
 
-    // input row
-    const inputRow = this.rows;
-    output += `\x1b[${inputRow};1H`;
+    // input block
     if (this.promptOverride) {
+      output += `\x1b[${inputTop};1H`;
       output += this.promptOverride.slice(0, colW) + "\x1b[K";
+      for (let r = 1; r < shownInputRows; r++) output += `\x1b[${inputTop + r};1H\x1b[K`;
       out(output);
       return;
     }
 
-    const prefix = ansi.green + "❯" + ansi.reset + " ";
-    const prefixW = displayWidth("\u276f") + 1;
-    const maxTextW = colW - prefixW - 1;
-    let start = 0;
-    let truncated = false;
-    if (displayWidth(this.input) > maxTextW) {
-      truncated = true;
-      let w = 0;
-      for (let i = 0; i < this.cursor; i++) {
-        w += displayWidth(this.input[i] ?? "");
-        if (w > maxTextW) {
-          start = i + 1;
-          break;
-        }
-      }
+    for (let r = 0; r < shownInputRows; r++) {
+      const line = inputLines[this.inputOffset + r] ?? "";
+      const prefix = r === 0 ? ansi.green + "❯" + ansi.reset + " " : " ".repeat(INPUT_PREFIX_COLS);
+      output += `\x1b[${inputTop + r};1H`;
+      output += prefix + line + "\x1b[K";
     }
-    const shown = truncated ? "…" + this.input.slice(start) : this.input;
-    output += prefix + shown;
-    let leadW: number;
-    if (truncated && this.cursor === 0) leadW = 0;
-    else if (truncated) leadW = 1 + displayWidth(this.input.slice(start, this.cursor));
-    else leadW = displayWidth(this.input.slice(0, this.cursor));
-    const cursorCol = 1 + prefixW + leadW;
-    output += "\x1b[K";
-    output += `\x1b[${inputRow};${Math.min(cursorCol, colW + 1)}H`;
+    const cursorRow = inputTop + (cpos.line - this.inputOffset);
+    const cursorCol = 1 + INPUT_PREFIX_COLS + cpos.col;
+    output += `\x1b[${cursorRow};${Math.min(cursorCol, colW + 1)}H`;
 
     out(output);
   }
@@ -391,6 +423,7 @@ export class TUI {
     process.stdout.removeListener("resize", this.onWinch);
     out("\x1b[?25h");
     out("\x1b[?1049l");
+    disableMouse();
     restoreTerminal();
     process.stdout.write("\r\n");
   }
