@@ -43,6 +43,7 @@ Input and commands
 
 - `/provider <name>` — switch provider (groq, ollama, openai, anthropic…)
 - `/model <id>` — switch model
+- `/route [auto|chat|heavy]` — model routing mode: `auto` classifies each message, `chat` forces the light model, `heavy` forces the task model (see Model routing below)
 - `/approve [on|off]` — toggle per-tool approval prompts. Default **off** = no limits (agents act freely). With it on, each tool call asks `[y/n/a]` — `a` approves the rest of the run.
 - `/save [name]` — save this conversation (auto-saved snapshots kept in `~/.vibecoder/last.json`)
 - `/resume [name]` — resume a saved conversation (or the last one)
@@ -82,6 +83,32 @@ For OpenAI-compatible providers, the API key is read from the `apiKeyEnv` variab
 
 The bundled config also ships the NVIDIA provider with `nvidia/nemotron-3-ultra-550b-a55b` (1M context) and `nvidia/nemotron-3-super-120b-a12b`. Switch with `--provider nvidia --model "nvidia/nemotron-3-ultra-550b-a55b"` or by setting `provider` in `config.json`.
 
+## Model routing
+
+Vibecoder can route between **two** models: a fast/cheap one for chat & simple queries, and a big reasoning model for coding and complex tasks. This is what lets you talk to the free GROQ model all day without ever spending Nemotron credits on small talk, while still getting the heavy model when a real task starts.
+
+Configure a `routing` block in `config.json`:
+
+```json
+"routing": {
+  "chatProvider": "groq",
+  "chatModel": "qwen/qwen3.8-27b",
+  "heavyProvider": "nvidia",
+  "heavyModel": "nvidia/nemotron-3-ultra-550b-a55b",
+  "strategy": "hybrid"
+}
+```
+
+How it works per message:
+
+1. **Keyword rules** classify the message instantly as *chat*, *heavy* (coding verbs, file paths, code blocks, bug/error language, analysis terms), or *ambiguous*.
+2. `strategy: "hybrid"` — an ambiguous message is asked to the cheap model to decide (a ~1s one-word query, capped at 10s). `"keyword"` skips that call and treats ambiguous as chat.
+3. **Sticky tasking** — once a turn runs on the heavy model and actually used tools, follow-ups like "fix the bug" or "now make it faster" stay on the heavy model so the task keeps its context; a clearly-chat message resets it.
+
+`/route auto|chat|heavy` overrides the mode for the current session (persisted with saved conversations). While a message is processed, the status bar shows which model is handling it (`chat`/`heavy`). The heavy model's per-request limits come from its provider block; the `nvidia` entry ships with generous `timeoutMs`/`timeoutIdleMs` because Nemotron's hosted tier can take a while to produce its first token.
+
+If no `routing` block exists, vibecoder uses the top-level `provider`/`model` for everything (previous single-model behavior).
+
 Timeouts (optional, per provider):
 
 ```json
@@ -111,6 +138,7 @@ src/
 │   └── tool-call.ts parses + JSON-parses model tool calls
 ├── llm/
 │   ├── client.ts   config → provider factory
+│   ├── router.ts   dual-model router: keyword classifier + cheap-model fallback, sticky tasking
 │   ├── timeout.ts  total/idle request timeouts for providers
 │   ├── retry.ts    rate-limit (429/5xx) retry helper
 │   ├── types.ts    shared LLM types

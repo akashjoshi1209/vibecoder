@@ -1,4 +1,5 @@
 import type { ChatOptions, LLMProvider, ProviderConfig } from "./types";
+import type { RoutingConfig } from "./router";
 import { AnthropicProvider } from "./providers/anthropic";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ export interface RootConfig {
   provider: string;
   model: string;
   providers: Record<string, ProviderConfig>;
+  routing?: RoutingConfig;
   systemPrompt?: string;
   temperature?: number;
   maxTokens?: number;

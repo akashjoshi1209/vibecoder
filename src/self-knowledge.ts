@@ -71,6 +71,9 @@ export async function buildSelfReport(): Promise<string> {
     `Model card`,
     ...cardLines(model),
     ``,
+    `Routing`,
+    ...routingReportLines(cfg),
+    ``,
     `Runtime configuration`,
     `  - config file: ${cfgPath}`,
     `  - systemPrompt: ${cfg?.systemPrompt ? "custom (from config)" : "not set explicitly"}`,
@@ -87,6 +90,17 @@ export async function buildSelfReport(): Promise<string> {
   return lines.join("\n");
 }
 
+function routingReportLines(cfg: Awaited<ReturnType<typeof loadConfig>> | null): string[] {
+  const r = cfg?.routing;
+  if (!r) return ["  - not configured — single model is used for everything"];
+  const strategyNote = r.strategy === "keyword" ? "ambiguous → chat (keyword only)" : "ambiguous → asked to the cheap model";
+  return [
+    `  - auto-router: chat ${r.chatProvider}/${r.chatModel}  ·  heavy ${r.heavyProvider}/${r.heavyModel}`,
+    `  - strategy: ${r.strategy} (${strategyNote})`,
+    `  - the identity above reflects the model used for the last turn`,
+  ];
+}
+
 function joinRepoRoot(name: string): string {
   return join(resolve(import.meta.dir, ".."), name);
 }
@@ -97,6 +111,7 @@ export async function buildSelfToolReport(): Promise<string> {
   const provider = identity.provider || "unknown";
   const cfg = await loadConfig().catch(() => null);
   const c = findModelCard(model);
+  const r = cfg?.routing;
   return [
     "I am Vibecoder, a terminal coding agent. I do not have a body or a life outside this conversation.",
     `provider=${provider} model=${model}`,
@@ -105,6 +120,7 @@ export async function buildSelfToolReport(): Promise<string> {
       : "model card: not on file",
     `capabilities: ${(c ? c.capabilities : ["text chat", "tool calling"]).join(", ")}`,
     `boundaries: ${(c ? c.limits : ["no facts beyond what these tools show", "text-only"]).join("; ")}`,
+    `routing: ${r ? `auto (chat ${r.chatProvider}/${r.chatModel} ↔ heavy ${r.heavyProvider}/${r.heavyModel}, strategy ${r.strategy}) · last turn used ${provider}/${model}` : "single model for everything"}`,
     `tools: ${listTools().map((t) => t.function.name).join(", ")}`,
     `config: temperature=${cfg?.temperature ?? "unset"} maxInputTokens=${cfg?.maxInputTokens ?? "unset"} maxInputTokensPerMinute=${cfg?.maxInputTokensPerMinute ?? "unset"} systemPrompt=${cfg?.systemPrompt ? "custom" : "default"}`,
     `self-edits are staged + audited in SELF_EDITS.jsonl; they go live only after the human runs /reload-config`,

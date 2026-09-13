@@ -1,4 +1,5 @@
 import { createProvider, loadConfig, type RootConfig } from "../llm/client";
+import { ModelRouter, type RoutingMode } from "../llm/router";
 import type { Message, ChatOptions, ChatChunk, StreamResult } from "../llm/types";
 import { runAgent } from "../agent/loop";
 import "../tools/bash";
@@ -39,6 +40,29 @@ let maxInputTokens: number | undefined;
 let maxInputTokensPerMinute: number | undefined;
 let sessionId = "";
 let rootConfig: RootConfig | null = null;
+let router: ModelRouter | null = null;
+let routerMode: RoutingMode = "auto";
+let taskActive = false;
+
+function limitsFor(cfg: RootConfig): { maxInputTokens?: number; maxInputTokensPerMinute?: number } {
+  return {
+    maxInputTokens: cfg.maxInputTokens ?? (cfg.provider === "groq" ? 5000 : undefined),
+    maxInputTokensPerMinute: cfg.maxInputTokensPerMinute ?? (cfg.provider === "groq" ? 6500 : undefined),
+  };
+}
+
+function shortId(provider: string, model: string): string {
+  return model.startsWith(provider + "/") ? model.slice(provider.length + 1) : model;
+}
+
+function routeLabel(): string {
+  if (!router) return "";
+  const { chat, heavy } = router.names();
+  const c = router.chatIdentity();
+  const h = router.heavyIdentity();
+  if (chat === heavy) return `router ${routerMode} · ${chat}/${shortId(chat, c.model)}`;
+  return `router ${routerMode} · chat ${chat}/${shortId(chat, c.model)} ↔ heavy ${heavy}/${shortId(heavy, h.model)}`;
+}
 
 function currentSession(): SessionData {
   return {
@@ -51,6 +75,7 @@ function currentSession(): SessionData {
     cwd,
     systemPrompt,
     messages,
+    routerMode,
     messageCount: messages.length,
   };
 }
@@ -73,6 +98,8 @@ function applySession(s: SessionData | null): boolean {
   if (!s || !Array.isArray(s.messages)) return false;
   messages = s.messages.filter((m) => m && typeof m.role === "string");
   sessionId = s.id;
+  taskActive = false;
+  if (s.routerMode) routerMode = s.routerMode;
   if (s.systemPrompt) systemPrompt = s.systemPrompt;
   if (s.cwd) cwd = s.cwd;
   if (s.provider && rootConfig) {
@@ -81,6 +108,7 @@ function applySession(s: SessionData | null): boolean {
       providerName = r.name;
       llmModel = s.model || r.model;
       providerStream = r.provider.streamChat.bind(r.provider);
+      router?.setChat(providerName, llmModel);
     } catch {
       /* keep current provider */
     }
@@ -89,10 +117,13 @@ function applySession(s: SessionData | null): boolean {
 }
 
 function banner(provider: string, model: string, dir: string): string[] {
-  return [
+  const lines = [
     `${colors.bold}${colors.green}vibecoder${colors.reset} ${colors.dim}— your own coding agent, no limitations${colors.reset}`,
     `${colors.dim}provider: ${provider}  model: ${model}  cwd: ${dir}  (type /help)${colors.reset}`,
   ];
+  const rl = routeLabel();
+  if (rl) lines.push(`${colors.dim}  ${rl}${colors.reset}`);
+  return lines;
 }
 
 async function init() {
@@ -105,9 +136,11 @@ async function init() {
   setRuntimeIdentity(providerName, llmModel);
   chatTemperature = config.temperature;
   chatMaxTokens = config.maxTokens;
-  maxInputTokens = config.maxInputTokens ?? (config.provider === "groq" ? 5000 : undefined);
-  maxInputTokensPerMinute = config.maxInputTokensPerMinute ?? (config.provider === "groq" ? 6500 : undefined);
+  const limits = limitsFor(config);
+  maxInputTokens = limits.maxInputTokens;
+  maxInputTokensPerMinute = limits.maxInputTokensPerMinute;
   providerStream = resolved.provider.streamChat.bind(resolved.provider);
+  router = new ModelRouter(config, limits);
 
   const pIdx = process.argv.indexOf("--provider");
   if (pIdx !== -1 && process.argv[pIdx + 1]) {
@@ -117,6 +150,7 @@ async function init() {
     const mIdx = process.argv.indexOf("--model");
     if (mIdx !== -1 && process.argv[mIdx + 1]) llmModel = process.argv[mIdx + 1];
     else llmModel = r.model;
+    router?.setChat(providerName, llmModel);
   }
   setRuntimeIdentity(providerName, llmModel);
 
@@ -143,7 +177,10 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     else console.log(s);
   };
   const setStatus = () => {
-    if (tui) tui.setStatus(`provider ${providerName} · model ${llmModel}`, 8);
+    if (tui) {
+      const rl = routeLabel();
+      tui.setStatus(rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`, 8);
+    }
   };
 
   if (["exit", "quit", "/exit", "/quit"].includes(line.trim())) {
@@ -155,6 +192,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`\n${colors.bold}Commands${colors.reset}`);
     print(`  ${colors.green}/provider <name>${colors.reset}  switch provider (groq, ollama, openai, anthropic…)`);
     print(`  ${colors.green}/model <id>${colors.reset}       switch model`);
+    print(`  ${colors.green}/route [auto|chat|heavy]${colors.reset} ${colors.dim}model routing: auto-classify, or force chat/heavy model${colors.reset}`);
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
     print(`  ${colors.green}/save [name]${colors.reset}      save this conversation`);
     print(`  ${colors.green}/resume [name]${colors.reset}    resume a saved conversation (or the last one)`);
@@ -232,12 +270,14 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   if (line.trim() === "/new") {
     messages = [];
     sessionId = "";
+    taskActive = false;
     const config = await loadConfig();
     if (config.systemPrompt) systemPrompt = config.systemPrompt + SELF_EDIT_PROTOCOL;
     tui?.clearScrollback();
     if (tui) {
       for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b);
-      tui.setStatus(`provider ${providerName} · model ${llmModel}`, 8);
+      const rl = routeLabel();
+      tui.setStatus(rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`, 8);
     }
     print(`${colors.dim}fresh conversation started${colors.reset}`);
     return true;
@@ -245,6 +285,8 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   if (line.startsWith("/model ")) {
     llmModel = line.slice(7).trim();
     if (!llmModel) return true;
+    router?.setChat(providerName, llmModel);
+    taskActive = false;
     setRuntimeIdentity(providerName, llmModel);
     setStatus();
     print(`${colors.dim}model set to ${llmModel}${colors.reset}`);
@@ -256,9 +298,27 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     providerName = r.name;
     llmModel = r.model;
     providerStream = r.provider.streamChat.bind(r.provider);
+    router?.setChat(providerName, llmModel);
+    taskActive = false;
     setRuntimeIdentity(providerName, llmModel);
     setStatus();
     print(`${colors.dim}provider set to ${providerName}, model ${llmModel}${colors.reset}`);
+    return true;
+  }
+  if (line.startsWith("/route")) {
+    const arg = line.slice(6).trim().toLowerCase();
+    if (!arg) {
+      print(`${colors.dim}mode: ${routerMode} · ${routeLabel() || `provider ${providerName}/${llmModel}`}${colors.reset}`);
+      return true;
+    }
+    if (arg === "auto" || arg === "chat" || arg === "heavy") {
+      routerMode = arg;
+      taskActive = false;
+      setStatus();
+      print(`${colors.dim}router mode: ${routerMode}  (chat = ${routeLabel()})${colors.reset}`);
+    } else {
+      print(`${colors.red}usage: /route [auto|chat|heavy]${colors.reset}`);
+    }
     return true;
   }
   if (line.startsWith("/approve")) {
@@ -292,9 +352,11 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     systemPrompt = (cfg.systemPrompt ?? "You are Vibecoder.") + SELF_EDIT_PROTOCOL;
     chatTemperature = cfg.temperature;
     chatMaxTokens = cfg.maxTokens;
-    maxInputTokens = cfg.maxInputTokens ?? undefined;
-    maxInputTokensPerMinute = cfg.maxInputTokensPerMinute ?? undefined;
+    const limits = limitsFor(cfg);
+    maxInputTokens = limits.maxInputTokens;
+    maxInputTokensPerMinute = limits.maxInputTokensPerMinute;
     rootConfig = cfg;
+    router = new ModelRouter(cfg, limits);
     appendLedger({ tool: "/reload-config", file: "config.json", beforeSha: "", afterSha: "", note: "staged config edits approved and applied by human" });
     setStatus();
     print(`${colors.green}approved & applied${colors.reset} — config is now live (${cfg.model ?? "model from config"}).${colors.dim} Consider ${colors.reset}${colors.green}git add config.json && git commit${colors.reset}${colors.dim} to mark this as the new approved baseline.${colors.reset}`);
@@ -308,6 +370,10 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
       if (cfg) {
         systemPrompt = (cfg.systemPrompt ?? "You are Vibecoder.") + SELF_EDIT_PROTOCOL;
         rootConfig = cfg;
+        const limits = limitsFor(cfg);
+        maxInputTokens = limits.maxInputTokens;
+        maxInputTokensPerMinute = limits.maxInputTokensPerMinute;
+        router = new ModelRouter(cfg, limits);
       }
       print(`${colors.green}config.json reset to the last approved state.${colors.reset}${res.out ? ` (${res.out})` : ""}`);
       print(`  ${colors.dim}run /reload-config to reload the restored values.${colors.reset}`);
@@ -326,10 +392,12 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   }
   if (line.trim() === "/clear") {
     messages = [];
+    taskActive = false;
     tui?.clearScrollback();
     if (tui) {
       for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b);
-      tui.setStatus(`provider ${providerName} · model ${llmModel}`, 8);
+      const rl = routeLabel();
+      tui.setStatus(rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`, 8);
     }
     return true;
   }
@@ -343,14 +411,32 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
 async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
   messages.push({ role: "user", content: userInput });
 
+  let turnProvider = providerStream;
+  let turnModel = llmModel;
+  let turnMaxInput = maxInputTokens;
+  let turnMaxInputPerMinute = maxInputTokensPerMinute;
+  let heavyRoute = false;
+  let routeNote = "";
+  if (router) {
+    const route = await router.resolve(userInput, routerMode, taskActive);
+    turnProvider = route.provider.streamChat.bind(route.provider);
+    turnModel = route.model;
+    turnMaxInput = route.maxInputTokens;
+    turnMaxInputPerMinute = route.maxInputTokensPerMinute;
+    heavyRoute = router.isHeavy(route);
+    setRuntimeIdentity(route.providerName, route.model);
+    routeNote = `→ ${heavyRoute ? "heavy" : "chat"}: ${route.providerName}/${route.model}`;
+  }
+
   if (!tui) {
-    process.stdout.write(`${colors.cyan}● ${providerName}/${llmModel}${colors.reset}\n`);
+    process.stdout.write(`${colors.cyan}● ${turnModel}${colors.reset}${routeNote ? ` ${colors.dim}${routeNote}${colors.reset}` : ""}\n`);
   } else {
     tui.printToScrollback("");
     tui.separator();
     tui.printToScrollback(`${colors.bold}${colors.cyan}❯ ${userInput}${colors.reset}`);
+    if (routeNote) tui.printToScrollback(`${colors.dim}${routeNote}${colors.reset}`);
     tui.busy = true;
-    tui.setStatus("thinking…  (ctrl-c to interrupt)", 8);
+    tui.setStatus(`router ${routerMode}${taskActive ? " · task" : ""}${heavyRoute ? " · heavy" : ""} — thinking…  (ctrl-c to interrupt)`, 8);
   }
 
   let aborted = false;
@@ -372,9 +458,9 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
   try {
     const result = await runAgent(
       {
-        provider: providerStream,
+        provider: turnProvider,
         systemPrompt,
-        model: llmModel,
+        model: turnModel,
         initialMessages: messages,
         toolCtx: { cwd, signal: ac.signal },
         signal: ac.signal,
@@ -382,8 +468,8 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
           temperature: chatTemperature,
           max_tokens: chatMaxTokens,
         },
-        maxInputTokens,
-        maxInputTokensPerMinute,
+        maxInputTokens: turnMaxInput,
+        maxInputTokensPerMinute: turnMaxInputPerMinute,
       },
       {
         maxSteps,
@@ -430,6 +516,8 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     );
 
     messages.push({ role: "assistant", content: result.finalText });
+    if (result.aborted) taskActive = false;
+    else taskActive = heavyRoute && result.toolCalls > 0;
     void aborted;
   } catch (err: any) {
     const msg = err?.message ?? String(err);
@@ -442,7 +530,8 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     persistLast();
     if (tui) {
       tui.busy = false;
-      tui.setStatus(`provider ${providerName} · model ${llmModel} · approve ${tui.approveMode === "on" ? "on" : "off"} · PgUp/PgDn scroll`, 8);
+      const rl = routeLabel();
+      tui.setStatus(`${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     } else {
       process.stdout.write("\n");
     }
@@ -478,7 +567,8 @@ function mainTUI(): void {
 
   tui.start();
   for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b, true);
-  tui.setStatus(`provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`, 8);
+  const rl0 = routeLabel();
+  tui.setStatus(rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`, 8);
 }
 
 function mainLine(): void {

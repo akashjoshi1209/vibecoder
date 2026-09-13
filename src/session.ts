@@ -17,6 +17,7 @@ export interface SessionData extends SessionMeta {
   cwd: string;
   systemPrompt: string;
   messages: Message[];
+  routerMode?: "auto" | "chat" | "heavy";
 }
 
 let _root: string | null = null;

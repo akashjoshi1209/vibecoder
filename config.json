@@ -12,6 +12,8 @@
       "type": "openai-compatible",
       "baseURL": "https://integrate.api.nvidia.com/v1",
       "apiKeyEnv": "NVIDIA_API_KEY",
+      "timeoutMs": 300000,
+      "timeoutIdleMs": 180000,
       "models": ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-super-120b-a12b"]
     },
     "ollama": {
@@ -32,6 +34,13 @@
       "apiKeyEnv": "ANTHROPIC_API_KEY",
       "models": ["claude-sonnet-4-5", "claude-3-5-haiku-latest"]
     }
+  },
+  "routing": {
+    "chatProvider": "groq",
+    "chatModel": "qwen/qwen3.8-27b",
+    "heavyProvider": "nvidia",
+    "heavyModel": "nvidia/nemotron-3-ultra-550b-a55b",
+    "strategy": "hybrid"
   },
   "temperature": 0.7,
   "maxInputTokens": 5000,
