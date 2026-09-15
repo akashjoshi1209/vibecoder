@@ -1,6 +1,6 @@
 {
-  "provider": "groq",
-  "model": "qwen/qwen3.8-27b",
+  "provider": "ollama",
+  "model": "qwen2.5:1.5b",
   "providers": {
     "groq": {
       "type": "openai-compatible",
@@ -36,11 +36,25 @@
     }
   },
   "routing": {
-    "chatProvider": "groq",
-    "chatModel": "qwen/qwen3.8-27b",
-    "heavyProvider": "nvidia",
-    "heavyModel": "nvidia/nemotron-3-ultra-550b-a55b",
-    "strategy": "hybrid"
+    "chatProvider": "ollama",
+    "chatModel": "qwen2.5:1.5b",
+    "heavyProvider": "groq",
+    "heavyModel": "openai/gpt-oss-120b",
+    "strategy": "hybrid",
+    "heavyMaxInputTokens": 10000,
+    "heavyMaxInputTokensPerMinute": 6500,
+    "offlineProvider": "ollama",
+    "offlineModel": "qwen2.5:1.5b"
+  },
+  "queue": {
+    "file": "~/.vibecoder/queue.json",
+    "autoApproveExceptDestructive": true,
+    "daemonLog": "~/.vibecoder/queue-daemon.log"
+  },
+  "connectivity": {
+    "probeUrl": "https://api.groq.com/openai/v1/models",
+    "pollMs": 15000,
+    "timeoutMs": 8000
   },
   "temperature": 0.7,
   "maxInputTokens": 5000,

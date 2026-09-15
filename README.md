@@ -68,7 +68,17 @@ Self-edits to `config.json` / `.env` are **staged, audited, and revertible**, ne
 - `/undo-self-edits` restores `config.json` from git (the last commit = last approved state).
 - The audit ledger cannot be modified or deleted through the file tools; the reset/reload commands live in code that is itself git-tracked, so any attempt to remove them shows up in `git diff` and is revertible. (An agent with free `bash` access can still bypass file-tool blocking — that residual risk is documented here.)
 - The SEP is also injected into every system prompt as an immutable preamble (`SELF_EDIT_PROTOCOL`) that config edits can't remove.
+
+## Commands
+
 - `exit` or `quit` — leave the REPL outside the TUI; `ctrl-c` when idle inside the TUI
+- `/about` — print who/what Vibecoder is (model card, provider, config, tools)
+- `/route auto|chat|heavy` — set the routing mode for the current session
+- `/reload-config` — approve staged `config.json` / `.env` self-edits and apply them
+- `/undo-self-edits` — revert `config.json` to the last committed (approved) state
+- `/save` — save the current conversation to a timestamped JSONL file under `vibecoder/sessions/`
+- `/load <file>` — load a saved conversation (bare filename is resolved against `vibecoder/sessions/`)
+- `/sessions` — list saved conversations (newest first)
 
 ## Configuration (`config.json`)
 
@@ -189,4 +199,4 @@ Edit `systemPrompt` in `config.json`, or dive into `src/agent/loop.ts` — you o
 ## Notes
 
 - Tool outputs are capped (30k chars for bash) to protect context; adjust constants in `src/tools/`.
-- GROQ default model: `qwen/qwen3.8-27b`. Check `curl -s https://api.groq.com/openai/v1/models` (with your key) for the current catalog.
+- Default model: `qwen2.5:1.5b` on Ollama. Check `ollama list` for locally available models. GROQ models (`qwen/qwen3.8-27b`, `openai/gpt-oss-120b`) are also configured as providers.
