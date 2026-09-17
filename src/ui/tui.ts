@@ -1,4 +1,5 @@
 import { KeyReader, type KeyEvent, ansi, disableMouse, displayWidth, enableMouse, enableRawMode, getSize, out, paint, restoreTerminal, wrapAnsi, wrapText } from "./terminal";
+import { theme } from "./present/theme";
 
 export type ConfirmAnswer = "yes" | "no" | "all";
 
@@ -89,6 +90,14 @@ export class TUI {
         else if (ev.kind === "pagedown") { this.scrollBy(-this.pageSize()); this.render(); }
         else if (ev.kind === "scrollup") { this.scrollBy(WHEEL_STEP); this.render(); }
         else if (ev.kind === "scrolldown") { this.scrollBy(-WHEEL_STEP); this.render(); }
+        else if (ev.kind === "enter" || ev.kind === "tab") {
+          // swallow: never submit while a run is in progress
+          this.render();
+        } else {
+          // let the user keep editing the input line while busy
+          this.handleIdle(ev);
+          this.render();
+        }
         continue;
       }
       this.handleIdle(ev);
@@ -381,10 +390,15 @@ export class TUI {
 
     // Move to origin (top of alt screen) and repaint
     let output = "\x1b[H";
-    for (let r = 0; r < contentRows; r++) {
-      const line = vis[r];
-      output += `\x1b[${r + 1};1H`;
-      output += line ? line + "\x1b[K" : "\x1b[K";
+    // idle composition: blank content area (no wordmark). Input choke paints "+  Ask anything...", status row paints "● Ready".
+    if (vis.length === 0 && !this.stream.text) {
+      for (let r = 0; r < contentRows; r++) output += `\x1b[${r + 1};1H\x1b[K`;
+    } else {
+      for (let r = 0; r < contentRows; r++) {
+        const line = vis[r];
+        output += `\x1b[${r + 1};1H`;
+        output += line ? line + "\x1b[K" : "\x1b[K";
+      }
     }
 
     // status row (with a scroll-back indicator when the user has paged up)
@@ -393,7 +407,9 @@ export class TUI {
       statusText = `${statusText}  ${ansi.dim}↑${this.scrollOffset}/${total}${ansi.reset}`;
     }
     output += `\x1b[${statusRow};1H`;
-    output += statusText ? paint(statusText.slice(0, colW), this.status.color) + "\x1b[K" : "\x1b[K";
+    output += statusText
+      ? paint(statusText.slice(0, colW), this.status.color) + "\x1b[K"
+      : (theme.violet + "●" + theme.reset + "  " + theme.muted + "Ready" + theme.reset + "\x1b[K");
 
     // input block
     if (this.promptOverride) {
@@ -406,7 +422,13 @@ export class TUI {
 
     for (let r = 0; r < shownInputRows; r++) {
       const line = inputLines[this.inputOffset + r] ?? "";
-      const prefix = r === 0 ? ansi.green + "❯" + ansi.reset + " " : " ".repeat(INPUT_PREFIX_COLS);
+      if (r === 0 && !this.input.trim()) {
+        const placeholder = theme.muted + "+  Ask anything..." + theme.reset;
+        output += `\x1b[${inputTop + r};1H`;
+        output += theme.violet + "+" + theme.reset + "  " + placeholder + "\x1b[K" + ansi.reset;
+        continue;
+      }
+      const prefix = r === 0 ? theme.violet + "+" + theme.reset + "  " : " ".repeat(INPUT_PREFIX_COLS);
       output += `\x1b[${inputTop + r};1H`;
       output += prefix + line + "\x1b[K";
     }

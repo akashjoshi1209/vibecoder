@@ -3,6 +3,8 @@ import type { ToolDefinition } from "../llm/types";
 export interface ToolContext {
   cwd: string;
   signal?: AbortSignal;
+  /** Plan mode: the agent is investigating and planning only — mutating tools are blocked. */
+  planPhase?: boolean;
 }
 
 export interface Tool {

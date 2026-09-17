@@ -2,7 +2,7 @@
 //
 //  - chat/light  (default fast/cheap model, e.g. groq/qwen) — conversation,
 //    simple queries, small talk.
-//  - heavy        (big reasoning/coding model, e.g. nvidia/nemotron-3-ultra) —
+//  - heavy        (big reasoning/coding model, e.g. groq/gpt-oss-120b) —
 //    coding, debugging, build tasks, complex reasoning.
 //
 // Decision per turn (strategy "hybrid", default):
@@ -26,15 +26,25 @@ export interface RoutingConfig {
   heavyProvider: string;
   heavyModel: string;
   strategy: "keyword" | "hybrid";
+  /** Per-side token budgets — when both models share the same API key (e.g. both on GROQ),
+   *  these let each side pace independently against the combined rate limit. */
+  heavyMaxInputTokens?: number;
+  heavyMaxInputTokensPerMinute?: number;
+  /** Local fallback used when the online providers are unreachable (offline chat/planning). */
+  offlineProvider?: string;
+  offlineModel?: string;
 }
 
 export interface RouteResult {
   provider: LLMProvider;
   providerName: string;
   model: string;
-  /** Token budget to pass to the loop: set for the light model, undefined for heavy (1M ctx). */
+  /** Token budget to pass to the loop: set per-side from config (light model low,
+   *  heavy model higher). Omitted when the side has no configured cap. */
   maxInputTokens?: number;
   maxInputTokensPerMinute?: number;
+  /** True when the route resolved to the local offline fallback model. */
+  offline?: boolean;
 }
 
 const CLASSIFIER_SYSTEM =
@@ -93,9 +103,12 @@ export function classifyMessage(text: string): Classification {
 export class ModelRouter {
   private chat: { provider: LLMProvider; providerName: string; model: string };
   private heavy: { provider: LLMProvider; providerName: string; model: string };
+  private offline?: { provider: LLMProvider; providerName: string; model: string };
   private readonly strategy: "keyword" | "hybrid";
   private readonly chatMaxInputTokens?: number;
   private readonly chatMaxInputTokensPerMinute?: number;
+  private readonly heavyMaxInputTokens?: number;
+  private readonly heavyMaxInputTokensPerMinute?: number;
   private classifierOverride?: (text: string) => Promise<"chat" | "heavy">;
 
   constructor(
@@ -109,6 +122,8 @@ export class ModelRouter {
   ) {
     this.chatMaxInputTokens = opts.maxInputTokens;
     this.chatMaxInputTokensPerMinute = opts.maxInputTokensPerMinute;
+    this.heavyMaxInputTokens = config.routing?.heavyMaxInputTokens;
+    this.heavyMaxInputTokensPerMinute = config.routing?.heavyMaxInputTokensPerMinute;
     this.classifierOverride = opts.classifier;
 
     const routing = config.routing;
@@ -134,6 +149,18 @@ export class ModelRouter {
       }
     })();
     this.heavy = safeHeavy;
+
+    // Optional offline fallback (e.g. local ollama). When it cannot be built —
+    // e.g. provider missing — offline routing degrades to the chat side.
+    const offlineName = routing?.offlineProvider;
+    const offlineModel = routing?.offlineModel;
+    if (offlineName) {
+      try {
+        this.offline = this.buildSide(offlineName, offlineModel || this.chat.model);
+      } catch {
+        this.offline = undefined;
+      }
+    }
   }
 
   private buildSide(name: string, model: string): { provider: LLMProvider; providerName: string; model: string } {
@@ -180,6 +207,11 @@ export class ModelRouter {
     return { provider: this.heavy.providerName, model: this.heavy.model };
   }
 
+  offlineIdentity(): { provider: string; model: string } | null {
+    if (!this.offline) return null;
+    return { provider: this.offline.providerName, model: this.offline.model };
+  }
+
   isHeavy(route: RouteResult): boolean {
     return route.providerName === this.heavy.providerName && route.model === this.heavy.model;
   }
@@ -203,6 +235,24 @@ export class ModelRouter {
     return this.route("chat", userMessage);
   }
 
+  /**
+   * Offline fallback: always routes to the local model (chat side of the local
+   * provider, or the chat side if no offline provider is configured). Heavy
+   * tasks are NOT routed here — the REPL queues them instead via classifyMessage
+   * + enqueueTask. Kept separate from resolve() so online behaviour is unchanged.
+   */
+  resolveOffline(_userMessage: string): RouteResult {
+    const side = this.offline ?? this.chat;
+    return {
+      provider: side.provider,
+      providerName: side.providerName,
+      model: side.model,
+      maxInputTokens: this.offline ? 4000 : this.chatMaxInputTokens,
+      maxInputTokensPerMinute: this.offline ? undefined : this.chatMaxInputTokensPerMinute,
+      offline: true,
+    };
+  }
+
   private route(kind: "chat" | "heavy", _userMessage: string): RouteResult {
     const side = kind === "chat" ? this.chat : this.heavy;
     const heavy = kind === "heavy";
@@ -210,8 +260,8 @@ export class ModelRouter {
       provider: side.provider,
       providerName: side.providerName,
       model: side.model,
-      maxInputTokens: heavy ? undefined : this.chatMaxInputTokens,
-      maxInputTokensPerMinute: heavy ? undefined : this.chatMaxInputTokensPerMinute,
+      maxInputTokens: heavy ? this.heavyMaxInputTokens : this.chatMaxInputTokens,
+      maxInputTokensPerMinute: heavy ? this.heavyMaxInputTokensPerMinute : this.chatMaxInputTokensPerMinute,
     };
   }
 

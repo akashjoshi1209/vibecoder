@@ -1,5 +1,9 @@
 import { createProvider, loadConfig, type RootConfig } from "../llm/client";
-import { ModelRouter, type RoutingMode } from "../llm/router";
+import { ModelRouter, classifyMessage, type RoutingMode } from "../llm/router";
+import { createConnectivityPoller, type ConnectivityPoller } from "../llm/connectivity";
+import { draftPlanNote, drainQueue, type QueueRunnerDeps } from "../queue-runner";
+import { enqueueTask, listTasks, setQueueFileOverride, type QueuedTask } from "../queue";
+import { ensureOllamaServe } from "../ollama";
 import type { Message, ChatOptions, ChatChunk, StreamResult } from "../llm/types";
 import { runAgent } from "../agent/loop";
 import "../tools/bash";
@@ -43,6 +47,10 @@ let rootConfig: RootConfig | null = null;
 let router: ModelRouter | null = null;
 let routerMode: RoutingMode = "auto";
 let taskActive = false;
+let connectivityPoller: ConnectivityPoller | null = null;
+let online = false;
+let nowDraining = false;
+let tuiRef: TUI | null = null;
 
 function limitsFor(cfg: RootConfig): { maxInputTokens?: number; maxInputTokensPerMinute?: number } {
   return {
@@ -116,19 +124,14 @@ function applySession(s: SessionData | null): boolean {
   return true;
 }
 
-function banner(provider: string, model: string, dir: string): string[] {
-  const lines = [
-    `${colors.bold}${colors.green}vibecoder${colors.reset} ${colors.dim}— your own coding agent, no limitations${colors.reset}`,
-    `${colors.dim}provider: ${provider}  model: ${model}  cwd: ${dir}  (type /help)${colors.reset}`,
-  ];
-  const rl = routeLabel();
-  if (rl) lines.push(`${colors.dim}  ${rl}${colors.reset}`);
-  return lines;
+function banner(_provider: string, _model: string, _dir: string): string[] {
+  return [];
 }
 
 async function init() {
   const config = await loadConfig();
   rootConfig = config;
+  setQueueFileOverride((config as any).queue?.file);
   const resolved = createProvider(config);
   providerName = resolved.name;
   llmModel = resolved.model;
@@ -141,6 +144,41 @@ async function init() {
   maxInputTokensPerMinute = limits.maxInputTokensPerMinute;
   providerStream = resolved.provider.streamChat.bind(resolved.provider);
   router = new ModelRouter(config, limits);
+
+  // ── local ollama autostart ─────────────────────────────────────────────────
+  if (router.offlineIdentity()) {
+    const oll = await ensureOllamaServe({
+      readyTimeoutMs: 6000,
+      onLog: (line) => process.stdout.write(`${colors.dim}${line}${colors.reset}\n`),
+    });
+    if (oll && !oll.running && !(oll.error ?? "").includes("autostart disabled")) {
+      process.stdout.write(`${colors.dim}note: offline chat needs a local model (ollama pull qwen2.5:1.5b); meanwhile set GROQ_API_KEY so online routes keep working.${colors.reset}\n`);
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // ── connectivity ──────────────────────────────────────────────────────────
+  const probeCfg = config.connectivity ?? {};
+  const probeUrl = probeCfg.probeUrl ?? "https://api.groq.com/openai/v1/models";
+  const pollMs = probeCfg.pollMs ?? 15_000;
+  const timeoutMs = probeCfg.timeoutMs ?? 8_000;
+  connectivityPoller = createConnectivityPoller(
+    { probeUrl, timeoutMs, pollMs },
+    (now) => {
+      online = now;
+      if (tuiRef) {
+        const rl = routeLabel();
+        tuiRef.setStatus(
+          `${onlineStatus()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`,
+          8,
+        );
+      }
+      if (online) void inAppDrain();
+    },
+  );
+  await connectivityPoller.checkNow();
+  online = connectivityPoller.online;
+  // ──────────────────────────────────────────────────────────────────────────
 
   const pIdx = process.argv.indexOf("--provider");
   if (pIdx !== -1 && process.argv[pIdx + 1]) {
@@ -166,6 +204,58 @@ async function init() {
   }
 }
 
+function onlineStatus(): string {
+  if (online) return "";
+  const off = router?.offlineIdentity();
+  return off ? `offline (${off.provider}/${off.model}) · ` : "offline · ";
+}
+
+/** Queue a task that was given while offline. Draft a plan note with the local
+ *  model and print a preview to the TUI/REPL. */
+async function queueOfflineTask(userInput: string, tui?: TUI): Promise<void> {
+  if (!router || !rootConfig) return;
+  const offRoute = router.resolveOffline(userInput);
+  let planNote: string | undefined;
+  try {
+    planNote = await draftPlanNote(offRoute, userInput, 120_000);
+  } catch { /* best-effort */ }
+
+  const task = enqueueTask({
+    userMessage: userInput,
+    cwd,
+    sessionId: sessionId || `session-${Date.now().toString(36)}`,
+    systemPrompt,
+    planNote,
+  });
+
+  const print = (s: string) => { if (tui) tui.printToScrollback(s); else process.stdout.write(s + "\n"); };
+  print(`${colors.green}✓ queued${colors.reset} ${colors.dim}${task.id}${colors.reset} — will run automatically when connectivity returns`);
+  if (planNote) print(`${colors.dim}${planNote.slice(0, 600)}${colors.reset}`);
+  else print(`${colors.dim}(offline plan draft unavailable — the task is still queued)`);
+
+  persistLast();
+}
+
+/** Drain the task queue now, streaming activity to the active TUI. */
+async function inAppDrain(): Promise<void> {
+  if (nowDraining || !router || !rootConfig) return;
+  nowDraining = true;
+  try {
+    const cfg = rootConfig.queue ?? {};
+    const deps: QueueRunnerDeps = {
+      config: rootConfig,
+      router,
+      maxSteps: maxSteps,
+      autoApproveExceptDestructive: cfg.autoApproveExceptDestructive ?? true,
+      onLog: (line) => tuiRef?.printToScrollback(line),
+    };
+    const { ran, failed } = await drainQueue(deps);
+    if (tuiRef && ran) tuiRef.printToScrollback(`${colors.green}[queue] drained ${ran} task(s)${failed ? `, ${failed} failed` : ""}${colors.reset}`);
+  } finally {
+    nowDraining = false;
+  }
+}
+
 function brief(args: Record<string, unknown>): string {
   const s = JSON.stringify(args);
   return s.length > 120 ? s.slice(0, 120) + "…" : s;
@@ -179,7 +269,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   const setStatus = () => {
     if (tui) {
       const rl = routeLabel();
-      tui.setStatus(rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`, 8);
+      tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
   };
 
@@ -204,6 +294,8 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/undo-self-edits${colors.reset}   reset config.json to last approved state (git)`);
     print(`  ${colors.green}/new${colors.reset}              start a fresh conversation (keeps provider/model)`);
     print(`  ${colors.green}/clear${colors.reset}            clear conversation + screen`);
+    print(`  ${colors.green}/queue${colors.reset}            list queued offline tasks (auto-run when online)`);
+    print(`  ${colors.green}/run-now${colors.reset}          drain the task queue now`);
     print(`  ${colors.green}/help${colors.reset}             this help`);
     print(`  ${colors.dim}PageUp/PageDown${colors.reset}       scroll back through the conversation`);
     print(`  ${colors.green}ctrl-c${colors.reset}            interrupt running task · clear input · exit\n`);
@@ -275,9 +367,9 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     if (config.systemPrompt) systemPrompt = config.systemPrompt + SELF_EDIT_PROTOCOL;
     tui?.clearScrollback();
     if (tui) {
-      for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b);
+      // presentation-only: wordmark is owned by tui.ts centered idle choke; banner() stays, but must NOT be re-emitted to scrollback (accumulates per refresh/keyboard cycle)
       const rl = routeLabel();
-      tui.setStatus(rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`, 8);
+      tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
     print(`${colors.dim}fresh conversation started${colors.reset}`);
     return true;
@@ -395,10 +487,35 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     taskActive = false;
     tui?.clearScrollback();
     if (tui) {
-      for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b);
+      // presentation-only: wordmark is owned by tui.ts centered idle choke; banner() stays, but must NOT be re-emitted to scrollback (accumulates per refresh/keyboard cycle)
       const rl = routeLabel();
-      tui.setStatus(rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`, 8);
+      tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
+    return true;
+  }
+  if (line.trim() === "/queue") {
+    const tasks = listTasks();
+    if (!tasks.length) {
+      print(`${colors.dim}task queue is empty — offline tasks will be queued here automatically${colors.reset}`);
+      return true;
+    }
+    print(`\n${colors.bold}Task queue (${tasks.length})${colors.reset}${online ? "" : `${colors.dim} — offline; will drain when online${colors.reset}`}`);
+    for (const t of tasks) {
+      const when = new Date(t.createdAt).toLocaleTimeString();
+      const badge =
+        t.status === "done" ? colors.green + "done" : t.status === "failed" ? colors.red + "failed" : t.status === "running" ? colors.yellow + "running" : colors.cyan + "queued";
+      print(`  ${colors.gray}${t.id}${colors.reset} ${badge}${colors.reset} ${colors.dim}${when} · ${String(t.userMessage).slice(0, 70)}${colors.reset}`);
+    }
+    return true;
+  }
+  if (line.trim() === "/run-now" || line.trim() === "/drain") {
+    if (!router || !rootConfig) {
+      print(`${colors.red}router not initialised — try again in a moment${colors.reset}`);
+      return true;
+    }
+    print(online ? `${colors.dim}draining queued tasks… (destination: router heavy model)${colors.reset}` : `${colors.dim}terminal is offline — /run-now attempts the queue anyway; it will retry when online${colors.reset}`);
+    await inAppDrain();
+    print(`${colors.green}drain complete${colors.reset}`);
     return true;
   }
   if (line.startsWith("/")) {
@@ -418,14 +535,33 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
   let heavyRoute = false;
   let routeNote = "";
   if (router) {
-    const route = await router.resolve(userInput, routerMode, taskActive);
-    turnProvider = route.provider.streamChat.bind(route.provider);
-    turnModel = route.model;
-    turnMaxInput = route.maxInputTokens;
-    turnMaxInputPerMinute = route.maxInputTokensPerMinute;
-    heavyRoute = router.isHeavy(route);
-    setRuntimeIdentity(route.providerName, route.model);
-    routeNote = `→ ${heavyRoute ? "heavy" : "chat"}: ${route.providerName}/${route.model}`;
+    // Offline: tasks are queued for later; everything else chats on the local model.
+    if (!online) {
+      const c = classifyMessage(userInput);
+      if (c === "heavy") {
+        await queueOfflineTask(userInput, tui);
+        // The turn is queued, not answered here — don't leave an unanswered
+        // user turn lingering in the conversation history.
+        messages.pop();
+        return;
+      }
+      const off = router.resolveOffline(userInput);
+      turnProvider = off.provider.streamChat.bind(off.provider);
+      turnModel = off.model;
+      turnMaxInput = off.maxInputTokens;
+      turnMaxInputPerMinute = off.maxInputTokensPerMinute;
+      setRuntimeIdentity(off.providerName, off.model);
+      routeNote = `→ offline local: ${off.providerName}/${off.model}`;
+    } else {
+      const route = await router.resolve(userInput, routerMode, taskActive);
+      turnProvider = route.provider.streamChat.bind(route.provider);
+      turnModel = route.model;
+      turnMaxInput = route.maxInputTokens;
+      turnMaxInputPerMinute = route.maxInputTokensPerMinute;
+      heavyRoute = router.isHeavy(route);
+      setRuntimeIdentity(route.providerName, route.model);
+      routeNote = `→ ${heavyRoute ? "heavy" : "chat"}: ${route.providerName}/${route.model}`;
+    }
   }
 
   if (!tui) {
@@ -531,7 +667,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     if (tui) {
       tui.busy = false;
       const rl = routeLabel();
-      tui.setStatus(`${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
+      tui.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     } else {
       process.stdout.write("\n");
     }
@@ -566,9 +702,8 @@ function mainTUI(): void {
   });
 
   tui.start();
-  for (const b of banner(providerName, llmModel, cwd)) tui.printToScrollback(b, true);
   const rl0 = routeLabel();
-  tui.setStatus(rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`, 8);
+  tui.setStatus(`${onlineStatus()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
 }
 
 function mainLine(): void {

@@ -1,6 +1,7 @@
 import { ContextTooLargeError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig } from "../types";
 import { withTimeout, LLMTimeoutError, type TimeoutSpec } from "../timeout";
 import { isTransientRateLimit, parseRetryAfter, sleepAbortable } from "../retry";
+import { parseToolArguments } from "../args";
 
 export function mapToAnthropic(messages: ChatOptions["messages"]): any[] {
   const out: any[] = [];
@@ -31,7 +32,7 @@ export function mapToAnthropic(messages: ChatOptions["messages"]): any[] {
           type: "tool_use",
           id: tc.id,
           name: tc.name,
-          input: JSON.parse(tc.arguments || "{}"),
+          input: parseToolArguments(tc.arguments),
         });
       }
     }

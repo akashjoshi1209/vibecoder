@@ -36,11 +36,36 @@ registerTool({
     try {
       const res = await fetch(url, { redirect: "follow", signal: ac.signal });
       if (!res.ok) return `ERROR: HTTP ${res.status} ${res.statusText}`;
-      const full = await res.text();
       const ctype = res.headers.get("content-type") ?? "";
-      const body = full.slice(0, maxChars);
-      const truncated = full.length > maxChars ? "\n...(truncated, more available via maxChars)" : "";
-      return `HTTP ${res.status} · content-type: ${ctype} · bytes: ${full.length}${truncated}\n${body}`;
+
+      // Stream the body and stop as soon as we have enough text, so a huge
+      // response (downloaded log, generated file, …) never loads fully into
+      // memory or blocks the turn.
+      const announced = Number(res.headers.get("content-length"));
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let body = "";
+      let bytesRead = 0;
+      let hitCap = false;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          bytesRead += value?.byteLength ?? 0;
+          body += decoder.decode(value, { stream: true });
+          if (body.length >= maxChars) {
+            hitCap = true;
+            break;
+          }
+        }
+      } finally {
+        if (hitCap) await reader.cancel?.().catch(() => {});
+        reader.releaseLock?.();
+      }
+
+      const fullLen = Number.isFinite(announced) && announced > 0 ? Math.max(announced, bytesRead) : bytesRead;
+      const truncated = fullLen > maxChars ? "\n...(truncated, more available via maxChars)" : "";
+      return `HTTP ${res.status} · content-type: ${ctype} · bytes: ${fullLen}${truncated}\n${body.slice(0, maxChars)}`;
     } catch (err: any) {
       if (timedOut) return `ERROR: fetch timed out after ${timeoutMs}ms`;
       if (ac.signal.aborted) return "ERROR: fetch aborted";

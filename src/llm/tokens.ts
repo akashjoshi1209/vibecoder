@@ -98,6 +98,11 @@ export function trimMessages(messages: Message[], opts: TrimOptions): TrimResult
 
   const blocks = splitBlocks(nonSystem);
 
+  // Nothing but system messages (or empty): nothing to trim.
+  if (!blocks.length) {
+    return { messages: system.map(cloneMessage), trimmed: messages.length - system.length, truncatedChars: 0 };
+  }
+
   if (budget < 1) {
     const lastIdx = blocks[blocks.length - 1];
     const kept = lastIdx.map((j) => cloneMessage(nonSystem[j]));

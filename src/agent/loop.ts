@@ -66,56 +66,98 @@ export async function runAgent(
     ? new RatePacer(options.maxInputTokensPerMinute)
     : null;
 
+  // Step-level resilience: track consecutive LLM failures and a running summary
+  // so that even when the step budget is exhausted we can report progress.
+  const MAX_STEP_RETRIES = 2;
+  const MAX_CONSECUTIVE_FAILURES = 3;
+  let consecutiveFailures = 0;
+  const stepSummaries: string[] = [];
+
   for (let step = 0; step < maxSteps; step++) {
     if (options.signal?.aborted) {
       callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
       return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true };
     }
 
-    let result: StreamResult;
-    retryBudgetDelta = 0;
-    // ContextTooLarge retry: try once more with a tighter budget before giving up.
-    for (;;) {
-      if (options.maxInputTokens) {
-        const trim = trimMessages(messages, {
-          budgetTokens: effectiveBudget(),
-          reservedTokens: effectiveReserved(),
-        });
-        messages.length = 0;
-        messages.push(...trim.messages);
-        if (trim.trimmed > 0 && retryBudgetDelta === 0) callbacks.onTrimmed?.(trim.trimmed, trim.truncatedChars);
-      }
+    let result: StreamResult | null = null;
+    let stepOk = false;
 
-      const chatOpts: ChatOptions = {
-        model: options.model,
-        messages,
-        tools: toolDefs,
-        signal: options.signal,
-        ...options.chatOptions,
-      };
-
-      // Pace to the provider's per-minute budget before sending.
-      await paceWait(pacer, estimateRequestTokens(), options.signal);
-
-      try {
-        result = await options.provider(chatOpts, (chunk) => {
-          if (chunk.reasoning) callbacks.onReasoning?.(chunk.reasoning);
-          if (chunk.content) callbacks.onModelText?.(chunk.content);
-        });
-        if (pacer) pacer.record(estimateRequestTokens());
-        break; // success
-      } catch (err: any) {
-        if (err instanceof ContextTooLargeError && retryBudgetDelta === 0) {
-          retryBudgetDelta = 512;
-          continue;
+    // Step-level retry: transient network/provider errors are retried up to
+    // MAX_STEP_RETRIES times before counting as a consecutive failure.
+    for (let attempt = 0; attempt <= MAX_STEP_RETRIES && !stepOk; attempt++) {
+      retryBudgetDelta = 0;
+      // ContextTooLarge retry: try once more with a tighter budget before giving up.
+      for (;;) {
+        if (options.maxInputTokens) {
+          const trim = trimMessages(messages, {
+            budgetTokens: effectiveBudget(),
+            reservedTokens: effectiveReserved(),
+          });
+          messages.length = 0;
+          messages.push(...trim.messages);
+          if (trim.trimmed > 0 && retryBudgetDelta === 0) callbacks.onTrimmed?.(trim.trimmed, trim.truncatedChars);
         }
-        if (options.signal?.aborted || err?.name === "AbortError") {
-          callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
-          return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true };
+
+        const chatOpts: ChatOptions = {
+          model: options.model,
+          messages,
+          tools: toolDefs,
+          signal: options.signal,
+          ...options.chatOptions,
+        };
+
+        // Pace to the provider's per-minute budget before sending.
+        try {
+          await paceWait(pacer, estimateRequestTokens(), options.signal);
+
+          result = await options.provider(chatOpts, (chunk) => {
+            if (chunk.reasoning) callbacks.onReasoning?.(chunk.reasoning);
+            if (chunk.content) callbacks.onModelText?.(chunk.content);
+          });
+          if (pacer) pacer.record(estimateRequestTokens());
+          stepOk = true;
+          break; // success
+        } catch (err: any) {
+          if (err instanceof ContextTooLargeError && retryBudgetDelta === 0) {
+            retryBudgetDelta = 512;
+            continue;
+          }
+          if (options.signal?.aborted || err?.name === "AbortError") {
+            callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
+            return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true };
+          }
+          // For transient errors, let the step-retry loop handle it.
+          break; // will retry if attempts remain
         }
-        throw err;
       }
     }
+
+    if (!stepOk || !result) {
+      // All step-level retries exhausted for this step.
+      consecutiveFailures++;
+      // Show the error to the user so failures are never silent.
+      const failMsg = `[step ${step + 1}: LLM call failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} consecutive)]`;
+      callbacks.onModelText?.(`\n${failMsg}\n`);
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        const summary = stepSummaries.length
+          ? `\nLast steps: ${stepSummaries.slice(-3).join("; ")}`
+          : "";
+        const finalMsg = `(stopped after ${consecutiveFailures} consecutive LLM failures — check your network and provider status.${summary})`;
+        callbacks.onModelText?.(`${finalMsg}\n`);
+        callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "error" });
+        return {
+          finalText: finalMsg,
+          toolCalls,
+          steps: step,
+          aborted: false,
+        };
+      }
+      // Skip this step but continue the loop (transient glitch).
+      continue;
+    }
+
+    // Reset consecutive failure counter on a successful LLM call.
+    consecutiveFailures = 0;
 
     if (result.text) {
       messages.push({ role: "assistant", content: result.text });
@@ -178,8 +220,20 @@ export async function runAgent(
       callbacks.onToolEnd?.(call.name, output);
       messages.push({ role: "tool", tool_call_id: call.id, content: output, name: call.name });
     }
+
+    // Track what happened this step for the progress summary.
+    const stepToolNames = parsed.filter((c) => c.name).map((c) => c.name);
+    if (stepToolNames.length) {
+      stepSummaries.push(`step ${step + 1}: ${stepToolNames.join(", ")}`);
+      if (stepSummaries.length > 20) stepSummaries.shift();
+    }
   }
 
+  const summary = stepSummaries.length
+    ? `\nProgress: ${stepSummaries.slice(-5).join("; ")}`
+    : "";
+  const maxMsg = `(reached max steps without completion.${summary})`;
+  callbacks.onModelText?.(`\n${maxMsg}\n`);
   callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "max_steps" });
-  return { finalText: "(reached max steps without completion)", toolCalls, steps: maxSteps, aborted: false };
+  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false };
 }

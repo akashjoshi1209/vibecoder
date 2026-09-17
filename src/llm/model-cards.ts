@@ -47,6 +47,7 @@ const CARDS: ModelCard[] = [
   },
   {
     id: "qwen3.8-27b",
+    alias: ["qwen/qwen3.8-27b"],
     family: "Qwen (Alibaba)",
     architecture: "unknown (GROQ-hosted; Qwen3 family)",
     paramsTotal: "~27B (per model id)",

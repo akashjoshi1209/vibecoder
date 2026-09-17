@@ -94,8 +94,10 @@ registerTool({
     if (!(await Bun.file(p).exists())) return `ERROR: file not found: ${p}`;
     const text = await Bun.file(p).text();
     const lines = text.split("\n");
-    const offset = Number(args.offset ?? 1);
-    const limit = Number(args.limit ?? 2000);
+    // Offset 0 (or a negative/NaN value) then `lines.slice(-1)` would read the
+    // LAST line; clamp so indexes always mean "1-based line number".
+    const offset = Math.max(1, Number(args.offset ?? 1) || 1);
+    const limit = Math.max(0, Number(args.limit ?? 2000) || 2000);
     const slice = lines.slice(offset - 1, offset - 1 + limit);
     return slice.map((l, i) => `${offset + i}: ${l}`).join("\n");
   },
@@ -119,6 +121,8 @@ registerTool({
     },
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    if (ctx.planPhase)
+      return `BLOCKED IN PLAN MODE: write_file is disabled while investigating. Record what you would write in your PLAN (FILES: ...) instead; the human approves before any file is touched.`;
     const p = resolve(String(args.path), ctx);
     const content = String(args.content ?? "");
     const guard = await preWriteNote(p, content);
@@ -148,6 +152,8 @@ registerTool({
     },
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    if (ctx.planPhase)
+      return `BLOCKED IN PLAN MODE: edit_file is disabled while investigating. Describe the exact change in your PLAN instead; the human approves before any file is touched.`;
     const p = resolve(String(args.path), ctx);
     const oldString = String(args.oldString ?? "");
     const newString = String(args.newString ?? "");

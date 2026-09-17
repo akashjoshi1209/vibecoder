@@ -68,7 +68,7 @@ function sgrApply(codes: number[], spec: string): void {
       continue;
     }
     if (c === 22 || c === 23 || c === 25 || c === 27) {
-      const i = codes.indexOf(c === 22 ? 1 : c === 23 ? 3 : c === 25 ? 7 : c === 27 ? 2 : -1);
+      const i = codes.indexOf(c === 22 ? 1 : c === 23 ? 3 : c === 25 ? 8 : c === 27 ? 2 : -1);
       if (i !== -1) codes.splice(i, 1);
       continue;
     }
@@ -184,16 +184,18 @@ export function paint(s: string, color?: number): string {
   return color === undefined ? s : `${fg(color)}${s}${ansi.reset}`;
 }
 
-let ttyFd: number | null = null;
+let ttyState: boolean | null = null;
 
 export function hasControllingTty(): boolean {
-  if (ttyFd !== null) return true;
+  if (ttyState !== null) return ttyState;
   try {
-    ttyFd = fs.openSync("/dev/tty", "r+");
-    return true;
+    const fd = fs.openSync("/dev/tty", "r+");
+    fs.closeSync(fd);
+    ttyState = true;
   } catch {
-    return false;
+    ttyState = false;
   }
+  return ttyState;
 }
 
 function ttyStty(args: string[]): string {
@@ -202,10 +204,12 @@ function ttyStty(args: string[]): string {
 }
 
 export function getSize(): { rows: number; cols: number } {
-  // Fast path: no subprocess spawn when the TTY exposes its size.
+  // Fast path: no subprocess spawn when the TTY exposes its size. We accept
+  // any usable size here — a genuinely small terminal (e.g. 3×20) is honored
+  // rather than overridden with 24×80.
   const cols = process.stdout.columns;
   const rows = process.stdout.rows;
-  if (Number.isFinite(rows) && Number.isFinite(cols) && rows > 0 && cols > 0 && rows >= 8 && cols >= 20) {
+  if (Number.isFinite(rows) && Number.isFinite(cols) && rows > 0 && cols > 0) {
     return { rows, cols };
   }
   let r = 24;
@@ -219,7 +223,7 @@ export function getSize(): { rows: number; cols: number } {
   } catch {
     /* keep defaults */
   }
-  if (r < 8 || c < 20) {
+  if (!(Number.isFinite(r) && Number.isFinite(c) && r > 0 && c > 0)) {
     // size unknown / unusably small (e.g. pty reports 0x0) -> sensible default
     return { rows: 24, cols: 80 };
   }

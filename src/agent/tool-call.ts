@@ -1,4 +1,5 @@
 import type { ToolCall } from "../llm/types";
+import { parseToolArguments } from "../llm/args";
 
 interface ParsedToolCall {
   id: string;
@@ -19,28 +20,9 @@ export function normalizeToolCalls(toolCalls: ToolCall[], seed = 1): ToolCall[] 
 }
 
 export function parseToolCalls(toolCalls: ToolCall[]): ParsedToolCall[] {
-  return toolCalls.map((tc) => {
-    let args: Record<string, unknown> = {};
-    try {
-      args = JSON.parse(tc.arguments || "{}");
-      if (typeof args !== "object" || args === null || Array.isArray(args)) args = {};
-    } catch {
-      const extracted = extractJson(tc.arguments);
-      if (extracted !== null) args = extracted;
-    }
-    return { id: tc.id, name: tc.name, args };
-  });
-}
-
-function extractJson(raw: string): Record<string, unknown> | null {
-  const first = raw.indexOf("{");
-  const last = raw.lastIndexOf("}");
-  if (first === -1 || last === -1 || last <= first) return null;
-  try {
-    const parsed = JSON.parse(raw.slice(first, last + 1));
-    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return parsed;
-  } catch {
-    return null;
-  }
-  return null;
+  return toolCalls.map((tc) => ({
+    id: tc.id,
+    name: tc.name,
+    args: parseToolArguments(tc.arguments),
+  }));
 }

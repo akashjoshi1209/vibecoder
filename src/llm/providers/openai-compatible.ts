@@ -18,7 +18,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const body: Record<string, unknown> = {
       model: options.model,
       messages: options.messages.map((m) => {
-        const msg: Record<string, unknown> = { role: m.role, content: m.content };
+        // Some providers reject `content: null` on assistant messages that only
+        // carry tool_calls; empty string is valid and reads as "no text".
+        const msg: Record<string, unknown> = {
+          role: m.role,
+          content: m.content ?? (m.role === "assistant" ? "" : null),
+        };
         if (m.tool_calls && m.tool_calls.length) {
           msg.tool_calls = m.tool_calls.map((tc) => ({
             id: tc.id,

@@ -20,6 +20,8 @@
       "type": "openai-compatible",
       "baseURL": "http://127.0.0.1:11434/v1",
       "apiKeyEnv": "",
+      "timeoutMs": 240000,
+      "timeoutIdleMs": 120000,
       "models": ["qwen2.5:1.5b", "llama3.1"]
     },
     "openai": {
@@ -28,7 +30,7 @@
       "apiKeyEnv": "OPENAI_API_KEY",
       "models": ["gpt-4o", "gpt-4o-mini"]
     },
-"anthropic": {
+    "anthropic": {
       "type": "anthropic",
       "baseURL": "https://api.anthropic.com/v1",
       "apiKeyEnv": "ANTHROPIC_API_KEY",
@@ -36,13 +38,11 @@
     }
   },
   "routing": {
-    "chatProvider": "ollama",
-    "chatModel": "qwen2.5:1.5b",
-    "heavyProvider": "groq",
-    "heavyModel": "openai/gpt-oss-120b",
+    "chatProvider": "groq",
+    "chatModel": "qwen/qwen3.8-27b",
+    "heavyProvider": "nvidia",
+    "heavyModel": "nvidia/nemotron-3-ultra-550b-a55b",
     "strategy": "hybrid",
-    "heavyMaxInputTokens": 10000,
-    "heavyMaxInputTokensPerMinute": 6500,
     "offlineProvider": "ollama",
     "offlineModel": "qwen2.5:1.5b"
   },

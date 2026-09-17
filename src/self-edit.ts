@@ -115,7 +115,12 @@ export function ledgerSummary(limit = 5): string[] {
 /** Record a self-edit made by tool `toolName`; returns the note to show the model. */
 export function auditSelfEdit(toolName: string, abs: string, beforeText: string, afterText: string, note: string): string {
   const rel = toRel(abs);
-  appendLedger({ tool: toolName, file: rel, beforeSha: shaOf(beforeText), afterSha: shaOf(afterText), note });
+  const ok = appendLedger({ tool: toolName, file: rel, beforeSha: shaOf(beforeText), afterSha: shaOf(afterText), note });
+  if (!ok) {
+    // Never claim the edit was recorded when the ledger write failed — the
+    // change would otherwise exist with no audit trail.
+    return `WARNING: SELF-EDIT on ${rel} (${toolName}) could NOT be written to ${LEDGER_NAME} — treat it as UNAUDITED and re-run with write access.`;
+  }
   return `SELF-EDIT recorded to ${LEDGER_NAME} (file ${rel}): staged, not live. Tell the human it needs /reload-config to go live, or /undo-self-edits to revert.`;
 }
 

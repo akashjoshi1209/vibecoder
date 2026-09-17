@@ -18,6 +18,7 @@ export interface SessionData extends SessionMeta {
   systemPrompt: string;
   messages: Message[];
   routerMode?: "auto" | "chat" | "heavy";
+  planMode?: boolean;
 }
 
 let _root: string | null = null;
@@ -36,6 +37,14 @@ export function resetSessionRoot(): void {
 
 export function sanitizeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/** Short deterministic hash so distinct ids that sanitize to the same string
+ *  (e.g. "a/b" and "a:b" → "a_b") never collide on disk. */
+function shortHash(s: string): string {
+  let h = 0;
+  for (const ch of s) h = ((h << 5) - h + ch.codePointAt(0)!) | 0;
+  return Math.abs(h).toString(36).slice(0, 6);
 }
 
 export interface ResumeArg {
@@ -61,7 +70,9 @@ function lastFile(): string {
 }
 
 function sessionFile(id: string): string {
-  return join(root(), "sessions", `${sanitizeId(id)}.json`);
+  const clean = sanitizeId(id);
+  const fname = clean === id ? clean : `${clean}--${shortHash(id)}`;
+  return join(root(), "sessions", `${fname}.json`);
 }
 
 export function saveSession(s: SessionData): string {
@@ -100,8 +111,16 @@ export function listSessions(): SessionMeta[] {
   if (!existsSync(dir)) return out;
   for (const name of readdirSync(dir)) {
     if (!name.endsWith(".json")) continue;
-    const id = name.slice(0, -5);
-    const s = loadSession(id);
+    // Read the id from the file rather than deriving it from the filename:
+    // filenames carry a hash suffix for non-clean ids and must not be
+    // re-sanitized.
+    let s: SessionData | null = null;
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, name), "utf8")) as SessionData;
+      if (parsed && typeof parsed.id === "string" && Array.isArray(parsed.messages)) s = parsed;
+    } catch {
+      // corrupt / partial file — skip it
+    }
     if (!s) continue;
     out.push({
       id: s.id,

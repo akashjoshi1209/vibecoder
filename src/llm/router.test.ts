@@ -171,4 +171,30 @@ describe("ModelRouter.resolve", () => {
     expect(r.isHeavy(await r.resolve("hi", "heavy"))).toBe(true);
     expect(r.isHeavy(await r.resolve("hi", "chat"))).toBe(false);
   });
+
+  test("resolveOffline routes to the configured offline model", async () => {
+    const r = new ModelRouter(config({ offlineProvider: "ollama", offlineModel: "qwen2.5:1.5b" }), limits);
+    const res = r.resolveOffline("hello, are we offline?");
+    expect(res.offline).toBe(true);
+    expect(res.providerName).toBe("ollama");
+    expect(res.model).toBe("qwen2.5:1.5b");
+    // Local model: generous small budget, no per-minute pacing.
+    expect(res.maxInputTokens).toBe(4000);
+    expect(res.maxInputTokensPerMinute).toBeUndefined();
+  });
+
+  test("resolveOffline degrades to chat side when no offline provider is set", () => {
+    const r = new ModelRouter(config(), limits);
+    const res = r.resolveOffline("hello");
+    expect(res.offline).toBe(true);
+    expect(res.providerName).toBe("groq");
+    expect(res.model).toBe("qwen/qwen3.8-27b");
+  });
+
+  test("resolveOffline falls back to chat side when offline provider missing", () => {
+    const r = new ModelRouter(config({ offlineProvider: "nope" }), limits);
+    const res = r.resolveOffline("hello");
+    expect(res.offline).toBe(true);
+    expect(res.providerName).toBe("groq");
+  });
 });

@@ -4,6 +4,20 @@ import { AnthropicProvider } from "./providers/anthropic";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible";
 import { join } from "node:path";
 
+export interface QueueConfig {
+  /** Absolute or ~-path to the queue JSON. Defaults to ~/.vibecoder/queue.json. */
+  file?: string;
+  /** Block destructive shell commands during unattended runs. Default true. */
+  autoApproveExceptDestructive?: boolean;
+  daemonLog?: string;
+}
+
+export interface ConnectivityConfig {
+  probeUrl?: string;
+  pollMs?: number;
+  timeoutMs?: number;
+}
+
 export interface RootConfig {
   provider: string;
   model: string;
@@ -15,6 +29,10 @@ export interface RootConfig {
   maxInputTokens?: number;
   /** Optional per-minute input-token cap for pacing (e.g. GROQ free-tier ITPM). */
   maxInputTokensPerMinute?: number;
+  /** Plan mode: task turns investigate + produce a plan for human approval before executing. */
+  planMode?: boolean;
+  queue?: QueueConfig;
+  connectivity?: ConnectivityConfig;
 }
 
 const DEFAULT_CONFIG_PATH = (() => {
