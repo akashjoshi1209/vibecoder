@@ -3,23 +3,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Vibecoder — AI coding agent that lives in your terminal</title>
-  <meta name="description" content="Vibecoder is an autonomous AI coding agent that runs in your Termux terminal on Android — no PC needed. Use free providers (GROQ, NVIDIA) to code, build, and automate from your phone.">
+  <title>VibeCoder — Open-source AI software development system</title>
+  <meta name="description" content="VibeCoder is an open-source AI software development system — today a single-agent terminal coding assistant, built toward an autonomous software specialist that plans, executes, tests, verifies, and keeps working until your vision is real.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg: #0a0b0e;
       --surface: #111318;
       --surface-2: #181b22;
-      --border: #1f2330;
+      --surface-3: #1f2330;
+      --border: #262a36;
       --text: #e4e6ed;
       --muted: #6b7280;
+      --muted-2: #8b929e;
       --accent: #22d3ee;
       --accent-2: #8b5cf6;
       --green: #34d399;
       --red: #f87171;
-      --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --amber: #fbbf24;
+      --font: 'Instrument Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -30,12 +36,24 @@
       background: var(--bg);
       color: var(--text);
       font-family: var(--font);
-      line-height: 1.6;
+      line-height: 1.65;
       -webkit-font-smoothing: antialiased;
       overflow-x: hidden;
+      position: relative;
     }
 
-    /* ── ambient glow ── */
+    /* grain texture */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.5;
+    }
+
+    /* ambient glows */
     .glow {
       position: fixed;
       pointer-events: none;
@@ -44,22 +62,14 @@
       filter: blur(120px);
       opacity: 0.18;
     }
-    .glow-1 {
-      width: 600px; height: 600px;
-      background: var(--accent);
-      top: -200px; left: -150px;
-    }
-    .glow-2 {
-      width: 500px; height: 500px;
-      background: var(--accent-2);
-      bottom: 100px; right: -100px;
-      opacity: 0.10;
-    }
+    .glow-1 { width: 600px; height: 600px; background: var(--accent); top: -200px; left: -150px; }
+    .glow-2 { width: 500px; height: 500px; background: var(--accent-2); bottom: 100px; right: -100px; opacity: 0.10; }
+    .glow-3 { width: 400px; height: 400px; background: var(--green); top: 40%; left: 50%; opacity: 0.06; }
 
     .wrap {
       position: relative;
       z-index: 1;
-      max-width: 1100px;
+      max-width: 1140px;
       margin: 0 auto;
       padding: 0 24px;
     }
@@ -71,11 +81,11 @@
       z-index: 50;
       backdrop-filter: blur(14px);
       -webkit-backdrop-filter: blur(14px);
-      background: rgba(10, 11, 14, 0.72);
+      background: rgba(10, 11, 14, 0.78);
       border-bottom: 1px solid var(--border);
     }
     .nav-inner {
-      max-width: 1100px;
+      max-width: 1140px;
       margin: 0 auto;
       padding: 14px 24px;
       display: flex;
@@ -103,15 +113,18 @@
     .nav-links {
       display: flex;
       align-items: center;
-      gap: 28px;
-      font-size: 0.9rem;
+      gap: 32px;
+      font-size: 0.88rem;
     }
     .nav-links a {
       color: var(--muted);
       text-decoration: none;
       transition: color 0.18s;
+      font-weight: 500;
     }
     .nav-links a:hover { color: var(--text); }
+    .nav-cta { display: flex; gap: 12px; }
+
     .btn {
       display: inline-flex;
       align-items: center;
@@ -119,7 +132,7 @@
       padding: 10px 20px;
       border-radius: 10px;
       font-weight: 600;
-      font-size: 0.9rem;
+      font-size: 0.88rem;
       border: 1px solid transparent;
       cursor: pointer;
       transition: all 0.18s;
@@ -148,28 +161,30 @@
     .hero {
       padding: 90px 0 70px;
       text-align: center;
+      position: relative;
     }
     .badge {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 6px 14px;
+      gap: 8px;
+      padding: 7px 16px;
       border-radius: 100px;
       background: var(--surface-2);
       border: 1px solid var(--border);
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       color: var(--muted);
-      margin-bottom: 28px;
+      margin-bottom: 30px;
       font-weight: 500;
     }
-    .badge span { color: var(--green); }
+    .badge .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; }
+    .badge .vision-dot { background: var(--accent); }
     .hero h1 {
       font-size: clamp(2.6rem, 6vw, 4.4rem);
       font-weight: 800;
       letter-spacing: -0.03em;
       line-height: 1.08;
       margin-bottom: 24px;
-      max-width: 860px;
+      max-width: 900px;
       margin-left: auto;
       margin-right: auto;
     }
@@ -178,6 +193,16 @@
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       background-clip: text;
+    }
+    .hero h1 .vision {
+      font-size: 0.55em;
+      font-weight: 500;
+      color: var(--muted);
+      display: block;
+      margin-top: 12px;
+      letter-spacing: -0.01em;
+      -webkit-text-fill-color: var(--muted);
+      background: none;
     }
     .hero p {
       font-size: 1.18rem;
@@ -192,27 +217,26 @@
       justify-content: center;
       gap: 16px;
       flex-wrap: wrap;
-      margin-bottom: 48px;
+      margin-bottom: 40px;
     }
     .hero-meta {
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 32px;
+      gap: 36px;
       flex-wrap: wrap;
       color: var(--muted);
       font-size: 0.85rem;
     }
     .hero-meta strong { color: var(--text); font-weight: 600; }
-
     .hero-visual {
-      margin-top: 60px;
+      margin-top: 56px;
       border-radius: 16px;
       border: 1px solid var(--border);
       background: var(--surface);
       overflow: hidden;
       position: relative;
-      max-width: 900px;
+      max-width: 920px;
       margin-left: auto;
       margin-right: auto;
     }
@@ -227,7 +251,7 @@
       font-size: 0.82rem;
       line-height: 1.6;
       color: var(--text);
-      min-height: 280px;
+      min-height: 300px;
       white-space: pre-wrap;
       overflow: hidden;
     }
@@ -236,187 +260,531 @@
       border-right: 1px solid var(--border);
     }
     .screen-mock.tui .prompt { color: var(--accent); }
-    .screen-mock.tui .tool { color: #fbbf24; }
+    .screen-mock.tui .tool { color: var(--amber); }
     .screen-mock.tui .result { color: #a78bfa; }
     .screen-mock.tui .dim { color: var(--muted); }
+    .screen-mock.tui .ok { color: var(--green); }
     .screen-mock.web {
       background: #0f1218;
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 14px;
     }
     .mock-chat {
       background: var(--surface-2);
       border-radius: 10px;
       padding: 14px 16px;
       border: 1px solid var(--border);
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      overflow: hidden;
     }
     .mock-msg {
       padding: 8px 12px;
       border-radius: 8px;
       font-size: 0.78rem;
       line-height: 1.5;
-      max-width: 85%;
+      max-width: 88%;
       font-family: var(--font);
     }
-    .mock-msg.user { background: #1a1f2e; color: var(--text); align-self: flex-end; border: 1px solid #2a3142; }
-    .mock-msg.bot { background: #0f1218; color: #c4c8d4; border: 1px solid var(--border); align-self: flex-start; }
+    .mock-msg.user {
+      background: #1a1f2e;
+      color: var(--text);
+      align-self: flex-end;
+      border: 1px solid #2a3142;
+    }
+    .mock-msg.bot {
+      background: #0f1218;
+      color: #c4c8d4;
+      border: 1px solid var(--border);
+      align-self: flex-start;
+    }
+    .mock-msg.bot .code {
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      background: rgba(34, 211, 238, 0.08);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
     .mock-input {
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 10px 14px;
+      padding: 9px 14px;
       color: var(--text);
       font-size: 0.82rem;
+      font-family: var(--font);
     }
 
     /* ── section ── */
     section {
-      padding: 80px 0;
+      padding: 84px 0;
       border-top: 1px solid var(--border);
     }
     .section-label {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      font-size: 0.8rem;
+      font-size: 0.78rem;
       font-weight: 600;
       color: var(--accent);
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      margin-bottom: 12px;
+      margin-bottom: 14px;
     }
     .section-title {
       font-size: clamp(1.9rem, 3.5vw, 2.6rem);
       font-weight: 700;
       letter-spacing: -0.02em;
       margin-bottom: 16px;
-      max-width: 720px;
+      max-width: 760px;
     }
     .section-sub {
       color: var(--muted);
       font-size: 1.04rem;
-      max-width: 580px;
+      max-width: 600px;
       margin-bottom: 52px;
       line-height: 1.7;
     }
 
-    /* ── features grid ── */
-    .features {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-      gap: 20px;
+    /* ── interactive demo ── */
+    .flow {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      max-width: 720px;
+      margin: 0 auto;
     }
-    .feature-card {
+    .flow-step {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      padding: 18px 24px;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 26px 24px;
-      transition: border-color 0.2s, transform 0.2s;
+      border-radius: 12px;
+      transition: border-color 0.3s, background 0.3s, transform 0.3s;
     }
-    .feature-card:hover {
-      border-color: #2a3344;
-      transform: translateY(-2px);
-    }
-    .feature-icon {
-      width: 42px; height: 42px;
-      background: var(--surface-2);
-      border-radius: 10px;
-      display: grid;
-      place-items: center;
-      font-size: 1.3rem;
-      margin-bottom: 18px;
-      border: 1px solid var(--border);
-    }
-    .feature-card h3 {
-      font-size: 1.1rem;
-      font-weight: 600;
-      margin-bottom: 8px;
-    }
-    .feature-card p {
-      color: var(--muted);
-      font-size: 0.92rem;
-      line-height: 1.65;
-    }
-
-    /* ── how it works ── */
-    .steps {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-      gap: 20px;
-      counter-reset: step;
-    }
-    .step {
-      counter-increment: step;
-      position: relative;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 28px 24px;
-    }
-    .step::before {
-      content: counter(step);
-      position: absolute;
-      top: -14px;
-      left: 24px;
-      width: 32px; height: 32px;
-      background: var(--accent);
-      color: #0a0b0e;
+    .flow-step .node {
+      width: 36px; height: 36px;
       border-radius: 50%;
       display: grid;
       place-items: center;
       font-weight: 700;
       font-size: 0.85rem;
+      flex-shrink: 0;
+      transition: all 0.3s;
     }
-    .step h3 {
-      font-size: 1.05rem;
-      font-weight: 600;
-      margin-bottom: 8px;
-      padding-top: 14px;
-    }
-    .step p {
+    .flow-step .node.idle {
+      background: var(--surface-2);
       color: var(--muted);
-      font-size: 0.92rem;
+      border: 1px solid var(--border);
+    }
+    .flow-step .node.active {
+      background: var(--accent);
+      color: #0a0b0e;
+      box-shadow: 0 0 20px rgba(34, 211, 238, 0.35);
+    }
+    .flow-step .node.done {
+      background: var(--green);
+      color: #0a0b0e;
+    }
+    .flow-step .label {
+      font-family: var(--font);
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .flow-step .desc {
+      color: var(--muted);
+      font-size: 0.85rem;
+      margin-left: auto;
+      max-width: 340px;
+      text-align: right;
+    }
+    .flow-step.done { border-color: rgba(52, 211, 153, 0.3); }
+    .flow-arrow {
+      display: flex;
+      justify-content: center;
+      color: var(--border);
+      font-size: 1.2rem;
+      padding: 2px 0;
+      transition: color 0.3s;
+    }
+    .flow-arrow.active { color: var(--accent); }
+    .flow-arrow.done { color: var(--green); }
+
+    .demo-controls {
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      margin-top: 32px;
+      flex-wrap: wrap;
+    }
+    .demo-controls .btn { font-size: 0.82rem; padding: 8px 16px; }
+
+    /* ── barriers ── */
+    .barriers {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 20px;
+      margin-top: 12px;
+    }
+    .barrier {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 28px 24px;
+      position: relative;
+      overflow: hidden;
+    }
+    .barrier .barrier-icon {
+      width: 44px; height: 44px;
+      background: var(--surface-2);
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      font-size: 1.4rem;
+      margin-bottom: 18px;
+      border: 1px solid var(--border);
+    }
+    .barrier h3 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 10px;
+    }
+    .barrier p {
+      color: var(--muted);
+      font-size: 0.9rem;
       line-height: 1.65;
+    }
+    .barrier .quote {
+      margin-top: 14px;
+      padding: 10px 14px;
+      background: var(--surface-2);
+      border-left: 3px solid var(--accent);
+      border-radius: 0 8px 8px 0;
+      font-style: italic;
+      color: var(--muted-2);
+      font-size: 0.88rem;
+    }
+
+    /* ── capabilities grid ── */
+    .cap-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .cap-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 22px;
+      transition: border-color 0.2s;
+    }
+    .cap-card:hover { border-color: #2a3344; }
+    .cap-card h3 {
+      font-size: 0.98rem;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .cap-card p {
+      color: var(--muted);
+      font-size: 0.86rem;
+      line-height: 1.6;
+    }
+    .cap-card .status {
+      display: inline-block;
+      margin-top: 10px;
+      padding: 2px 8px;
+      border-radius: 100px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .cap-card .status.now { background: rgba(52, 211, 153, 0.12); color: var(--green); border: 1px solid rgba(52, 211, 153, 0.2); }
+    .cap-card .status.vision { background: rgba(139, 92, 246, 0.12); color: var(--accent-2); border: 1px solid rgba(139, 92, 246, 0.2); }
+
+    /* ── how it works diagram ── */
+    .diagram {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0;
+      flex-wrap: wrap;
+      margin: 32px 0 16px;
+      max-width: 760px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .diagram-node {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px 26px;
+      text-align: center;
+      min-width: 130px;
+      flex: 1 1 0;
+    }
+    .diagram-node .dn-icon {
+      font-size: 1.6rem;
+      margin-bottom: 8px;
+    }
+    .diagram-node .dn-label {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .diagram-node .dn-detail {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-top: 4px;
+    }
+    .diagram-node.user { border-color: rgba(34, 211, 238, 0.3); background: rgba(34, 211, 238, 0.04); }
+    .diagram-node.router { border-color: rgba(139, 92, 246, 0.3); background: rgba(139, 92, 246, 0.04); }
+    .diagram-node.loop { border-color: rgba(52, 211, 153, 0.3); background: rgba(52, 211, 153, 0.04); }
+    .diagram-node.tools { border-color: rgba(251, 191, 36, 0.3); background: rgba(251, 191, 36, 0.04); }
+    .diagram-node.result { border-color: rgba(139, 92, 246, 0.3); background: rgba(139, 92, 246, 0.04); }
+    .diagram-arrow {
+      color: var(--border);
+      font-size: 1.4rem;
+      padding: 0 6px;
+      transition: color 0.3s;
     }
 
     /* ── providers ── */
     .providers {
       display: flex;
-      gap: 20px;
+      gap: 16px;
       flex-wrap: wrap;
-      margin-top: 12px;
+      margin-top: 8px;
     }
     .provider-pill {
       display: flex;
       align-items: center;
-      gap: 12px;
-      padding: 14px 20px;
+      gap: 14px;
+      padding: 16px 22px;
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 12px;
-      flex: 1 1 220px;
-      min-width: 200px;
+      flex: 1 1 200px;
+      min-width: 180px;
+      transition: border-color 0.2s;
     }
-    .provider-pill .name {
+    .provider-pill:hover { border-color: #2a3344; }
+    .provider-pill .pp-icon {
+      width: 40px; height: 40px;
+      background: var(--surface-2);
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      font-size: 1.3rem;
+      border: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .provider-pill .pp-name {
       font-weight: 600;
       font-size: 0.95rem;
     }
-    .provider-pill .detail {
+    .provider-pill .pp-detail {
       font-size: 0.82rem;
       color: var(--muted);
     }
-    .provider-pill .cost {
+    .provider-pill .pp-cost {
       color: var(--green);
       font-weight: 600;
-      font-size: 0.85rem;
+      font-size: 0.82rem;
       margin-left: auto;
+      white-space: nowrap;
     }
 
-    /* ── use cases ── */
+    /* ── vision section ── */
+    /*
+    .vision {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 40px 36px;
+      margin-top: 8px;
+      position: relative;
+      overflow: hidden;
+    }
+    .vision::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 20% 50%, rgba(139, 92, 246, 0.06), transparent 60%);
+      pointer-events: none;
+    }
+    .vision-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 100px;
+      background: rgba(139, 92, 246, 0.1);
+      border: 1px solid rgba(139, 92, 246, 0.2);
+      color: var(--accent-2);
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 18px;
+    }
+    .vision h2 {
+      font-size: clamp(1.7rem, 3vw, 2.2rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 16px;
+      max-width: 700px;
+    }
+    .vision p {
+      color: var(--muted);
+      font-size: 1.02rem;
+      max-width: 620px;
+      line-height: 1.7;
+      margin-bottom: 24px;
+    }
+    .vision-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 14px;
+    }
+    .vision-item {
+      padding: 16px 18px;
+      background: rgba(139, 92, 246, 0.04);
+      border: 1px solid rgba(139, 92, 246, 0.12);
+      border-radius: 10px;
+    }
+    .vision-item .vi-icon { font-size: 1.2rem; margin-bottom: 6px; }
+    .vision-item h4 { font-size: 0.92rem; font-weight: 600; margin-bottom: 4px; }
+    .vision-item p { color: var(--muted); font-size: 0.82rem; line-height: 1.55; }
+
+    /* ── control panel ── */
+    .control-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .ctrl {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px 18px;
+      text-align: center;
+    }
+    .ctrl .ctrl-label {
+      font-weight: 600;
+      font-size: 0.9rem;
+      margin-bottom: 4px;
+    }
+    .ctrl .ctrl-state {
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+    .ctrl .ctrl-state .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 100px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .ctrl .ctrl-state .pill.now { background: rgba(52, 211, 153, 0.12); color: var(--green); }
+    .ctrl .ctrl-state .pill.vising { background: rgba(139, 92, 246, 0.12); color: var(--accent-2); }
+
+    /* ── roadmap ── */
+    .roadmap {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      max-width: 760px;
+      margin: 24px auto 0;
+      position: relative;
+    }
+    .roadmap-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+      padding: 18px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .roadmap-step:last-child { border-bottom: none; }
+    .roadmap-step .rs-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      background: var(--accent);
+      margin-top: 6px;
+      flex-shrink: 0;
+      box-shadow: 0 0 10px rgba(34, 211, 238, 0.3);
+    }
+    .roadmap-step .rs-dot.done { background: var(--green); box-shadow: 0 0 10px rgba(52, 211, 153, 0.3); }
+    .roadmap-step .rs-dot.vision { background: var(--accent-2); box-shadow: 0 0 10px rgba(139, 92, 246, 0.3); }
+    .roadmap-step .rs-content { flex: 1; }
+    .roadmap-step .rs-status {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+    .roadmap-step .rs-status.now { color: var(--green); }
+    .roadmap-step .rs-status.vision { color: var(--accent-2); }
+    .roadmap-step h3 { font-size: 1.02rem; font-weight: 600; margin-bottom: 4px; }
+    .roadmap-step p { color: var(--muted); font-size: 0.88rem; line-height: 1.6; }
+
+    /* ── install ── */
+    .install-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 36px 32px;
+      max-width: 760px;
+      margin: 0 auto;
+    }
+    .install-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      margin-top: 20px;
+    }
+    .install-step {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+    }
+    .install-step .is-num {
+      width: 28px; height: 28px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      font-weight: 700;
+      font-size: 0.8rem;
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+    .install-step .is-body { flex: 1; }
+    .install-step .is-body code {
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      background: var(--surface-2);
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: var(--accent);
+      display: block;
+      margin-top: 4px;
+    }
+    .install-step .is-body p { color: var(--muted); font-size: 0.92rem; margin-bottom: 4px; }
+
+    /* ── usecases ── */
     .usecases {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-      gap: 20px;
+      gap: 16px;
     }
     .usecase {
       background: var(--surface);
@@ -437,16 +805,8 @@
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
-    .usecase h3 {
-      font-size: 1.1rem;
-      font-weight: 600;
-      margin-bottom: 8px;
-    }
-    .usecase p {
-      color: var(--muted);
-      font-size: 0.92rem;
-      line-height: 1.65;
-    }
+    .usecase h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 8px; }
+    .usecase p { color: var(--muted); font-size: 0.9rem; line-height: 1.65; }
 
     /* ── CTA ── */
     .cta-section {
@@ -461,26 +821,44 @@
       padding: 60px 40px;
       max-width: 720px;
       margin: 0 auto;
+      position: relative;
+      overflow: hidden;
+    }
+    .cta-box::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 50% 0%, rgba(34, 211, 238, 0.06), transparent 60%);
+      pointer-events: none;
     }
     .cta-box h2 {
       font-size: clamp(1.8rem, 3vw, 2.4rem);
       font-weight: 700;
       letter-spacing: -0.02em;
       margin-bottom: 16px;
+      position: relative;
+    }
+    .cta-box .cta-question {
+      color: var(--accent);
+      font-size: 1.05rem;
+      margin-bottom: 20px;
+      position: relative;
     }
     .cta-box p {
       color: var(--muted);
-      font-size: 1.05rem;
+      font-size: 1.04rem;
       margin-bottom: 32px;
       max-width: 480px;
       margin-left: auto;
       margin-right: auto;
+      position: relative;
     }
     .cta-buttons {
       display: flex;
       justify-content: center;
       gap: 16px;
       flex-wrap: wrap;
+      position: relative;
     }
 
     /* ── footer ── */
@@ -489,22 +867,39 @@
       padding: 36px 0;
       color: var(--muted);
       font-size: 0.85rem;
+    }
+    .footer-inner {
       display: flex;
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 16px;
+      align-items: center;
     }
-    footer a { color: var(--muted); text-decoration: none; }
-    footer a:hover { color: var(--text); }
+    .footer-inner .fi-left { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+    .footer-inner .fi-left .brand { font-weight: 600; color: var(--text); }
+    .footer-inner .fi-links { display: flex; gap: 20px; flex-wrap: wrap; align-items: center; }
+    .footer-inner .fi-links a { color: var(--muted); text-decoration: none; transition: color 0.18s; }
+    .footer-inner .fi-links a:hover { color: var(--text); }
 
     /* ── responsive ── */
-    @media (max-width: 640px) {
+    @media (max-width: 768px) {
       .nav-links { display: none; }
       .hero { padding: 60px 0 40px; }
+      .hero-visual-inner { grid-template-columns: 1fr; }
+      .screen-mock.tui { border-right: none; border-bottom: 1px solid var(--border); }
       section { padding: 56px 0; }
       .cta-box { padding: 40px 24px; }
-      .screen-mock.tui { border-right: none; border-bottom: 1px solid var(--border); }
-      .hero-visual-inner { grid-template-columns: 1fr; }
+      .vision { padding: 28px 20px; }
+      .diagram-node { padding: 16px 14px; min-width: 90px; }
+      .diagram-node .dn-icon { font-size: 1.2rem; }
+      .control-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 480px) {
+      .wrap { padding: 0 16px; }
+      .hero h1 { font-size: 2.2rem; }
+      .nav-inner { padding: 12px 16px; }
+      .diagram { flex-direction: column; }
+      .diagram-arrow { padding: 4px 0; }
     }
 
     /* ── scroll reveal ── */
@@ -513,29 +908,43 @@
       transform: translateY(20px);
       transition: opacity 0.55s ease, transform 0.55s ease;
     }
-    .reveal.show {
-      opacity: 1;
-      transform: none;
+    .reveal.show { opacity: 1; transform: none; }
+
+    /* ── micro-interactions ── */
+    .hover-lift { transition: transform 0.2s, border-color 0.2s; }
+    .hover-lift:hover { transform: translateY(-2px); border-color: #2a3344; }
+
+    /* focus */
+    a:focus-visible, button:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+      border-radius: 6px;
     }
   </style>
 </head>
 <body>
   <div class="glow glow-1" aria-hidden="true"></div>
   <div class="glow glow-2" aria-hidden="true"></div>
+  <div class="glow glow-3" aria-hidden="true"></div>
 
   <!-- ── NAV ── -->
   <nav>
     <div class="nav-inner">
       <div class="logo">
         <div class="logo-mark">⚡</div>
-        <span>Vibecoder</span>
+        <span>VibeCoder</span>
       </div>
       <div class="nav-links">
-        <a href="#features">Features</a>
+        <a href="#why">Why it exists</a>
+        <a href="#today">What it does today</a>
         <a href="#how">How it works</a>
         <a href="#providers">Providers</a>
-        <a href="#use">Use cases</a>
-        <a href="#start" class="btn btn-primary">Get started</a>
+        <a href="#future">Where it's going</a>
+        <a href="#install">Install</a>
+      </div>
+      <div class="nav-cta">
+        <a href="https://github.com/akashjoshi1209/vibecoder" class="btn btn-secondary" target="_blank" rel="noopener">GitHub</a>
+        <a href="#start" class="btn btn-primary">Try it →</a>
       </div>
     </div>
   </nav>
@@ -544,67 +953,76 @@
   <section class="hero">
     <div class="wrap">
       <div class="badge reveal">
-        <span>●</span> Your agent · Your terms · No PC required
+        <span class="dot"></span> Open source
+        <span style="margin:0 6px;color:var(--border);">·</span>
+        Single-agent terminal assistant
+        <span style="margin:0 6px;color:var(--border);">·</span>
+        <span class="vision-dot" style="width:7px;height:7px;border-radius:50%;background:var(--accent);display:inline-block;"></span>
+        Built toward an autonomous software specialist
       </div>
 
       <h1 class="reveal">
-        The AI coding agent that<br>
-        <span class="accent">lives in your terminal</span>
+        The open-source AI software development system<br>
+        <span class="accent">that starts where you are</span>
+        <span class="vision">— today a terminal coding agent, tomorrow an autonomous specialist that plans, builds, tests, and verifies your work.</span>
       </h1>
 
       <p class="reveal">
-        Vibecoder is a fully yours, no-limits AI coding agent that runs inside
-        Termux on Android. No PC. No opaque framework. Just your phone, your
-        providers, and an agent that sees a goal through to done.
+        VibeCoder is for anyone who has an idea and wants to build it — whether you're
+        an experienced developer, a complete beginner, or someone with only an Android
+        phone and no coding background. Your hardware and your coding knowledge should
+        not be what decides whether you can build something.
       </p>
 
       <div class="hero-cta reveal">
-        <a href="#start" class="btn btn-primary">Start coding on your phone →</a>
-        <a href="https://github.com/akashjoshi1209/vibecoder" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+        <a href="https://github.com/akashjoshi1209/vibecoder" class="btn btn-primary" target="_blank" rel="noopener">
+          View on GitHub →
+        </a>
+        <a href="#how" class="btn btn-secondary">See how it works</a>
       </div>
 
       <div class="hero-meta reveal">
-        <span><strong>No PC needed</strong> — runs on Android Termux</span>
-        <span><strong>Free providers</strong> — GROQ, NVIDIA, Ollama</span>
-        <span><strong>You own it</strong> — open source, no locks</span>
+        <span><strong>Open source</strong> — Apache-2.0, your code</span>
+        <span><strong>Runs on</strong> — Android, Windows, Linux, macOS</span>
+        <span><strong>AI</strong> — local models or free remote providers</span>
       </div>
 
       <div class="hero-visual reveal">
         <div class="hero-visual-inner">
           <div class="screen-mock tui">
             <span class="dim">$ vibecoder</span>
-            <span class="dim">● qwen/qwen3.8-27b → chat: groq</span><span class="dim"></span>
+            <span class="dim">● qwen/qwen3.8-27b → chat: groq</span>
             <span class="dim"></span>
-            <span class="prompt">❯</span> Create a Python script that fetches the top 5 Hacker News
-            stories and prints their titles. Keep it minimal.
+            <span class="prompt">❯</span> Build a small dashboard that reads a CSV of daily
+            temperatures, finds the warmest week, and writes an HTML summary.
             <span class="dim"></span>
-            <span class="dim">⚡ write_file {"path":"hn_top.py", ...}</span>
-            <span class="dim">  └ Wrote 210 bytes to hn_top.py</span>
-            <span class="dim">⚡ bash {"command":"python3 hn_top.py"}</span>
-            <span class="result">→ Showing top 5 stories from Hacker News:</span>
-            <span class="result">1. Show HN: ...</span>
-            <span class="result">2. ...</span>
-            <span class="dim"></span>
-            <span class="dim">✓ Done in 2 steps · 2 tool calls</span>
+            <span class="dim">⚡ understood: build temp dashboard from CSV → HTML</span>
+            <span class="dim">⚡ plan: 3 steps — read CSV, analyze, write HTML</span>
+            <span class="dim">⚡ bash {"command":"mkdir -p dashboard"}</span>
+            <span class="dim">  └ created dashboard/</span>
+            <span class="dim">⚡ write_file {"path":"dashboard/analyze.py"}</span>
+            <span class="dim">  └ Wrote 1.2 KB to dashboard/analyze.py</span>
+            <span class="dim">⚡ write_file {"path":"dashboard/index.html"}</span>
+            <span class="dim">  └ Wrote 3.4 KB to dashboard/index.html</span>
+            <span class="dim">⚡ bash {"command":"python3 dashboard/analyze.py"}</span>
+            <span class="ok">→ Warmest week: Sep 9–15, avg 29.4°C</span>
+            <span class="dim">✓ Done in 5 steps · 4 tool calls</span>
           </div>
           <div class="screen-mock web">
-            <div style="font-size:0.7rem;color:var(--muted);margin-bottom:4px;">web · agent running on phone</div>
+            <div style="font-size:0.7rem;color:var(--muted);margin-bottom:4px;">web · agent running locally</div>
             <div class="mock-chat" style="flex:1;">
               <div class="mock-msg bot">
-                Ready. I'll write a small HN fetcher using only the
-                standard library. One file, ~20 lines, no deps.
+                I'll build a small temperature dashboard. Reading your CSV, finding
+                the warmest week, and writing an HTML summary — one file of analysis
+                code, one HTML output.
               </div>
               <div class="mock-msg user">
-                Make it print titles + URLs, sorted by points.
+                Make the HTML show a bar for each day, highlight the warmest week in
+                amber, and keep it under 50 lines.
               </div>
               <div class="mock-msg bot">
-                Done — <code style="color:var(--accent);">hn_top.py</code> created.
-                Here's the output:
-                <pre style="margin-top:8px;font-size:0.72rem;color:#a78bfa;border-radius:6px;background:#080a10;padding:8px;overflow-x:auto;">
-1. Show HN: Vibecoder — coding agent on your phone
-   https://... · 342 points
-2. ...
-                </pre>
+                Done — <span class="code">dashboard/analyze.py</span> + <span class="code">dashboard/index.html</span> created.
+                Open <span class="code">dashboard/index.html</span> in a browser to see it.
               </div>
             </div>
             <div class="mock-input">❯ What's next?</div>
@@ -614,81 +1032,285 @@
     </div>
   </section>
 
-  <!-- ── FEATURES ── -->
-  <section id="features">
+  <!-- ── INTERACTIVE DEMO ── -->
+  <section id="demo">
     <div class="wrap">
-      <div class="reveal">
-        <div class="section-label">● Features</div>
-        <h2 class="section-title">Everything you need to code from a phone</h2>
-        <p class="section-sub">
-          Vibecoder ships with the tools a real coding session needs — file
-          ops, search, shell, web fetch, notifications, and tailnet check —
-          all controlled by the agent.
+      <div class="reveal" style="text-align:center;">
+        <div class="section-label">● See the loop</div>
+        <h2 class="section-title" style="margin-left:auto;margin-right:auto;">How a task moves through VibeCoder</h2>
+        <p class="section-sub" style="margin-left:auto;margin-right:auto;">
+          Every task follows the same loop: understand, plan, execute, test, verify,
+          fix, repeat — until the work matches what you actually wanted.
         </p>
       </div>
 
-      <div class="features">
-        <div class="feature-card reveal">
-          <div class="feature-icon">📁</div>
-          <h3>File tools</h3>
-          <p>Read, write, edit, and list directories. The agent explores your
-            codebase, creates files, and makes surgical edits without
-            clobbering what's already there.</p>
+      <div class="flow reveal" id="flow">
+        <div class="flow-step" data-step="0">
+          <div class="node idle">1</div>
+          <span class="label">Understand</span>
+          <span class="desc">Read the request. Detect ambiguity and ask if the goal is unclear.</span>
+        </div>
+        <div class="flow-arrow" data-arrow="0">↓</div>
+
+        <div class="flow-step" data-step="1">
+          <div class="node idle">2</div>
+          <span class="label">Plan</span>
+          <span class="desc">Break the work into steps. Decide which tools and models are needed.</span>
+        </div>
+        <div class="flow-arrow" data-arrow="1">↓</div>
+
+        <div class="flow-step" data-step="2">
+          <div class="node idle">3</div>
+          <span class="label">Execute</span>
+          <span class="desc">Write code, run commands, read files, install packages — one step at a time.</span>
+        </div>
+        <div class="flow-arrow" data-arrow="2">↓</div>
+
+        <div class="flow-step" data-step="3">
+          <div class="node idle">4</div>
+          <span class="label">Test</span>
+          <span class="desc">Run the result. Check it works the way you asked for.</span>
+        </div>
+        <div class="flow-arrow" data-arrow="3">↓</div>
+
+        <div class="flow-step" data-step="4">
+          <div class="node idle">5</div>
+          <span class="label">Verify</span>
+          <span class="desc">Compare the result against your original vision — not just "did it run."</span>
+        </div>
+        <div class="flow-arrow" data-arrow="4">↓</div>
+
+        <div class="flow-step" data-step="5">
+          <div class="node idle">6</div>
+          <span class="label">Fix</span>
+          <span class="desc">If something's off, investigate the failure and try a different approach.</span>
+        </div>
+        <div class="flow-arrow" data-arrow="5">↓</div>
+
+        <div class="flow-step" data-step="6">
+          <div class="node idle">↺</div>
+          <span class="label">Repeat</span>
+          <span class="desc">Loop back until the work is actually right — not just finished.</span>
+        </div>
+      </div>
+
+      <div class="demo-controls reveal">
+        <button class="btn btn-secondary" id="flow-play">Play the loop</button>
+        <button class="btn btn-ghost" id="flow-reset">Reset</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── WHY IT EXISTS ── -->
+  <section id="why">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Why it exists</div>
+        <h2 class="section-title">Three barriers stood between ideas and built things</h2>
+        <p class="section-sub">
+          VibeCoder started from a real, personal problem. Its creator wanted to build
+          software from an Android phone — without being an experienced programmer and
+          without relying on expensive hardware. Existing coding-agent workflows were
+          built around desktops and capable machines, and that created a gap.
+        </p>
+      </div>
+
+      <div class="barriers">
+        <div class="barrier reveal hover-lift">
+          <div class="barrier-icon">🧠</div>
+          <h3>Knowledge barrier</h3>
+          <p>People have ideas but don't know how to code. They can describe what they
+            want, but the "how" is locked behind a skill they haven't learned yet.</p>
+          <div class="quote">Your idea shouldn't require a CS degree to start.</div>
         </div>
 
-        <div class="feature-card reveal">
-          <div class="feature-icon">🔍</div>
-          <h3>Search &amp; grep</h3>
-          <p>Glob files by pattern and search contents with regex. Find the
-            right file and the right line before touching anything.</p>
+        <div class="barrier reveal hover-lift">
+          <div class="barrier-icon">💻</div>
+          <h3>Hardware barrier</h3>
+          <p>People may know how to build things but can't afford powerful computers.
+            A high-end laptop or workstation shouldn't be a prerequisite for building
+            software.</p>
+          <div class="quote">A low-end phone should still be a valid way to build.</div>
         </div>
 
-        <div class="feature-card reveal">
-          <div class="feature-icon">🖥️</div>
-          <h3>Bash</h3>
-          <p>Run shell commands — git, builds, installs, scripts, tests. The
-            agent batches work into one command where it can, and never runs
-            destructive commands silently.</p>
+        <div class="barrier reveal hover-lift">
+          <div class="barrier-icon">📱</div>
+          <h3>Accessibility barrier</h3>
+          <p>AI coding workflows are often designed around desktop environments and
+            high-resource setups. Mobile and low-resource environments get left out of
+            the conversation entirely.</p>
+          <div class="quote">The work should follow the user, not the hardware.</div>
+        </div>
+      </div>
+
+      <div class="reveal" style="margin-top:40px; padding:20px 24px; background:var(--surface); border:1px solid var(--border); border-radius:14px; max-width:680px;">
+        <p style="color:var(--muted); font-size:0.95rem; line-height:1.7;">
+          The original motivation was simple: <strong>"I want to be able to build things
+          from my Android phone, even without high-end hardware or traditional coding
+          skills."</strong> That grew into a broader philosophy:
+        </p>
+        <p style="color:var(--text); font-weight:600; margin-top:12px; font-size:1.02rem;">
+          "Build the tool you wish existed. Then open the door for others."
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── WHAT IT DOES TODAY ── -->
+  <section id="today">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Available now · V1.0.0</div>
+        <h2 class="section-title">What VibeCoder does today</h2>
+        <p class="section-sub">
+          Today, VibeCoder is a single-agent terminal-based AI coding assistant. It
+          receives a natural-language task, uses AI models and tools to do the work,
+          and iterates until the job is done. This is real, usable software — not a
+          roadmap masquerading as a product.
+        </p>
+      </div>
+
+      <div class="cap-grid">
+        <div class="cap-card reveal hover-lift">
+          <h3>Natural-language tasks</h3>
+          <p>Describe what you want in plain language. The agent reads the request,
+            understands the goal, and starts working.</p>
+          <span class="status now">Available now</span>
         </div>
 
-        <div class="feature-card reveal">
-          <div class="feature-icon">🌐</div>
-          <h3>Fetch URLs</h3>
-          <p>Read documentation, API responses, and web pages as part of the
-            agent's reasoning. Capped output so big pages never blow context.</p>
+        <div class="cap-card reveal hover-lift">
+          <h3>CLI, REPL, Unix TUI</h3>
+          <p>Three ways to talk to the agent: a one-shot CLI for task prompts, an
+            interactive REPL for back-and-forth, and a full-screen terminal UI.</p>
+          <span class="status now">Available now</span>
         </div>
 
-        <div class="feature-card reveal">
-          <div class="feature-icon">🔔</div>
-          <h3>Termux notifications</h3>
-          <p>The agent fires a notification to your Android status bar when a
-            long task finishes. Step away from the phone — you'll know when
-            it's done.</p>
+        <div class="cap-card reveal hover-lift">
+          <h3>Code generation &amp; editing</h3>
+          <p>Create files, write code, and make surgical edits without clobbering what's
+            already there. The agent reads before it writes.</p>
+          <span class="status now">Available now</span>
         </div>
 
-        <div class="feature-card reveal">
-          <div class="feature-icon">🔗</div>
-          <h3>Tailscale status</h3>
-          <p>Before reaching a server on another device (e.g. your Oppo home
-            server), the agent checks the tailnet tunnel. If it's down, it
+        <div class="cap-card reveal hover-lift">
+          <h3>File read, search, grep, glob</h3>
+          <p>Explore any codebase. Find the right file and the right line before touching
+            anything — read-only investigation first.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Terminal command execution</h3>
+          <p>Run shell commands — git, builds, installs, scripts, tests. The agent batches
+            work where it can and never runs destructive commands silently.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Package installation via shell</h3>
+          <p>Install tools and dependencies through the shell as part of the work, not as
+            a separate setup step you have to manage.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Model routing</h3>
+          <p>A fast model handles chat and simple queries; a heavy reasoning model takes
+            coding and complex tasks. Use the cheap model all day, the big model when it
+            matters.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Local Ollama + remote providers</h3>
+          <p>Works with Ollama for local models, plus GROQ, NVIDIA NIM, OpenAI, Anthropic,
+            and any custom OpenAI-compatible endpoint. You choose where the intelligence
+            comes from.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Queue system + background daemon</h3>
+          <p>Heavy tasks get queued automatically when connectivity drops and run the moment
+            it returns. Work keeps moving on spotty mobile data.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Tailscale &amp; network diagnostics</h3>
+          <p>Before reaching a server on another device, the agent checks the tailnet tunnel
+            and runs local network checks — ping, DNS, HTTP probe, gateway. If it's down, it
             tells you rather than guessing at an unreachable IP.</p>
+          <span class="status now">Available now</span>
         </div>
 
-        <div class="feature-card reveal">
-          <div class="feature-icon">🧠</div>
-          <h3>Dual-model routing</h3>
-          <p>A fast model handles chat and simple queries; a heavy reasoning
-            model takes coding and complex tasks. You use the cheap model all
-            day and only burn the big model when it matters.</p>
+        <div class="cap-card reveal hover-lift">
+          <h3>HTTP URL fetching</h3>
+          <p>Read documentation, API responses, and web pages as part of the agent's
+            reasoning. Capped output so big pages never blow context.</p>
+          <span class="status now">Available now</span>
         </div>
 
-        <div class="feature-card reveal">
-          <div class="feature-icon">⚡</div>
-          <h3>Offline queue</h3>
-          <p>Heavy tasks get queued automatically when your connection drops,
-            and run the moment connectivity returns. Work keeps moving on
-            spotty mobile data.</p>
+        <div class="cap-card reveal hover-lift">
+          <h3>Step-level error retries</h3>
+          <p>If a tool call fails, the agent retries at the step level before giving up —
+            not every failure becomes an immediate "what should I do?" to you.</p>
+          <span class="status now">Available now</span>
         </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Tool approval &amp; live status</h3>
+          <p>Sensitive actions can require your approval. Streaming shows what the agent is
+            doing as it happens. Tool calls are visible inline.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Plan mode, config, self-reporting</h3>
+          <p>Plan mode lets the agent think before it acts. A configuration system controls
+            providers, models, and behavior. Self-reporting and self-edit auditing keep a
+            record of what the agent changed and why.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Timeouts &amp; token budgeting</h3>
+          <p>Each interaction has a timeout and a token budget, so the agent doesn't burn
+            through your context or your patience on a stuck loop.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Connectivity awareness</h3>
+          <p>The agent knows whether it's online. Offline, it can fall back to a local model
+            (if you have one) or queue work for when connectivity returns.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Session persistence</h3>
+          <p>Work persists across sessions. The agent can pick up where it left off instead
+            of starting from zero every time.</p>
+          <span class="status now">Available now</span>
+        </div>
+
+        <div class="cap-card reveal hover-lift">
+          <h3>Linux, macOS, partial Windows</h3>
+          <p>Runs on Linux and macOS. Windows support is partial but usable — the core agent
+            loop works; some platform-specific tools vary.</p>
+          <span class="status now">Available now</span>
+        </div>
+      </div>
+
+      <div class="reveal" style="margin-top:40px; padding:18px 22px; background:var(--surface); border:1px solid var(--border); border-radius:12px; max-width:640px;">
+        <p style="color:var(--muted); font-size:0.92rem; line-height:1.65;">
+          <strong>What it does not do yet:</strong> VibeCoder v1.0.0 is a single agent, not
+          an orchestrated multi-agent system. It doesn't run parallel agents, create tools at
+          runtime, take mid-task pause/resume, let you modify the goal live, or take over
+          manually during execution. It doesn't have full GitHub integration, browser-based
+          web browsing, a dedicated debugger, wall-clock task deadlines, or cross-session
+          semantic memory. These are the next things — see the roadmap.
+        </p>
       </div>
     </div>
   </section>
@@ -698,43 +1320,52 @@
     <div class="wrap">
       <div class="reveal">
         <div class="section-label">● How it works</div>
-        <h2 class="section-title">Three steps from install to coding</h2>
+        <h2 class="section-title">From your words to working software</h2>
         <p class="section-sub">
-          No PC, no account dance, no opaque framework. Install, set a key,
-          and start talking to your agent.
+          The current architecture is straightforward: your request goes through a model
+          router, into an agent loop, out to tools, and back with results. You own every
+          part of that chain — the prompt, the tools, the providers. Nothing is opaque or
+          locked behind a framework.
         </p>
       </div>
 
-      <div class="steps">
-        <div class="step reveal">
-          <h3>1. Install on Termux</h3>
-          <p>One-time Bun install, then clone vibecoder and link it. The
-            <code>vibecoder</code> command is on your PATH — callable from
-            anywhere in Termux.</p>
+      <div class="diagram reveal">
+        <div class="diagram-node user">
+          <div class="dn-icon">🗣️</div>
+          <div class="dn-label">You</div>
+          <div class="dn-detail">Describe the goal in natural language</div>
         </div>
-
-        <div class="step reveal">
-          <h3>2. Set a free API key</h3>
-          <p>Grab a free GROQ key (qwen3.8-27b, gpt-oss-120b) or a free
-            NVIDIA NIM trial (Nemotron 3 Ultra 550B). Drop it in a gitignored
-            .env. No card required for the free tiers.</p>
+        <div class="diagram-arrow">→</div>
+        <div class="diagram-node router">
+          <div class="dn-icon">🔀</div>
+          <div class="dn-label">Model Router</div>
+          <div class="dn-detail">Chooses fast or heavy model for the task</div>
         </div>
-
-        <div class="step reveal">
-          <h3>3. Talk to your agent</h3>
-          <p>Open <code>vibecoder</code> and describe what you want. The agent
-            explores, decides, acts, observes, and iterates — reading files,
-            running commands, writing code — until the job is done.</p>
+        <div class="diagram-arrow">→</div>
+        <div class="diagram-node loop">
+          <div class="dn-icon">🔄</div>
+          <div class="dn-label">Agent Loop</div>
+          <div class="dn-detail">Understand → plan → act → observe → repeat</div>
+        </div>
+        <div class="diagram-arrow">→</div>
+        <div class="diagram-node tools">
+          <div class="dn-icon">🛠️</div>
+          <div class="dn-label">Tools</div>
+          <div class="dn-detail">Files, bash, search, fetch, git, network…</div>
+        </div>
+        <div class="diagram-arrow">→</div>
+        <div class="diagram-node result">
+          <div class="dn-icon">✓</div>
+          <div class="dn-label">Results</div>
+          <div class="dn-detail">Code, output, verified work</div>
         </div>
       </div>
 
-      <div class="reveal" style="margin-top:52px;padding:24px;background:var(--surface);border:1px solid var(--border);border-radius:14px;">
-        <p style="color:var(--muted);font-size:0.92rem;line-height:1.65;">
-          <strong>Optional:</strong> install Ollama in Termux and pull a small
-          local model (<code>qwen2.5:1.5b</code>) for offline chat. Vibecoder
-          auto-detects it. Most people use the free online providers and skip
-          local models entirely — your phone never has to run a big model.
-        </p>
+      <div class="reveal" style="margin-top:32px; color:var(--muted); font-size:0.92rem; max-width:560px;">
+        The agent loop runs up to 40 steps per task — each step is a tool call, an
+        observation, and a decision. If a step fails, the agent retries. If context gets
+        tight, it trims. If the task is still going after 40 steps, it reports what it
+        accomplished and what's left. You're never left guessing what happened.
       </div>
     </div>
   </section>
@@ -743,61 +1374,429 @@
   <section id="providers">
     <div class="wrap">
       <div class="reveal">
-        <div class="section-label">● Providers</div>
-        <h2 class="section-title">Free tiers that actually work</h2>
+        <div class="section-label">● Local + remote AI</div>
+        <h2 class="section-title">Provider-agnostic — you choose where the intelligence comes from</h2>
         <p class="section-sub">
-          Vibecoder is provider-agnostic. Point it at any OpenAI-compatible
-          endpoint or Anthropic — the config is yours. These are the defaults
-          that work out of the box on the free tier.
+          VibeCoder is designed to work with local models and remote providers alike. The
+          long-term system stays model-agnostic: you select models manually, and eventually
+          the agent picks the right one for the task automatically.
         </p>
       </div>
 
       <div class="providers reveal">
-        <div class="provider-pill">
+        <div class="provider-pill hover-lift">
+          <div class="pp-icon">⚡</div>
           <div>
-            <div class="name">GROQ</div>
-            <div class="detail">qwen/qwen3.8-27b · openai/gpt-oss-120b</div>
+            <div class="pp-name">GROQ</div>
+            <div class="pp-detail">qwen/qwen3.8-27b · openai/gpt-oss-120b</div>
           </div>
-          <div class="cost">free tier</div>
+          <div class="pp-cost">free tier</div>
         </div>
 
-        <div class="provider-pill">
+        <div class="provider-pill hover-lift">
+          <div class="pp-icon">🔷</div>
           <div>
-            <div class="name">NVIDIA NIM</div>
-            <div class="detail">nvidia/nemotron-3-ultra-550b-a55b</div>
+            <div class="pp-name">NVIDIA NIM</div>
+            <div class="pp-detail">nvidia/nemotron-3-ultra-550b-a55b</div>
           </div>
-          <div class="cost">free trial</div>
+          <div class="pp-cost">free trial</div>
         </div>
 
-        <div class="provider-pill">
+        <div class="provider-pill hover-lift">
+          <div class="pp-icon">🧠</div>
           <div>
-            <div class="name">Ollama (local)</div>
-            <div class="detail">qwen2.5:1.5b · llama3.1</div>
+            <div class="pp-name">Ollama (local)</div>
+            <div class="pp-detail">qwen2.5:1.5b · llama3.1 · any local model</div>
           </div>
-          <div class="cost">offline · optional</div>
+          <div class="pp-cost">offline · optional</div>
         </div>
 
-        <div class="provider-pill">
+        <div class="provider-pill hover-lift">
+          <div class="pp-icon">🟠</div>
           <div>
-            <div class="name">OpenAI</div>
-            <div class="detail">gpt-4o · gpt-4o-mini</div>
+            <div class="pp-name">OpenAI</div>
+            <div class="pp-detail">gpt-4o · gpt-4o-mini · any compatible model</div>
           </div>
-          <div class="cost">paid API</div>
+          <div class="pp-cost">paid API</div>
         </div>
 
-        <div class="provider-pill">
+        <div class="provider-pill hover-lift">
+          <div class="pp-icon">🟣</div>
           <div>
-            <div class="name">Anthropic</div>
-            <div class="detail">claude-sonnet-4-5 · haiku</div>
+            <div class="pp-name">Anthropic</div>
+            <div class="pp-detail">claude-sonnet-4-5 · haiku</div>
           </div>
-          <div class="cost">paid API</div>
+          <div class="pp-cost">paid API</div>
+        </div>
+
+        <div class="provider-pill hover-lift">
+          <div class="pp-icon">⚙️</div>
+          <div>
+            <div class="pp-name">Custom endpoint</div>
+            <div class="pp-detail">Any OpenAI-compatible provider</div>
+          </div>
+          <div class="pp-cost">yours to configure</div>
         </div>
       </div>
 
-      <div class="reveal" style="margin-top:36px;color:var(--muted);font-size:0.92rem;max-width:560px;">
-        Add any other OpenAI-compatible endpoint in <code>config.json</code>.
-        The agent owns the full loop — the prompt, the tools, the providers —
-        nothing here is opaque or locked behind a framework.
+      <div class="reveal" style="margin-top:32px; color:var(--muted); font-size:0.92rem; max-width:560px;">
+        Add any other OpenAI-compatible endpoint in <code>config.json</code>. The agent owns
+        the full loop — the prompt, the tools, the providers — nothing here is opaque or
+        locked behind a framework. Local models matter because VibeCoder should not
+        fundamentally depend on expensive cloud infrastructure.
+      </div>
+    </div>
+  </section>
+
+  <!-- ── WHERE IT'S GOING ── -->
+  <section id="future">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● The long-term vision</div>
+        <h2 class="section-title">Where VibeCoder is going</h2>
+        <p class="section-sub">
+          Today's VibeCoder is a real, usable single-agent assistant. The larger vision is
+          an autonomous AI software specialist — something closer to a software-focused
+          JARVIS/FRIDAY than a chatbot or code generator. This is the direction the project
+          is being built toward, not what exists today.
+        </p>
+      </div>
+
+      <div class="vision reveal">
+        <div class="vision-badge">
+          <span style="width:7px;height:7px;border-radius:50%;background:var(--accent-2);display:inline-block;"></span>
+          Vision — not yet implemented
+        </div>
+        <h2>An autonomous software specialist</h2>
+        <p>
+          The goal is to let a person describe what they want to build and have VibeCoder
+          understand the goal, plan the work, execute it, test it, verify it, fix problems,
+          and continue working toward the user's actual vision — without the user having to
+          manually control every tiny step.
+        </p>
+
+        <div class="vision-grid">
+          <div class="vision-item">
+            <div class="vi-icon">🎯</div>
+            <h4>Dynamic agents</h4>
+            <p>For complex tasks, create and assign specialized agents — research, frontend,
+              backend — based on what the work actually needs.</p>
+          </div>
+          <div class="vision-item">
+            <div class="vi-icon">↔️</div>
+            <h4>Parallel work</h4>
+            <p>Independent components of a task worked on in parallel where it makes sense —
+              not "more agents," but the right agents for the right task.</p>
+          </div>
+          <div class="vision-item">
+            <div class="vi-icon">🔁</div>
+            <h4>Continuous verification</h4>
+            <p>The agent compares results against your original vision and repeats the
+              understand-plan-execute-test-verify-fix loop until the work is actually right.</p>
+          </div>
+          <div class="vision-item">
+            <div class="vi-icon">🛡️</div>
+            <h4>Self-recovery</h4>
+            <p>Failure triggers investigation, not immediate surrender. Inspect errors, read
+              docs, try another approach or model, test again.</p>
+          </div>
+          <div class="vision-item">
+            <div class="vi-icon">⏱️</div>
+            <h4>Long-running tasks</h4>
+            <p>"You have 6 hours. Work on this until it's finished." The agent plans around
+              the time available, prioritizes, leaves room for testing and fixes, and stops
+              when the work is done.</p>
+          </div>
+          <div class="vision-item">
+            <div class="vi-icon">📱→💻→☁️</div>
+            <h4>Multi-device execution</h4>
+            <p>The same work moving across phone, PC, server, cloud, and other connected
+              devices — your hardware shouldn't be the reason the work stops.</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- human control -->
+      <div class="reveal" style="margin-top:44px;">
+        <div class="section-label">● Human control</div>
+        <h2 class="section-title">Autonomy doesn't mean you lose the wheel</h2>
+        <p class="section-sub">
+          You stay in control — start, stop, pause, resume, set time limits, approve
+          sensitive actions, watch the activity or ignore it. Some people want to see
+          everything; others just want to say "handle it in the background." VibeCoder
+          should support both.
+        </p>
+      </div>
+
+      <div class="control-grid reveal">
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Start</div>
+          <div class="ctrl-state"><span class="pill now">Available now</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Stop</div>
+          <div class="ctrl-state"><span class="pill now">Available now</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Pause / Resume</div>
+          <div class="ctrl-state"><span class="pill vising">Vision</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Time limit</div>
+          <div class="ctrl-state"><span class="pill vising">Vision</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Approvals</div>
+          <div class="ctrl-state"><span class="pill now">Available now</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Activity visibility</div>
+          <div class="ctrl-state"><span class="pill now">Available now</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Plan visibility</div>
+          <div class="ctrl-state"><span class="pill now">Available now</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Goal modification</div>
+          <div class="ctrl-state"><span class="pill vising">Vision</span></div>
+        </div>
+        <div class="ctrl hover-lift">
+          <div class="ctrl-label">Manual takeover</div>
+          <div class="ctrl-state"><span class="pill vising">Vision</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── MULTI-DEVICE VISION ── -->
+  <section id="multidevice">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Multi-device vision</div>
+        <h2 class="section-title">The work follows the user, not the hardware</h2>
+        <p class="section-sub">
+          The long-term vision is a full multi-device assistant. VibeCoder should not be tied
+          to one machine — the same work should eventually move between Android, Windows,
+          Linux, macOS, PCs, servers, cloud machines, and other connected devices.
+        </p>
+      </div>
+
+      <div class="diagram reveal">
+        <div class="diagram-node user">
+          <div class="dn-icon">📱</div>
+          <div class="dn-label">Phone</div>
+        </div>
+        <div class="diagram-arrow">→</div>
+        <div class="diagram-node loop">
+          <div class="dn-icon">⚡</div>
+          <div class="dn-label">VibeCoder</div>
+          <div class="dn-detail">Task orchestration</div>
+        </div>
+        <div class="diagram-arrow">→</div>
+        <div style="display:flex;flex-direction:column;gap:6px;align-items:center;">
+          <div class="diagram-node tools" style="min-width:110px;">
+            <div class="dn-label" style="font-size:0.82rem;">Phone</div>
+          </div>
+          <div class="diagram-node tools" style="min-width:110px;">
+            <div class="dn-label" style="font-size:0.82rem;">PC</div>
+          </div>
+          <div class="diagram-node tools" style="min-width:110px;">
+            <div class="dn-label" style="font-size:0.82rem;">Server</div>
+          </div>
+          <div class="diagram-node tools" style="min-width:110px;">
+            <div class="dn-label" style="font-size:0.82rem;">Cloud</div>
+          </div>
+          <div class="diagram-node tools" style="min-width:110px;">
+            <div class="dn-label" style="font-size:0.82rem;">Devices</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="reveal" style="margin-top:28px; padding:18px 22px; background:var(--surface); border:1px solid var(--border); border-radius:12px; max-width:600px;">
+        <p style="color:var(--muted); font-size:0.92rem; line-height:1.65;">
+          If a task needs more computational power, VibeCoder should eventually use other
+          available resources rather than telling you "your device isn't powerful enough."
+          A low-end phone should still be a valid way to access the system.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── OPEN SOURCE ── -->
+  <section id="open">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Open source</div>
+        <h2 class="section-title">Built public because building shouldn't have another paywall</h2>
+        <p class="section-sub">
+          VibeCoder is open source because its creator doesn't want someone who loves building
+          things to hit another mandatory paywall at every stage. Building software already
+          has possible costs — hardware, infrastructure, APIs, hosting, deployment, services.
+          VibeCoder itself should not become one more barrier that makes someone abandon an
+          idea because they can't afford the tool.
+        </p>
+      </div>
+
+      <div class="reveal" style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px;">
+        <div style="flex:1 1 240px; padding:20px 22px; background:var(--surface); border:1px solid var(--border); border-radius:14px;">
+          <div class="section-label" style="margin-bottom:10px;">The philosophy</div>
+          <p style="color:var(--text); font-size:1.02rem; line-height:1.6; font-weight:500;">
+            "If someone has an idea and wants to build it, their lack of coding knowledge or
+            expensive hardware should not automatically stop them."
+          </p>
+        </div>
+        <div style="flex:1 1 240px; padding:20px 22px; background:var(--surface); border:1px solid var(--border); border-radius:14px;">
+          <div class="section-label" style="margin-bottom:10px;">No business model (yet)</div>
+          <p style="color:var(--muted); font-size:0.92rem; line-height:1.6;">
+            There is no decided monetization strategy. No subscriptions, no enterprise pricing,
+            no premium tiers, no ads. The long-term personal vision is for the complete
+            VibeCoder experience to eventually be free, including the infrastructure.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── ROADMAP ── -->
+  <section id="roadmap">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Roadmap</div>
+        <h2 class="section-title">From a terminal assistant to an autonomous specialist</h2>
+        <p class="section-sub">
+          This is the direction VibeCoder is being built in. No dates — just the order of
+          what comes next. Each step makes the system more capable, more autonomous, and more
+          useful across more hardware.
+        </p>
+      </div>
+
+      <div class="roadmap reveal">
+        <div class="roadmap-step">
+          <div class="rs-dot done"></div>
+          <div class="rs-content">
+            <div class="rs-status now">Available now · V1.0.0</div>
+            <h3>Single-agent terminal assistant</h3>
+            <p>Natural-language tasks, CLI/REPL/TUI, file tools, bash, search, model routing,
+              queue system, network diagnostics, tool approval, streaming, plan mode, config,
+              self-reporting. Runs on Android, Linux, macOS, partial Windows.</p>
+          </div>
+        </div>
+
+        <div class="roadmap-step">
+          <div class="rs-dot vision"></div>
+          <div class="rs-content">
+            <div class="rs-status vision">In development</div>
+            <h3>Stronger autonomy &amp; verification</h3>
+            <p>Longer agent loops, better failure investigation, automatic retries that actually
+              try alternatives, continuous comparison of results against the original goal, and
+              clearer progress reporting when a task is left running.</p>
+          </div>
+        </div>
+
+        <div class="roadmap-step">
+          <div class="rs-dot vision"></div>
+          <div class="rs-content">
+            <div class="rs-status vision">Vision</div>
+            <h3>Multi-agent orchestration</h3>
+            <p>An orchestrator that dynamically organizes work — research agent, frontend agent,
+              backend agent — created and assigned based on what the task actually needs, not a
+              fixed list of permanent agents.</p>
+          </div>
+        </div>
+
+        <div class="roadmap-step">
+          <div class="rs-dot vision"></div>
+          <div class="rs-content">
+            <div class="rs-status vision">Vision</div>
+            <h3>Parallel execution</h3>
+            <p>Genuinely independent components of a task worked on in parallel. The goal is not
+              "more agents" — it's the right intelligence, tools, and agents for the right task.</p>
+          </div>
+        </div>
+
+        <div class="roadmap-step">
+          <div class="rs-dot vision"></div>
+          <div class="rs-content">
+            <div class="rs-status vision">Vision</div>
+            <h3>Deeper verification &amp; self-healing</h3>
+            <p>Automatic test interpretation and repair loops, runtime tool creation, mid-task
+              pause/resume, live goal modification, manual takeover during execution, and failure
+              handling that investigates before asking.</p>
+          </div>
+        </div>
+
+        <div class="roadmap-step">
+          <div class="rs-dot vision"></div>
+          <div class="rs-content">
+            <div class="rs-status vision">Vision</div>
+            <h3>Multi-device execution</h3>
+            <p>Full multi-device operation — Android, Windows, Linux, macOS, PCs, servers, cloud
+              machines, other connected devices, potentially IoT. The work follows the user, not
+              the hardware.</p>
+          </div>
+        </div>
+
+        <div class="roadmap-step">
+          <div class="rs-dot vision"></div>
+          <div class="rs-content">
+            <div class="rs-status vision">Vision</div>
+            <h3>Broader autonomous software specialist</h3>
+            <p>The long-term end state: an AI that can understand a goal, plan the work, use
+              whatever tools and intelligence it needs, execute complex tasks, verify the result,
+              recover from failure, and keep working until the user's vision is actually achieved
+              — across whatever hardware is available.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── INSTALL ── -->
+  <section id="install">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Install</div>
+        <h2 class="section-title">Get running in a few minutes</h2>
+        <p class="section-sub">
+          Clone the repo, install dependencies, set a free API key, and you're talking to your
+          agent. No PC required if you're on Android Termux. No opaque setup dance.
+        </p>
+      </div>
+
+      <div class="install-box reveal">
+        <div class="install-steps">
+          <div class="install-step">
+            <div class="is-num">1</div>
+            <div class="is-body">
+              <p>Clone the repository</p>
+              <code>git clone https://github.com/akashjoshi1209/vibecoder.git && cd vibecoder</code>
+            </div>
+          </div>
+          <div class="install-step">
+            <div class="is-num">2</div>
+            <div class="is-body">
+              <p>Install dependencies (Bun + npm)</p>
+              <code>npm install && bun run build</code>
+            </div>
+          </div>
+          <div class="install-step">
+            <div class="is-num">3</div>
+            <div class="is-body">
+              <p>Set a free API key in a gitignored <code>.env</code></p>
+              <code>echo "GROQ_API_KEY=your_key_here" > .env</code>
+              <p style="font-size:0.85rem; color:var(--muted);">GROQ (qwen3.8-27b, gpt-oss-120b) and NVIDIA NIM (Nemotron 3 Ultra 550B) both have free tiers. Or point it at any OpenAI-compatible endpoint.</p>
+            </div>
+          </div>
+          <div class="install-step">
+            <div class="is-num">4</div>
+            <div class="is-body">
+              <p>Start the agent</p>
+              <code>./vibecoder</code>
+              <p style="font-size:0.85rem; color:var(--muted);">Describe what you want to build. The agent understands, plans, executes, tests, verifies, and iterates until it's done.</p>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </section>
@@ -806,61 +1805,63 @@
   <section id="use">
     <div class="wrap">
       <div class="reveal">
-        <div class="section-label">● Use cases</div>
-        <h2 class="section-title">What people actually do with it</h2>
+        <div class="section-label">● Who it's for</div>
+        <h2 class="section-title">Anyone with an idea they want to turn into software</h2>
         <p class="section-sub">
-          Vibecoder is a general coding agent — but on a phone, the use cases
-          that matter are the ones you can do anywhere, anytime.
+          VibeCoder is not only for professional developers. It's for complete beginners,
+          students, makers, indie hackers, people with only an Android phone, people on
+          low-end computers, people with powerful workstations, and anyone already using AI
+          coding agents. A beginner should understand the website. A developer should still
+          find enough technical depth to take the project seriously.
         </p>
       </div>
 
       <div class="usecases">
-        <div class="usecase reveal">
+        <div class="usecase reveal hover-lift">
           <div class="tag">On the go</div>
           <h3>Quick coding sessions</h3>
-          <p>Write a script, fix a bug, build a small tool — between things,
-            on the train, on the couch. No laptop required. The agent does the
-            threading; you describe the outcome.</p>
+          <p>Write a script, fix a bug, build a small tool — between things, on the train, on
+            the couch. No laptop required. You describe the outcome; the agent does the work.</p>
         </div>
 
-        <div class="usecase reveal">
-          <div class="tag">Automation</div>
-          <h3>Phone-side automations</h3>
-          <p>Have the agent run repetitive tasks on your device — organize
-            files, batch-rename, fetch and process data, run a build and
-            notify you when it's done. Set it going and walk away.</p>
-        </div>
-
-        <div class="usecase reveal">
-          <div class="tag">Offline-resilient</div>
-          <h3>Spotty data? No problem</h3>
-          <p>Heavy tasks queue automatically when connectivity drops and run
-            when it returns. You can keep talking to the agent on the local
-            model (if you have one) or just queue up work for later.</p>
-        </div>
-
-        <div class="usecase reveal">
-          <div class="tag">Multi-device</div>
-          <h3>Reach your other devices</h3>
-          <p>With Tailscale up, the agent can check the tunnel and reach a
-            server on another device — your Oppo home server, a VPS, a NAS.
-            One agent, several machines, all from your phone.</p>
-        </div>
-
-        <div class="usecase reveal">
-          <div class="tag">Learning</div>
-          <h3>Explore and understand code</h3>
-          <p>Drop into any codebase, ask the agent to explain it, trace how
-            pieces fit together, and grep for the thing you actually care
-            about. Read-only investigation before you touch anything.</p>
-        </div>
-
-        <div class="usecase reveal">
+        <div class="usecase reveal hover-lift">
           <div class="tag">Building</div>
           <h3>Build real things</h3>
-          <p>The heavy model (Nemotron 550B) takes on real coding tasks —
-            multi-file work, debugging, refactoring. The agent keeps context
-            across steps and tool calls until the job is done.</p>
+          <p>The heavy model takes on real coding tasks — multi-file work, debugging,
+            refactoring. The agent keeps context across steps and tool calls until the job is
+            done.</p>
+        </div>
+
+        <div class="usecase reveal hover-lift">
+          <div class="tag">Exploration</div>
+          <h3>Understand any codebase</h3>
+          <p>Drop into a project, ask the agent to explain it, trace how pieces fit together,
+            and grep for the thing you actually care about. Read-only investigation before you
+            touch anything.</p>
+        </div>
+
+        <div class="usecase reveal hover-lift">
+          <div class="tag">Offline-resilient</div>
+          <h3>Spotty data? No problem</h3>
+          <p>Heavy tasks queue automatically when connectivity drops and run when it returns.
+            You can keep talking to the agent on a local model (if you have one) or queue work
+            for later.</p>
+        </div>
+
+        <div class="usecase reveal hover-lift">
+          <div class="tag">Multi-device</div>
+          <h3>Reach your other machines</h3>
+          <p>With Tailscale up, the agent checks the tunnel and reaches a server on another
+            device — your home server, a VPS, a NAS. One agent, several machines, from wherever
+            you are.</p>
+        </div>
+
+        <div class="usecase reveal hover-lift">
+          <div class="tag">Low-spec</div>
+          <h3>Build on modest hardware</h3>
+          <p>A low-end phone or a modest laptop is still a valid way to access the system. The
+            agent uses whatever hardware is available and, eventually, reaches for more when the
+            task needs it.</p>
         </div>
       </div>
     </div>
@@ -870,17 +1871,20 @@
   <section id="start" class="cta-section">
     <div class="wrap">
       <div class="cta-box reveal">
-        <h2>Start coding on your phone</h2>
-        <p>Install vibecoder in Termux, set a free API key, and you're
-          coding — no PC, no setup drama, no framework you don't control.</p>
+        <h2 style="color:var(--text);">What if having an idea was enough to start building?</h2>
+        <p class="cta-question">VibeCoder exists because the ability to build should not be
+          limited by how much someone knows about coding or how powerful their hardware is.</p>
+        <p>Open source. Terminal-based. Runs on your device. Free providers included. Becoming
+          an autonomous software specialist that plans, builds, tests, verifies, and keeps
+          working until your vision is real.</p>
         <div class="cta-buttons">
           <a href="https://github.com/akashjoshi1209/vibecoder" class="btn btn-primary" target="_blank" rel="noopener">
             View on GitHub →
           </a>
-          <a href="#features" class="btn btn-ghost">Read the details</a>
+          <a href="#how" class="btn btn-ghost">Read the details</a>
         </div>
-        <p style="margin-top:28px;font-size:0.82rem;color:var(--muted);">
-          Open source · Apache-2.0 · You own the loop · Free providers included
+        <p style="margin-top:28px; font-size:0.82rem; color:var(--muted);">
+          Open source · Apache-2.0 · You own the loop · Free providers included · No PC required
         </p>
       </div>
     </div>
@@ -888,12 +1892,12 @@
 
   <!-- ── FOOTER ── -->
   <footer>
-    <div class="wrap" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px;">
-      <div>
-        <span style="font-weight:600;color:var(--text);">Vibecoder</span>
-        <span style="margin-left:12px;">— an autonomous AI coding agent, fully yours.</span>
+    <div class="wrap footer-inner">
+      <div class="fi-left">
+        <span class="brand">VibeCoder</span>
+        <span>— an open-source AI software development system.</span>
       </div>
-      <div style="display:flex;gap:24px;flex-wrap:wrap;">
+      <div class="fi-links">
         <a href="https://github.com/akashjoshi1209/vibecoder" target="_blank" rel="noopener">GitHub</a>
         <span>·</span>
         <span>Apache-2.0</span>
@@ -903,8 +1907,9 @@
     </div>
   </footer>
 
-  <!-- ── scroll reveal ── -->
+  <!-- ── scroll reveal + interactive demo ── -->
   <script>
+    // scroll reveal
     const revealEls = document.querySelectorAll('.reveal');
     const observer = new IntersectionObserver((entries) => {
       entries.forEach((e) => {
@@ -915,6 +1920,76 @@
       });
     }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
     revealEls.forEach((el) => observer.observe(el));
+
+    // interactive demo: play the loop
+    const steps = document.querySelectorAll('.flow-step');
+    const arrows = document.querySelectorAll('.flow-arrow');
+    let playing = false;
+    let current = -1;
+    let timer = null;
+
+    function setStep(i, state) {
+      const el = steps[i];
+      const node = el.querySelector('.node');
+      const label = el.querySelector('.label');
+      if (state === 'active') {
+        node.className = 'node active';
+        label.style.color = 'var(--accent)';
+      } else if (state === 'done') {
+        node.className = 'node done';
+        label.style.color = 'var(--green)';
+        el.classList.add('done');
+      } else {
+        node.className = 'node idle';
+        label.style.color = '';
+        el.classList.remove('done');
+      }
+    }
+
+    function setArrow(i, state) {
+      const a = arrows[i];
+      if (state === 'active') { a.className = 'flow-arrow active'; }
+      else if (state === 'done') { a.className = 'flow-arrow done'; }
+      else { a.className = 'flow-arrow'; }
+    }
+
+    function resetFlow() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      playing = false;
+      current = -1;
+      steps.forEach((_, i) => setStep(i, 'idle'));
+      arrows.forEach((_, i) => setArrow(i, 'idle'));
+      document.getElementById('flow-play').textContent = 'Play the loop';
+    }
+
+    function playFlow() {
+      if (playing) { resetFlow(); return; }
+      playing = true;
+      current = -1;
+      steps.forEach((_, i) => setStep(i, 'idle'));
+      arrows.forEach((_, i) => setArrow(i, 'idle'));
+      document.getElementById('flow-play').textContent = 'Reset';
+
+      function next() {
+        current++;
+        if (current >= steps.length) {
+          playing = false;
+          document.getElementById('flow-play').textContent = 'Play the loop';
+          return;
+        }
+        // mark previous arrow as done, current step as active
+        if (current > 0) setArrow(current - 1, 'done');
+        setStep(current, 'active');
+        // mark previous step as done
+        if (current > 0) setStep(current - 1, 'done');
+        timer = setTimeout(next, 650);
+      }
+      // small delay before first step
+      timer = setTimeout(next, 300);
+    }
+
+    document.getElementById('flow-play').addEventListener('click', playFlow);
+    document.getElementById('flow-reset').addEventListener('click', resetFlow);
   </script>
 </body>
 </html>
