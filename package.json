@@ -1,15 +1,46 @@
 {
   "name": "vibecoder",
-  "version": "0.1.0",
-  "description": "A custom AI coding agent - fully yours, no limitations",
+  "version": "1.0.0",
+  "description": "A free, open-source AI coding agent that runs in your terminal. Fully yours — no payments, no artificial limitations, anything is customizable. Runs on Node or Bun; works online (free-tier cloud models) or fully offline with local Ollama.",
   "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "coding-agent",
+    "terminal",
+    "autonomous",
+    "llm",
+    "ollama",
+    "open-source",
+    "free"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akashjoshi1209/vibecoder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/akashjoshi1209/vibecoder/issues"
+  },
+  "homepage": "https://github.com/akashjoshi1209/vibecoder",
   "bin": {
-    "vibecoder": "./bin/vibecoder.js"
+    "vibecoder": "./dist/vibecoder.js",
+    "vibecoder-queue": "./dist/vibecoder-queue.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
     "start": "bun run src/cli.ts",
-    "build": "bun build src/cli.ts --outdir dist --target bun",
+    "build": "bun run scripts/build.ts",
+    "prepublishOnly": "bun run build && bun run typecheck && bun test",
     "typecheck": "tsc --noEmit",
     "test": "bun test --timeout=30000",
     "daemon": "bun src/daemon.ts"

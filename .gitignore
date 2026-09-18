@@ -4,6 +4,6 @@ dist/
 *.tsbuildinfo
 .vibecoder/
 .env
-
-# API keys (never commit)
-.env
+~/
+*.tgz
+.npmrc

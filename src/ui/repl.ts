@@ -19,6 +19,11 @@ import { TUI } from "./tui";
 import { setRuntimeIdentity, buildSelfReport, SELF_EDIT_PROTOCOL } from "../self-knowledge";
 import { appendLedger, restoreSelfFiles, selfFileDiffStat, ledgerSummary } from "../self-edit";
 import "../self-knowledge";
+import { createInterface } from "node:readline";
+import { loadDotEnv } from "../env";
+import { runDoctor } from "../doctor";
+import { runSetup } from "../setup";
+import { readPackageJson } from "../paths";
 
 const colors = {
   dim: "\x1b[2m",
@@ -714,8 +719,7 @@ function mainLine(): void {
 
 function mainLineInteractive(): void {
   console.log(banner(providerName, llmModel, cwd).join("\n"));
-  const readline = require("node:readline") as typeof import("node:readline");
-  const rl = readline.createInterface({
+  const rl = createInterface({
     input: process.stdin,
     output: process.stdout,
   });
@@ -739,7 +743,56 @@ function mainLineInteractive(): void {
   ask();
 }
 
+function printUsage(): void {
+  const v = readPackageJson()?.version ?? "dev";
+  console.log(`vibecoder v${v} — a free, custom AI coding agent for your terminal`);
+  console.log("");
+  console.log("Usage:");
+  console.log("  vibecoder                    interactive TUI REPL");
+  console.log("  vibecoder \"task message\"      one-shot prompt");
+  console.log("  vibecoder --prompt \"task\"     one-shot prompt (same as above)");
+  console.log("  vibecoder setup              generate ~/.vibecoder/config.json (customize it!)");
+  console.log("  vibecoder setup --yes        same, without prompts");
+  console.log("  vibecoder doctor             check install, config, providers, connectivity");
+  console.log("  vibecoder queue [start|status|stop]   run the queue daemon (vibecoder-queue)");
+  console.log("");
+  console.log("Options:");
+  console.log("  --provider <name>   pick provider (groq, ollama, openai, anthropic, nvidia…)");
+  console.log("  --model <id>        pick model");
+  console.log("  --resume [name]     resume last (or named) conversation");
+  console.log("  --max-steps <n>     cap the agent loop (default 40)");
+  console.log("  --cwd <path>        work from another directory");
+  console.log("  --version, -v       print version");
+  console.log("  --help, -h          this help");
+  console.log("");
+  console.log("Environment:");
+  console.log("  VIBECODER_CONFIG     exact config file to use (skips merge); otherwise ~/.vibecoder/config.json overrides defaults");
+  console.log("  VIBECODER_SESSION_DIR  where sessions/ and queue.json live (default ~/.vibecoder)");
+  console.log("  VIBECODER_NO_DOTENV=1   disable .env loading");
+  console.log("  GROQ_API_KEY / NVIDIA_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY  (in ~/.vibecoder/.env or your shell)");
+}
+
 async function main() {
+  loadDotEnv();
+
+  const first = process.argv[2];
+  if (first === "setup") {
+    process.exitCode = await runSetup(process.argv);
+    return;
+  }
+  if (first === "doctor") {
+    process.exitCode = await runDoctor();
+    return;
+  }
+  if (first === "--version" || first === "-v" || first === "version") {
+    console.log(readPackageJson()?.version ?? "dev");
+    return;
+  }
+  if (first === "--help" || first === "-h" || first === "help") {
+    printUsage();
+    return;
+  }
+
   await init();
 
   const resume = resolveResumeArg(process.argv);
@@ -755,7 +808,11 @@ async function main() {
   }
 
   const promptIdx = process.argv.indexOf("--prompt");
-  const prompt = promptIdx !== -1 ? process.argv[promptIdx + 1] : undefined;
+  let prompt = promptIdx !== -1 ? process.argv[promptIdx + 1] : undefined;
+  // `vibecoder "some task"` is sugar for `vibecoder --prompt "some task"`.
+  if (prompt === undefined && process.argv.length === 3 && process.argv[2] && !process.argv[2].startsWith("-")) {
+    prompt = process.argv[2];
+  }
 
   if (prompt) {
     mainLine();

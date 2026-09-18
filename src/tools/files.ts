@@ -1,8 +1,26 @@
 import { registerTool, type ToolContext } from "./registry";
 import { resolve } from "./fs-utils";
 import { dirname, join } from "node:path";
-import { mkdirSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
 import { isSelfFile, isProtectedFile, auditSelfEdit } from "../self-edit";
+
+async function fileText(p: string): Promise<string> {
+  try {
+    return await readFileAsync(p, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await readFileAsync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function protectedError(p: string): string {
   return `ERROR: SELF-EDIT PROTECTED — ${p} is the append-only audit ledger. It cannot be modified or deleted; self-edits are recorded there automatically.`;
@@ -11,7 +29,7 @@ function protectedError(p: string): string {
 async function preWriteNote(p: string, content: string): Promise<{ ok: boolean; note: string }> {
   if (isProtectedFile(p)) return { ok: false, note: protectedError(p) };
   if (isSelfFile(p)) {
-    const before = (await Bun.file(p).exists()) ? await Bun.file(p).text() : "";
+    const before = (await fileExists(p)) ? await fileText(p) : "";
     return { ok: true, note: auditSelfEdit("write_file", p, before, content, `wrote ${content.length} bytes`) };
   }
   return { ok: true, note: "" };
@@ -91,8 +109,8 @@ registerTool({
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const p = resolve(String(args.path), ctx);
-    if (!(await Bun.file(p).exists())) return `ERROR: file not found: ${p}`;
-    const text = await Bun.file(p).text();
+    if (!(await fileExists(p))) return `ERROR: file not found: ${p}`;
+    const text = await fileText(p);
     const lines = text.split("\n");
     // Offset 0 (or a negative/NaN value) then `lines.slice(-1)` would read the
     // LAST line; clamp so indexes always mean "1-based line number".
@@ -128,7 +146,7 @@ registerTool({
     const guard = await preWriteNote(p, content);
     if (!guard.ok) return guard.note;
     mkdirSync(dirname(p), { recursive: true });
-    await Bun.write(p, content);
+    await writeFileAsync(p, content, "utf8");
     return `Wrote ${content.length} bytes to ${p}${guard.note ? "\n" + guard.note : ""}`;
   },
 });
@@ -157,15 +175,15 @@ registerTool({
     const p = resolve(String(args.path), ctx);
     const oldString = String(args.oldString ?? "");
     const newString = String(args.newString ?? "");
-    if (!(await Bun.file(p).exists())) return `ERROR: file not found: ${p}`;
+    if (!(await fileExists(p))) return `ERROR: file not found: ${p}`;
     if (isProtectedFile(p)) return protectedError(p);
-    const text = await Bun.file(p).text();
+    const text = await fileText(p);
     if (!oldString) return `ERROR: oldString cannot be empty`;
     const count = text.split(oldString).length - 1;
     if (count === 0) return `ERROR: oldString not found in file`;
     if (count > 1) return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique)`;
     const updated = text.replace(oldString, newString);
-    await Bun.write(p, updated);
+    await writeFileAsync(p, updated, "utf8");
     const note = isSelfFile(p)
       ? auditSelfEdit("edit_file", p, text, updated, "replaced 1 occurrence")
       : "";

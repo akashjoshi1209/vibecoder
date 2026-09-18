@@ -1,4 +1,5 @@
 import { registerTool, type ToolContext } from "./registry";
+import { spawnCollect } from "./proc";
 
 const MAX_OUTPUT = 30000;
 
@@ -52,56 +53,29 @@ registerTool({
     const cwd = args.workdir ? String(args.workdir) : ctx.cwd;
     const timeout = Math.max(0, Number(args.timeout ?? 120000));
 
-    const proc = Bun.spawn({
+    const res = await spawnCollect({
       cmd: ["bash", "-lc", command],
       cwd,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true,
+      env: { ...process.env, NO_COLOR: "1" } as Record<string, string>,
+      timeoutMs: timeout,
+      signal: ctx.signal,
     });
 
-    const killTree = () => {
-      try { process.kill(-proc.pid, "SIGKILL"); } catch {
-        try { proc.kill(); } catch {}
-      }
-    };
+    let output = "";
+    if (res.stdout) output += res.stdout;
+    if (res.stderr) output += res.stderr ? (output ? "\n" : "") + res.stderr : "";
+    if (res.exitCode !== 0) output += (output ? "\n" : "") + `[exit code: ${res.exitCode}]`;
+    if (res.timedOut) output += (output ? "\n" : "") + `[killed: timed out after ${timeout}ms]`;
+    if (res.aborted) output += (output ? "\n" : "") + "[killed: interrupted]";
+    if (!output) output = "(no output)";
 
-    let timedOut = false;
-    const timer = timeout > 0 ? setTimeout(() => {
-      timedOut = true;
-      killTree();
-    }, timeout) : null;
-    const onAbort = () => killTree();
-    if (ctx.signal?.aborted) onAbort();
-    else ctx.signal?.addEventListener("abort", onAbort, { once: true });
-
-    try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-
-      let output = "";
-      if (stdout) output += stdout;
-      if (stderr) output += stderr ? (output ? "\n" : "") + stderr : "";
-      if (exitCode !== 0) output += (output ? "\n" : "") + `[exit code: ${exitCode}]`;
-      if (timedOut) output += (output ? "\n" : "") + `[killed: timed out after ${timeout}ms]`;
-      if (ctx.signal?.aborted) output += (output ? "\n" : "") + "[killed: interrupted]";
-      if (!output) output = "(no output)";
-
-      if (output.length > MAX_OUTPUT) {
-        // Keep the tail where errors/exit codes live; trim the head (build logs).
-        const keep = MAX_OUTPUT - 200;
-        const trimmed = output.length - keep;
-        output = `...[trimmed ${trimmed} chars from beginning]\n` + output.slice(output.length - keep);
-      }
-
-      return output;
-    } finally {
-      if (timer) clearTimeout(timer);
-      ctx.signal?.removeEventListener("abort", onAbort);
+    if (output.length > MAX_OUTPUT) {
+      // Keep the tail where errors/exit codes live; trim the head (build logs).
+      const keep = MAX_OUTPUT - 200;
+      const trimmed = output.length - keep;
+      output = `...[trimmed ${trimmed} chars from beginning]\n` + output.slice(output.length - keep);
     }
+
+    return output;
   },
 });

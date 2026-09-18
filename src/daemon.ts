@@ -6,6 +6,7 @@ import { mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./llm/client";
+import { loadDotEnv } from "./env";
 import { ModelRouter } from "./llm/router";
 import { createConnectivityPoller, type ConnectivityPoller } from "./llm/connectivity";
 import { drainQueue, type QueueRunnerDeps } from "./queue-runner";
@@ -66,6 +67,7 @@ function logger(logPath?: string): (line: string) => void {
 
 // ── main loop ─────────────────────────────────────────────────────────────────
 async function main() {
+  loadDotEnv();
   if (!lock()) { process.exit(1); }
   process.on("exit", removePid);
   process.on("SIGINT", () => { removePid(); process.exit(0); });
@@ -164,6 +166,23 @@ function cmdStop(): void {
 }
 
 const cmd = process.argv[2] ?? "start";
+
+if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+  console.log("1.0.0");
+  process.exit(0);
+}
+if (cmd === "--help" || cmd === "-h" || cmd === "help") {
+  console.log(
+    "vibecoder-queue — task-queue daemon (part of vibecoder).\n" +
+      "Usage: vibecoder-queue [start|status|stop]   (start is default)\n" +
+      "Also:  vibecoder-queue --version | --help\n",
+  );
+  process.exit(0);
+}
+if (cmd !== "start" && cmd !== "status" && cmd !== "stop") {
+  console.error(`[vibecoder-queue] unknown argument: ${cmd} (try 'status' or 'stop')`);
+  process.exit(2);
+}
 
 if (cmd === "status") cmdStatus();
 else if (cmd === "stop") cmdStop();

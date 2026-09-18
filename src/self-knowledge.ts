@@ -5,10 +5,10 @@
 import { listTools } from "./tools/registry";
 import { findModelCard } from "./llm/model-cards";
 import { loadConfig } from "./llm/client";
-import { ledgerSummary } from "./self-edit";
+import { loadConfigInfo } from "./config";
+import { readPackageJson } from "./paths";
+import { ledgerSummary, ledgerPath } from "./self-edit";
 import { registerTool } from "./tools/registry";
-import { readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
 
 let identity = { provider: "", model: "" };
 export function setRuntimeIdentity(provider: string, model: string): void {
@@ -20,10 +20,10 @@ export function runtimeIdentity(): { provider: string; model: string } {
 
 export const SELF_EDIT_PROTOCOL = `
 SELF-EDIT PROTOCOL (appended by the runtime; config edits cannot remove it):
-- Editing config.json or .env is a SELF-EDIT. Each one is written to SELF_EDITS.jsonl, an append-only audit ledger.
+- Editing your live config (config.json — the file /about reports; in user installs this is ~/.vibecoder/config.json, or .env in a repo install) is a SELF-EDIT. Each one is written to SELF_EDITS.jsonl, an append-only audit ledger.
 - Self-edits are STAGED: they only go live after the human runs /reload-config. Never claim a config change is live.
 - If you intend to change config.json, tell the human what changed and that it needs /reload-config (approve) or /undo-self-edits (revert) before continuing.
-- Never modify or delete SELF_EDITS.jsonl, and never remove the /reload-config or /undo-self-edits commands — such edits are blocked or audited and revertible via git.
+- Never modify or delete SELF_EDITS.jsonl, and never remove the /reload-config or /undo-self-edits commands — such edits are blocked or audited and revertible via git (repo) or backups (user install).
 - For source-code/style changes, edit files as normal; those are versioned by git.`;
 
 function toolListLines(): string[] {
@@ -50,22 +50,17 @@ function cardLines(model: string): string[] {
 export async function buildSelfReport(): Promise<string> {
   const model = identity.model || "unknown";
   const provider = identity.provider || "unknown";
-  let version = "dev";
-  try {
-    const pkg = JSON.parse(readFileSync(joinRepoRoot("package.json"), "utf8")) as { version?: string };
-    version = pkg.version || version;
-  } catch {
-    /* best-effort */
-  }
-  const cfg = await loadConfig().catch(() => null);
-  const cfgPath = process.env.VIBECODER_CONFIG || joinRepoRoot("config.json");
+  const pkg = readPackageJson();
+  const version = pkg?.version || "dev";
+  const { config: cfg, paths } = await loadConfigInfo();
+  const cfgPath = paths.effectiveFile;
 
   const lines: string[] = [
     `\n${"\x1b[1m"}${"\x1b[32m"}vibecoder — self-knowledge report${"\x1b[0m"}`,
     ``,
     `Identity`,
     `  - I am Vibecoder, an autonomous AI coding agent running inside a terminal.`,
-    `  - build: v${version} (runtime ${process.versions.bun ? "bun " + process.versions.bun : "node"})`,
+    `  - build: v${version} (runtime ${process.versions.bun ? "bun " + process.versions.bun : "node " + process.version})`,
     `  - provider: ${provider} · model: ${model}`,
     ``,
     `Model card`,
@@ -75,7 +70,7 @@ export async function buildSelfReport(): Promise<string> {
     ...routingReportLines(cfg),
     ``,
     `Runtime configuration`,
-    `  - config file: ${cfgPath}`,
+    `  - config file: ${cfgPath}${paths.merged ? " (built-in defaults + your ~/.vibecoder/config.json)" : ""}`,
     `  - systemPrompt: ${cfg?.systemPrompt ? "custom (from config)" : "not set explicitly"}`,
     `  - temperature: ${cfg?.temperature ?? "unset"} · maxTokens: ${cfg?.maxTokens ?? "unset"}`,
     `  - maxInputTokens: ${cfg?.maxInputTokens ?? "unset"} · maxInputTokensPerMinute: ${cfg?.maxInputTokensPerMinute ?? "unset"}`,
@@ -84,7 +79,7 @@ export async function buildSelfReport(): Promise<string> {
     ...toolListLines(),
     ``,
     `Self-edit state`,
-    `  - audit ledger: ${joinRepoRoot("SELF_EDITS.jsonl")} (append-only, protected)`,
+    `  - audit ledger: ${ledgerPath()} (append-only, protected)`,
     ...(ledgerSummary(3).length ? ledgerSummary(3) : ["  - no self-edits recorded"]),
   ];
   return lines.join("\n");
@@ -99,10 +94,6 @@ function routingReportLines(cfg: Awaited<ReturnType<typeof loadConfig>> | null):
     `  - strategy: ${r.strategy} (${strategyNote})`,
     `  - the identity above reflects the model used for the last turn`,
   ];
-}
-
-function joinRepoRoot(name: string): string {
-  return join(resolve(import.meta.dir, ".."), name);
 }
 
 /** Authenticity boundary text, shared by tool and /about. */

@@ -1,20 +1,10 @@
 import { registerTool, type ToolContext } from "./registry";
+import { spawnCollect } from "./proc";
+import { globScan } from "./glob";
 
 const MAX_RESULTS = 50;
 const MAX_SCANNED = 2000;
 const DEFAULT_TIMEOUT_MS = 60_000;
-
-function killTree(p: Bun.Subprocess): void {
-  try {
-    if (p.pid > 0) process.kill(-p.pid, "SIGKILL");
-  } catch {
-    try {
-      p.kill();
-    } catch {
-      // already gone
-    }
-  }
-}
 
 registerTool({
   definition: {
@@ -38,15 +28,8 @@ registerTool({
     const dir = args.cwd ? String(args.cwd) : ctx.cwd;
     const matches: string[] = [];
     try {
-      const r = new Bun.Glob(pattern).scan({ cwd: dir, onlyFiles: true });
-      for await (const m of r) {
-        if (matches.length >= MAX_SCANNED) {
-          matches.push("...(scan limit reached, results truncated)");
-          break;
-        }
-        if (m.split("/").some((seg) => seg === "node_modules" || seg === ".git")) continue;
-        matches.push(m);
-      }
+      const found = await globScan(pattern, { cwd: dir, onlyFiles: true, maxResults: MAX_SCANNED });
+      matches.push(...found);
     } catch (err: any) {
       return `ERROR: glob failed: ${err?.message ?? String(err)}`;
     }
@@ -83,7 +66,7 @@ registerTool({
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
 
-    const proc = Bun.spawn({
+    const res = await spawnCollect({
       cmd: [
         "grep",
         "-rn",
@@ -96,42 +79,19 @@ registerTool({
         "--",
         dir,
       ],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true,
+      env: { ...process.env, NO_COLOR: "1" } as Record<string, string>,
+      timeoutMs: timeout,
+      signal: ctx.signal,
     });
 
-    let timedOut = false;
-    const timer =
-      timeout > 0
-        ? setTimeout(() => {
-            timedOut = true;
-            killTree(proc);
-          }, timeout)
-        : null;
-    const onAbort = () => killTree(proc);
-    if (ctx.signal?.aborted) onAbort();
-    else ctx.signal?.addEventListener("abort", onAbort, { once: true });
-
-    try {
-      const [out, err, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      const lines = out.split("\n").filter(Boolean);
-      const shown = lines.slice(0, MAX_RESULTS);
-      let result = shown.join("\n");
-      if (timedOut) result += `\n[killed: timed out after ${timeout} ms]`;
-      else if (ctx.signal?.aborted) result += "\n[aborted]";
-      if (exitCode !== 0 && !lines.length) result += (err.trim() ? `ERROR: ${err.trim()}` : "");
-      if (!lines.length) result = result.trim() || "(no matches)";
-      else if (lines.length > MAX_RESULTS) result += `\n...(${lines.length - MAX_RESULTS} more)`;
-      return result;
-    } finally {
-      if (timer) clearTimeout(timer);
-      ctx.signal?.removeEventListener("abort", onAbort);
-    }
+    const lines = res.stdout.split("\n").filter(Boolean);
+    const shown = lines.slice(0, MAX_RESULTS);
+    let result = shown.join("\n");
+    if (res.timedOut) result += `\n[killed: timed out after ${timeout} ms]`;
+    else if (res.aborted) result += "\n[aborted]";
+    if (res.exitCode !== 0 && !lines.length) result += (res.stderr.trim() ? `ERROR: ${res.stderr.trim()}` : "");
+    if (!lines.length) result = result.trim() || "(no matches)";
+    else if (lines.length > MAX_RESULTS) result += `\n...(${lines.length - MAX_RESULTS} more)`;
+    return result;
   },
 });

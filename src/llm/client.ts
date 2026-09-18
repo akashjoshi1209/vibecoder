@@ -2,7 +2,8 @@ import type { ChatOptions, LLMProvider, ProviderConfig } from "./types";
 import type { RoutingConfig } from "./router";
 import { AnthropicProvider } from "./providers/anthropic";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible";
-import { join } from "node:path";
+export { loadConfig, configPaths, userConfigFile } from "../config";
+import { loadConfig } from "../config";
 
 export interface QueueConfig {
   /** Absolute or ~-path to the queue JSON. Defaults to ~/.vibecoder/queue.json. */
@@ -33,17 +34,6 @@ export interface RootConfig {
   planMode?: boolean;
   queue?: QueueConfig;
   connectivity?: ConnectivityConfig;
-}
-
-const DEFAULT_CONFIG_PATH = (() => {
-  const env = process.env.VIBECODER_CONFIG;
-  if (env) return env;
-  return join(import.meta.dir, "../../config.json");
-})();
-
-export async function loadConfig(path = DEFAULT_CONFIG_PATH): Promise<RootConfig> {
-  const text = await Bun.file(path).text();
-  return JSON.parse(text) as RootConfig;
 }
 
 export function createProvider(config: RootConfig, providerName?: string): { provider: LLMProvider; model: string; name: string } {
