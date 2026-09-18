@@ -233,7 +233,7 @@ export async function runAgent(
   // summary so even on a phone screen the user sees what was accomplished.
   const progressLines: string[] = [];
   if (stepSummaries.length) {
-    progressLines.push("Progress so far:");
+    progressLines.push("Progress:");
     for (const s of stepSummaries.slice(-8)) progressLines.push("  " + s);
   }
   const maxMsg =
