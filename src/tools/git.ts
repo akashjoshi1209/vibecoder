@@ -1,4 +1,5 @@
 import { registerTool, type ToolContext } from "./registry";
+import { spawnCollect } from "./proc";
 
 /**
  * Read-only Git operations. Use these to inspect repo state without touching it.
@@ -194,24 +195,16 @@ registerTool({
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 async function runGit(args: string[], label: string, ctx: ToolContext): Promise<string> {
-  const proc = Bun.spawn({
+  const res = await spawnCollect({
     cmd: ["git", ...args],
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...process.env, NO_COLOR: "1", GIT_PAGER: "cat" },
     cwd: ctx.cwd,
-    detached: true,
+    env: { ...process.env, NO_COLOR: "1", GIT_PAGER: "cat" },
     signal: ctx.signal,
   });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
   let out = "";
-  if (stdout) out += stdout;
-  if (stderr) out += (out ? "\n" : "") + stderr;
-  if (exitCode !== 0) out += (out ? "\n" : "") + `[exit code: ${exitCode}]`;
+  if (res.stdout) out += res.stdout;
+  if (res.stderr) out += res.stderr ? (out ? "\n" : "") + res.stderr : "";
+  if (res.exitCode !== 0) out += (out ? "\n" : "") + `[exit code: ${res.exitCode}]`;
   if (!out) out = "(no output)";
   return out;
 }

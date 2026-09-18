@@ -1,4 +1,6 @@
 import { registerTool, type ToolContext } from "./registry";
+import { spawnCollect } from "./proc";
+import { existsSync } from "node:fs";
 
 /**
  * Local network diagnostics for the laptop this agent runs on. Performs
@@ -80,25 +82,17 @@ registerTool({
 
 async function pingHost(ctx: ToolContext, host: string): Promise<string> {
   try {
-    const proc = Bun.spawn({
+    const res = await spawnCollect({
       cmd: ["ping", "-c", "3", "-W", "5", host],
-      stdout: "pipe",
-      stderr: "pipe",
       env: { ...process.env, NO_COLOR: "1" },
-      detached: true,
       signal: ctx.signal,
     });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
     let out = "";
-    if (stdout) out += stdout;
-    if (stderr) out += (out ? "\n" : "") + stderr;
-    if (exitCode !== 0 && !stdout) out += (out ? "\n" : "") + `[exit code: ${exitCode}]`;
-    const avg = stdout.match(/rtt[mina-z0-9 ]+=\s*([\d.]+)\/mu\/?l/gi)?.[0]?.slice(/\d/.test(stdout[0]) ? 0 : 0) ?? "";
-    return `ping ${host}: ${exitCode === 0 ? "reachable" : "unreachable"}${avg ? " (avg " + avg.split("=")[1].trim() + " ms)" : ""}`;
+    if (res.stdout) out += res.stdout;
+    if (res.stderr) out += res.stderr ? (out ? "\n" : "") + res.stderr : "";
+    if (res.exitCode !== 0 && !out) out += (out ? "\n" : "") + `[exit code: ${res.exitCode}]`;
+    const avg = out.match(/rtt[mina-z0-9 ]+=\s*([\d.]+)\/mu\/?l/gi)?.[0]?.slice(/\d/.test(out[0]) ? 0 : 0) ?? "";
+    return `ping ${host}: ${res.exitCode === 0 ? "reachable" : "unreachable"}${avg ? " (avg " + avg.split("=")[1].trim() + " ms)" : ""}`;
   } catch (err: unknown) {
     const msg = err && typeof err === "object" && "message" in err ? (err as Record<string, unknown>).message : String(err);
     return `ping ${host}: unavailable (${msg})`;
@@ -109,19 +103,12 @@ async function resolveDNS(ctx: ToolContext, host: string): Promise<string> {
   // Try dig first, then getent, then node net.lookup.
   if (await binaryExists(ctx, "dig")) {
     try {
-      const proc = Bun.spawn({
+      const res = await spawnCollect({
         cmd: ["dig", "+short", host],
-        stdout: "pipe",
-        stderr: "pipe",
         env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
         signal: ctx.signal,
       });
-      const [stdout, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        proc.exited,
-      ]);
-      const ips = stdout.trim().split("\n").filter(Boolean);
+      const ips = res.stdout.trim().split("\n").filter(Boolean);
       if (ips.length) return `dns ${host}: ${ips.join(", ")}`;
       return `dns ${host}: no records (dig returned empty)`;
     } catch {
@@ -130,19 +117,12 @@ async function resolveDNS(ctx: ToolContext, host: string): Promise<string> {
   }
   if (await binaryExists(ctx, "getent")) {
     try {
-      const proc = Bun.spawn({
+      const res = await spawnCollect({
         cmd: ["getent", "hosts", host],
-        stdout: "pipe",
-        stderr: "pipe",
         env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
         signal: ctx.signal,
       });
-      const [stdout, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        proc.exited,
-      ]);
-      const lines = stdout.trim().split("\n").filter(Boolean);
+      const lines = res.stdout.trim().split("\n").filter(Boolean);
       if (lines.length) {
         // getent hosts: "IP hostname [alias...]"
         const ips = lines.map((l) => l.split(/\s+/)[0]).filter(Boolean);
@@ -193,19 +173,12 @@ async function lanGateway(ctx: ToolContext): Promise<string> {
   // Try ip route, then netstat -rn, then node networkInterfaces for a reasonable guess.
   if (await binaryExists(ctx, "ip")) {
     try {
-      const proc = Bun.spawn({
+      const res = await spawnCollect({
         cmd: ["ip", "route"],
-        stdout: "pipe",
-        stderr: "pipe",
         env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
         signal: ctx.signal,
       });
-      const [stdout, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        proc.exited,
-      ]);
-      const lines = stdout.split("\n").filter((l) => l.startsWith("default via"));
+      const lines = res.stdout.split("\n").filter((l) => l.startsWith("default via"));
       if (lines.length) {
         const gw = lines[0].split(/\s+/)[2];
         return `lan gateway: ${gw}`;
@@ -217,19 +190,12 @@ async function lanGateway(ctx: ToolContext): Promise<string> {
   }
   if (await binaryExists(ctx, "netstat")) {
     try {
-      const proc = Bun.spawn({
+      const res = await spawnCollect({
         cmd: ["netstat", "-rn"],
-        stdout: "pipe",
-        stderr: "pipe",
         env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
         signal: ctx.signal,
       });
-      const [stdout, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        proc.exited,
-      ]);
-      const lines = stdout.split("\n").filter((l) => l.startsWith("default"));
+      const lines = res.stdout.split("\n").filter((l) => l.startsWith("default"));
       if (lines.length) {
         const gw = lines[0].split(/\s+/)[1];
         return `lan gateway: ${gw}`;
@@ -261,18 +227,12 @@ async function lanGateway(ctx: ToolContext): Promise<string> {
 
 async function binaryExists(ctx: ToolContext, name: string): Promise<boolean> {
   try {
-    const proc = Bun.spawn({
+    const res = await spawnCollect({
       cmd: ["which", name],
-      stdout: "pipe",
-      stderr: "pipe",
-      detached: true,
+      env: { ...process.env, NO_COLOR: "1" },
       signal: ctx.signal,
     });
-    const [out, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]);
-    return exitCode === 0 && out.trim().length > 0;
+    return res.exitCode === 0 && res.stdout.trim().length > 0;
   } catch {
     return false;
   }
