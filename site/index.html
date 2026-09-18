@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vibecoder — AI coding agent that lives in your terminal</title>
+  <meta name="description" content="Vibecoder is an autonomous AI coding agent that runs in your Termux terminal on Android — no PC needed. Use free providers (GROQ, NVIDIA) to code, build, and automate from your phone.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+  <style>
+    :root {
+      --bg: #0a0b0e;
+      --surface: #111318;
+      --surface-2: #181b22;
+      --border: #1f2330;
+      --text: #e4e6ed;
+      --muted: #6b7280;
+      --accent: #22d3ee;
+      --accent-2: #8b5cf6;
+      --green: #34d399;
+      --red: #f87171;
+      --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ── ambient glow ── */
+    .glow {
+      position: fixed;
+      pointer-events: none;
+      z-index: 0;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: 0.18;
+    }
+    .glow-1 {
+      width: 600px; height: 600px;
+      background: var(--accent);
+      top: -200px; left: -150px;
+    }
+    .glow-2 {
+      width: 500px; height: 500px;
+      background: var(--accent-2);
+      bottom: 100px; right: -100px;
+      opacity: 0.10;
+    }
+
+    .wrap {
+      position: relative;
+      z-index: 1;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ── nav ── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      background: rgba(10, 11, 14, 0.72);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-inner {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 1.15rem;
+      letter-spacing: -0.01em;
+    }
+    .logo-mark {
+      width: 30px; height: 30px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      font-size: 1.1rem;
+      color: #0a0b0e;
+      font-weight: 800;
+    }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      font-size: 0.9rem;
+    }
+    .nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.18s;
+    }
+    .nav-links a:hover { color: var(--text); }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      border: 1px solid transparent;
+      cursor: pointer;
+      transition: all 0.18s;
+      text-decoration: none;
+      font-family: var(--font);
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #0a0b0e;
+    }
+    .btn-primary:hover { background: #1ec8e6; transform: translateY(-1px); }
+    .btn-secondary {
+      background: var(--surface-2);
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-ghost {
+      background: transparent;
+      color: var(--text);
+      border-color: var(--border);
+    }
+    .btn-ghost:hover { border-color: var(--text); }
+
+    /* ── hero ── */
+    .hero {
+      padding: 90px 0 70px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 100px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 28px;
+      font-weight: 500;
+    }
+    .badge span { color: var(--green); }
+    .hero h1 {
+      font-size: clamp(2.6rem, 6vw, 4.4rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.08;
+      margin-bottom: 24px;
+      max-width: 860px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .hero h1 .accent {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .hero p {
+      font-size: 1.18rem;
+      color: var(--muted);
+      max-width: 640px;
+      margin: 0 auto 36px;
+      line-height: 1.7;
+    }
+    .hero-cta {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      margin-bottom: 48px;
+    }
+    .hero-meta {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 32px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
+    .hero-meta strong { color: var(--text); font-weight: 600; }
+
+    .hero-visual {
+      margin-top: 60px;
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      overflow: hidden;
+      position: relative;
+      max-width: 900px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .hero-visual-inner {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+    }
+    .screen-mock {
+      padding: 24px;
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      line-height: 1.6;
+      color: var(--text);
+      min-height: 280px;
+      white-space: pre-wrap;
+      overflow: hidden;
+    }
+    .screen-mock.tui {
+      background: #0d0f13;
+      border-right: 1px solid var(--border);
+    }
+    .screen-mock.tui .prompt { color: var(--accent); }
+    .screen-mock.tui .tool { color: #fbbf24; }
+    .screen-mock.tui .result { color: #a78bfa; }
+    .screen-mock.tui .dim { color: var(--muted); }
+    .screen-mock.web {
+      background: #0f1218;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .mock-chat {
+      background: var(--surface-2);
+      border-radius: 10px;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+    }
+    .mock-msg {
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      max-width: 85%;
+      font-family: var(--font);
+    }
+    .mock-msg.user { background: #1a1f2e; color: var(--text); align-self: flex-end; border: 1px solid #2a3142; }
+    .mock-msg.bot { background: #0f1218; color: #c4c8d4; border: 1px solid var(--border); align-self: flex-start; }
+    .mock-input {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      color: var(--text);
+      font-size: 0.82rem;
+    }
+
+    /* ── section ── */
+    section {
+      padding: 80px 0;
+      border-top: 1px solid var(--border);
+    }
+    .section-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 12px;
+    }
+    .section-title {
+      font-size: clamp(1.9rem, 3.5vw, 2.6rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 16px;
+      max-width: 720px;
+    }
+    .section-sub {
+      color: var(--muted);
+      font-size: 1.04rem;
+      max-width: 580px;
+      margin-bottom: 52px;
+      line-height: 1.7;
+    }
+
+    /* ── features grid ── */
+    .features {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 20px;
+    }
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 26px 24px;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .feature-card:hover {
+      border-color: #2a3344;
+      transform: translateY(-2px);
+    }
+    .feature-icon {
+      width: 42px; height: 42px;
+      background: var(--surface-2);
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      font-size: 1.3rem;
+      margin-bottom: 18px;
+      border: 1px solid var(--border);
+    }
+    .feature-card h3 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .feature-card p {
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.65;
+    }
+
+    /* ── how it works ── */
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 20px;
+      counter-reset: step;
+    }
+    .step {
+      counter-increment: step;
+      position: relative;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 28px 24px;
+    }
+    .step::before {
+      content: counter(step);
+      position: absolute;
+      top: -14px;
+      left: 24px;
+      width: 32px; height: 32px;
+      background: var(--accent);
+      color: #0a0b0e;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      font-weight: 700;
+      font-size: 0.85rem;
+    }
+    .step h3 {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+      padding-top: 14px;
+    }
+    .step p {
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.65;
+    }
+
+    /* ── providers ── */
+    .providers {
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+    .provider-pill {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      flex: 1 1 220px;
+      min-width: 200px;
+    }
+    .provider-pill .name {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .provider-pill .detail {
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+    .provider-pill .cost {
+      color: var(--green);
+      font-weight: 600;
+      font-size: 0.85rem;
+      margin-left: auto;
+    }
+
+    /* ── use cases ── */
+    .usecases {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 20px;
+    }
+    .usecase {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 26px 24px;
+    }
+    .usecase .tag {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 100px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .usecase h3 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .usecase p {
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.65;
+    }
+
+    /* ── CTA ── */
+    .cta-section {
+      text-align: center;
+      padding: 90px 0;
+      border-top: 1px solid var(--border);
+    }
+    .cta-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 60px 40px;
+      max-width: 720px;
+      margin: 0 auto;
+    }
+    .cta-box h2 {
+      font-size: clamp(1.8rem, 3vw, 2.4rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 16px;
+    }
+    .cta-box p {
+      color: var(--muted);
+      font-size: 1.05rem;
+      margin-bottom: 32px;
+      max-width: 480px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .cta-buttons {
+      display: flex;
+      justify-content: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    /* ── footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 36px 0;
+      color: var(--muted);
+      font-size: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    footer a { color: var(--muted); text-decoration: none; }
+    footer a:hover { color: var(--text); }
+
+    /* ── responsive ── */
+    @media (max-width: 640px) {
+      .nav-links { display: none; }
+      .hero { padding: 60px 0 40px; }
+      section { padding: 56px 0; }
+      .cta-box { padding: 40px 24px; }
+      .screen-mock.tui { border-right: none; border-bottom: 1px solid var(--border); }
+      .hero-visual-inner { grid-template-columns: 1fr; }
+    }
+
+    /* ── scroll reveal ── */
+    .reveal {
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 0.55s ease, transform 0.55s ease;
+    }
+    .reveal.show {
+      opacity: 1;
+      transform: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="glow glow-1" aria-hidden="true"></div>
+  <div class="glow glow-2" aria-hidden="true"></div>
+
+  <!-- ── NAV ── -->
+  <nav>
+    <div class="nav-inner">
+      <div class="logo">
+        <div class="logo-mark">⚡</div>
+        <span>Vibecoder</span>
+      </div>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#providers">Providers</a>
+        <a href="#use">Use cases</a>
+        <a href="#start" class="btn btn-primary">Get started</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ── HERO ── -->
+  <section class="hero">
+    <div class="wrap">
+      <div class="badge reveal">
+        <span>●</span> Your agent · Your terms · No PC required
+      </div>
+
+      <h1 class="reveal">
+        The AI coding agent that<br>
+        <span class="accent">lives in your terminal</span>
+      </h1>
+
+      <p class="reveal">
+        Vibecoder is a fully yours, no-limits AI coding agent that runs inside
+        Termux on Android. No PC. No opaque framework. Just your phone, your
+        providers, and an agent that sees a goal through to done.
+      </p>
+
+      <div class="hero-cta reveal">
+        <a href="#start" class="btn btn-primary">Start coding on your phone →</a>
+        <a href="https://github.com/akashjoshi1209/vibecoder" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+
+      <div class="hero-meta reveal">
+        <span><strong>No PC needed</strong> — runs on Android Termux</span>
+        <span><strong>Free providers</strong> — GROQ, NVIDIA, Ollama</span>
+        <span><strong>You own it</strong> — open source, no locks</span>
+      </div>
+
+      <div class="hero-visual reveal">
+        <div class="hero-visual-inner">
+          <div class="screen-mock tui">
+            <span class="dim">$ vibecoder</span>
+            <span class="dim">● qwen/qwen3.8-27b → chat: groq</span><span class="dim"></span>
+            <span class="dim"></span>
+            <span class="prompt">❯</span> Create a Python script that fetches the top 5 Hacker News
+            stories and prints their titles. Keep it minimal.
+            <span class="dim"></span>
+            <span class="dim">⚡ write_file {"path":"hn_top.py", ...}</span>
+            <span class="dim">  └ Wrote 210 bytes to hn_top.py</span>
+            <span class="dim">⚡ bash {"command":"python3 hn_top.py"}</span>
+            <span class="result">→ Showing top 5 stories from Hacker News:</span>
+            <span class="result">1. Show HN: ...</span>
+            <span class="result">2. ...</span>
+            <span class="dim"></span>
+            <span class="dim">✓ Done in 2 steps · 2 tool calls</span>
+          </div>
+          <div class="screen-mock web">
+            <div style="font-size:0.7rem;color:var(--muted);margin-bottom:4px;">web · agent running on phone</div>
+            <div class="mock-chat" style="flex:1;">
+              <div class="mock-msg bot">
+                Ready. I'll write a small HN fetcher using only the
+                standard library. One file, ~20 lines, no deps.
+              </div>
+              <div class="mock-msg user">
+                Make it print titles + URLs, sorted by points.
+              </div>
+              <div class="mock-msg bot">
+                Done — <code style="color:var(--accent);">hn_top.py</code> created.
+                Here's the output:
+                <pre style="margin-top:8px;font-size:0.72rem;color:#a78bfa;border-radius:6px;background:#080a10;padding:8px;overflow-x:auto;">
+1. Show HN: Vibecoder — coding agent on your phone
+   https://... · 342 points
+2. ...
+                </pre>
+              </div>
+            </div>
+            <div class="mock-input">❯ What's next?</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── FEATURES ── -->
+  <section id="features">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Features</div>
+        <h2 class="section-title">Everything you need to code from a phone</h2>
+        <p class="section-sub">
+          Vibecoder ships with the tools a real coding session needs — file
+          ops, search, shell, web fetch, notifications, and tailnet check —
+          all controlled by the agent.
+        </p>
+      </div>
+
+      <div class="features">
+        <div class="feature-card reveal">
+          <div class="feature-icon">📁</div>
+          <h3>File tools</h3>
+          <p>Read, write, edit, and list directories. The agent explores your
+            codebase, creates files, and makes surgical edits without
+            clobbering what's already there.</p>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon">🔍</div>
+          <h3>Search &amp; grep</h3>
+          <p>Glob files by pattern and search contents with regex. Find the
+            right file and the right line before touching anything.</p>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon">🖥️</div>
+          <h3>Bash</h3>
+          <p>Run shell commands — git, builds, installs, scripts, tests. The
+            agent batches work into one command where it can, and never runs
+            destructive commands silently.</p>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon">🌐</div>
+          <h3>Fetch URLs</h3>
+          <p>Read documentation, API responses, and web pages as part of the
+            agent's reasoning. Capped output so big pages never blow context.</p>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon">🔔</div>
+          <h3>Termux notifications</h3>
+          <p>The agent fires a notification to your Android status bar when a
+            long task finishes. Step away from the phone — you'll know when
+            it's done.</p>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon">🔗</div>
+          <h3>Tailscale status</h3>
+          <p>Before reaching a server on another device (e.g. your Oppo home
+            server), the agent checks the tailnet tunnel. If it's down, it
+            tells you rather than guessing at an unreachable IP.</p>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon">🧠</div>
+          <h3>Dual-model routing</h3>
+          <p>A fast model handles chat and simple queries; a heavy reasoning
+            model takes coding and complex tasks. You use the cheap model all
+            day and only burn the big model when it matters.</p>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon">⚡</div>
+          <h3>Offline queue</h3>
+          <p>Heavy tasks get queued automatically when your connection drops,
+            and run the moment connectivity returns. Work keeps moving on
+            spotty mobile data.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── HOW IT WORKS ── -->
+  <section id="how">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● How it works</div>
+        <h2 class="section-title">Three steps from install to coding</h2>
+        <p class="section-sub">
+          No PC, no account dance, no opaque framework. Install, set a key,
+          and start talking to your agent.
+        </p>
+      </div>
+
+      <div class="steps">
+        <div class="step reveal">
+          <h3>1. Install on Termux</h3>
+          <p>One-time Bun install, then clone vibecoder and link it. The
+            <code>vibecoder</code> command is on your PATH — callable from
+            anywhere in Termux.</p>
+        </div>
+
+        <div class="step reveal">
+          <h3>2. Set a free API key</h3>
+          <p>Grab a free GROQ key (qwen3.8-27b, gpt-oss-120b) or a free
+            NVIDIA NIM trial (Nemotron 3 Ultra 550B). Drop it in a gitignored
+            .env. No card required for the free tiers.</p>
+        </div>
+
+        <div class="step reveal">
+          <h3>3. Talk to your agent</h3>
+          <p>Open <code>vibecoder</code> and describe what you want. The agent
+            explores, decides, acts, observes, and iterates — reading files,
+            running commands, writing code — until the job is done.</p>
+        </div>
+      </div>
+
+      <div class="reveal" style="margin-top:52px;padding:24px;background:var(--surface);border:1px solid var(--border);border-radius:14px;">
+        <p style="color:var(--muted);font-size:0.92rem;line-height:1.65;">
+          <strong>Optional:</strong> install Ollama in Termux and pull a small
+          local model (<code>qwen2.5:1.5b</code>) for offline chat. Vibecoder
+          auto-detects it. Most people use the free online providers and skip
+          local models entirely — your phone never has to run a big model.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── PROVIDERS ── -->
+  <section id="providers">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Providers</div>
+        <h2 class="section-title">Free tiers that actually work</h2>
+        <p class="section-sub">
+          Vibecoder is provider-agnostic. Point it at any OpenAI-compatible
+          endpoint or Anthropic — the config is yours. These are the defaults
+          that work out of the box on the free tier.
+        </p>
+      </div>
+
+      <div class="providers reveal">
+        <div class="provider-pill">
+          <div>
+            <div class="name">GROQ</div>
+            <div class="detail">qwen/qwen3.8-27b · openai/gpt-oss-120b</div>
+          </div>
+          <div class="cost">free tier</div>
+        </div>
+
+        <div class="provider-pill">
+          <div>
+            <div class="name">NVIDIA NIM</div>
+            <div class="detail">nvidia/nemotron-3-ultra-550b-a55b</div>
+          </div>
+          <div class="cost">free trial</div>
+        </div>
+
+        <div class="provider-pill">
+          <div>
+            <div class="name">Ollama (local)</div>
+            <div class="detail">qwen2.5:1.5b · llama3.1</div>
+          </div>
+          <div class="cost">offline · optional</div>
+        </div>
+
+        <div class="provider-pill">
+          <div>
+            <div class="name">OpenAI</div>
+            <div class="detail">gpt-4o · gpt-4o-mini</div>
+          </div>
+          <div class="cost">paid API</div>
+        </div>
+
+        <div class="provider-pill">
+          <div>
+            <div class="name">Anthropic</div>
+            <div class="detail">claude-sonnet-4-5 · haiku</div>
+          </div>
+          <div class="cost">paid API</div>
+        </div>
+      </div>
+
+      <div class="reveal" style="margin-top:36px;color:var(--muted);font-size:0.92rem;max-width:560px;">
+        Add any other OpenAI-compatible endpoint in <code>config.json</code>.
+        The agent owns the full loop — the prompt, the tools, the providers —
+        nothing here is opaque or locked behind a framework.
+      </div>
+    </div>
+  </section>
+
+  <!-- ── USE CASES ── -->
+  <section id="use">
+    <div class="wrap">
+      <div class="reveal">
+        <div class="section-label">● Use cases</div>
+        <h2 class="section-title">What people actually do with it</h2>
+        <p class="section-sub">
+          Vibecoder is a general coding agent — but on a phone, the use cases
+          that matter are the ones you can do anywhere, anytime.
+        </p>
+      </div>
+
+      <div class="usecases">
+        <div class="usecase reveal">
+          <div class="tag">On the go</div>
+          <h3>Quick coding sessions</h3>
+          <p>Write a script, fix a bug, build a small tool — between things,
+            on the train, on the couch. No laptop required. The agent does the
+            threading; you describe the outcome.</p>
+        </div>
+
+        <div class="usecase reveal">
+          <div class="tag">Automation</div>
+          <h3>Phone-side automations</h3>
+          <p>Have the agent run repetitive tasks on your device — organize
+            files, batch-rename, fetch and process data, run a build and
+            notify you when it's done. Set it going and walk away.</p>
+        </div>
+
+        <div class="usecase reveal">
+          <div class="tag">Offline-resilient</div>
+          <h3>Spotty data? No problem</h3>
+          <p>Heavy tasks queue automatically when connectivity drops and run
+            when it returns. You can keep talking to the agent on the local
+            model (if you have one) or just queue up work for later.</p>
+        </div>
+
+        <div class="usecase reveal">
+          <div class="tag">Multi-device</div>
+          <h3>Reach your other devices</h3>
+          <p>With Tailscale up, the agent can check the tunnel and reach a
+            server on another device — your Oppo home server, a VPS, a NAS.
+            One agent, several machines, all from your phone.</p>
+        </div>
+
+        <div class="usecase reveal">
+          <div class="tag">Learning</div>
+          <h3>Explore and understand code</h3>
+          <p>Drop into any codebase, ask the agent to explain it, trace how
+            pieces fit together, and grep for the thing you actually care
+            about. Read-only investigation before you touch anything.</p>
+        </div>
+
+        <div class="usecase reveal">
+          <div class="tag">Building</div>
+          <h3>Build real things</h3>
+          <p>The heavy model (Nemotron 550B) takes on real coding tasks —
+            multi-file work, debugging, refactoring. The agent keeps context
+            across steps and tool calls until the job is done.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── CTA ── -->
+  <section id="start" class="cta-section">
+    <div class="wrap">
+      <div class="cta-box reveal">
+        <h2>Start coding on your phone</h2>
+        <p>Install vibecoder in Termux, set a free API key, and you're
+          coding — no PC, no setup drama, no framework you don't control.</p>
+        <div class="cta-buttons">
+          <a href="https://github.com/akashjoshi1209/vibecoder" class="btn btn-primary" target="_blank" rel="noopener">
+            View on GitHub →
+          </a>
+          <a href="#features" class="btn btn-ghost">Read the details</a>
+        </div>
+        <p style="margin-top:28px;font-size:0.82rem;color:var(--muted);">
+          Open source · Apache-2.0 · You own the loop · Free providers included
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── FOOTER ── -->
+  <footer>
+    <div class="wrap" style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:16px;">
+      <div>
+        <span style="font-weight:600;color:var(--text);">Vibecoder</span>
+        <span style="margin-left:12px;">— an autonomous AI coding agent, fully yours.</span>
+      </div>
+      <div style="display:flex;gap:24px;flex-wrap:wrap;">
+        <a href="https://github.com/akashjoshi1209/vibecoder" target="_blank" rel="noopener">GitHub</a>
+        <span>·</span>
+        <span>Apache-2.0</span>
+        <span>·</span>
+        <span>Built with Bun + TypeScript</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ── scroll reveal ── -->
+  <script>
+    const revealEls = document.querySelectorAll('.reveal');
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((e) => {
+        if (e.isIntersecting) {
+          e.target.classList.add('show');
+          observer.unobserve(e.target);
+        }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+    revealEls.forEach((el) => observer.observe(el));
+  </script>
+</body>
+</html>
