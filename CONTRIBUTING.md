@@ -44,7 +44,10 @@ config.json                built-in defaults (shipped with the package)
   (>=18.17). Prefer `node:*` imports. Tests may use `Bun.*` helpers — they only
   run under `bun test`.
 - **Portable bundle:** `bun run build` produces single-file Node bundles in
-  `dist/`. Don't commit `dist/`; `prepublishOnly` builds it for npm.
+  `dist/`. `dist/` **is committed** so the curl|bash installer works straight
+  from GitHub (no npm publish needed). Always rebuild (`bun run build`) before
+  committing so `dist/` matches `src/`; `prepublishOnly` rebuilds it again for
+  npm.
 - **No secrets.** `.env` holds real API keys and is gitignored. Never commit it.
 - Add tests for new logic in `src/*.test.ts`. Keep tests offline (all LLM calls
   are mocked or skipped in tests).

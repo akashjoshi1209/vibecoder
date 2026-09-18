@@ -4,29 +4,47 @@ A free, open-source AI coding agent that lives in your terminal. Fully yours —
 no payments, no accounts, no artificial limitations, and every layer is
 customizable: the prompt, the loop, the tools, the providers.
 
-- **Runs anywhere** — installs as a global npm package, works on plain Node.js ≥ 18.17 (Bun optional).
+- **Made for phones too** — runs on Android via Termux, right in your pocket. Small screen, light model, full agent.
+- **Runs anywhere** — installs in one terminal command; works on plain Node.js ≥ 18.17 (Bun optional), Linux/macOS/Android.
 - **Works offline and free** — defaults to local [Ollama](https://ollama.com); no API key required to start.
 - **Or brings your own free tier** — GROQ, NVIDIA NIM, OpenAI, Anthropic, any OpenAI-compatible endpoint.
 - **Designed to be customized** — `vibecoder setup` generates a config file you can edit; no limits, no paywall.
 
 ## Install
 
-One line, from the official repository:
+One command, from any terminal (desktop **or** Android/Termux):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/akashjoshi1209/vibecoder/master/scripts/install.sh | bash
 ```
 
-Or install directly with npm (requires Node ≥ 18.17):
+The script downloads the prebuilt CLI straight from GitHub — no npm publishing,
+no accounts, no build tools. It installs Node itself on Termux (Android); on a
+desktop it verifies you have Node ≥ 18.17 first.
+
+### Android (Termux)
 
 ```bash
-npm install -g vibecoder
+# once (2 min setup): install Termux from F-Droid at https://f-droid.org/en/packages/com.termux/
+pkg install -y curl
+curl -fsSL https://raw.githubusercontent.com/akashjoshi1209/vibecoder/master/scripts/install.sh | bash
+
+# free + fully offline on the phone:
+pkg install -y ollama && ollama pull qwen2.5:1.5b
+vibecoder
 ```
 
-Or with Bun:
+Termux is fully supported: `vibecoder doctor`, `setup`, the TUI, the queue
+daemon, and offline Ollama all work. Feels like a native IDE on a phone.
+
+### Desktop (Linux / macOS)
+
+Same one-liner above. Or, once the npm package is published, with your package
+manager:
 
 ```bash
-bun add -g vibecoder
+npm install -g vibecoder     # requires Node ≥ 18.17
+bun add -g vibecoder         # if you prefer Bun
 ```
 
 Verify:

@@ -29,9 +29,19 @@ export interface PackageMeta {
 
 export function readPackageJson(): PackageMeta | null {
   const f = resolvePackageFile("package.json");
-  if (!f) return null;
+  if (f) {
+    try {
+      return JSON.parse(readFileSync(f, "utf8")) as PackageMeta;
+    } catch {
+      // fall through to version.json
+    }
+  }
+  // Standalone installs (curl→ ~/.vibecoder/cli) carry dist/version.json.
+  const v = resolvePackageFile("version.json");
+  if (!v) return null;
   try {
-    return JSON.parse(readFileSync(f, "utf8")) as PackageMeta;
+    const m = JSON.parse(readFileSync(v, "utf8")) as PackageMeta;
+    return { name: m.name ?? "vibecoder", version: m.version ?? undefined };
   } catch {
     return null;
   }

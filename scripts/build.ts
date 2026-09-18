@@ -11,6 +11,9 @@ const outdir = join(root, "dist");
 rmSync(outdir, { recursive: true, force: true });
 mkdirSync(outdir, { recursive: true });
 
+const pkgMeta = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version: string; name: string };
+writeFileSync(join(outdir, "version.json"), JSON.stringify({ name: pkgMeta.name, version: pkgMeta.version }) + "\n");
+
 async function bundle(entry: string, out: string): Promise<void> {
   const result = await build({
     entrypoints: [join(root, entry)],
@@ -36,4 +39,4 @@ await bundle("src/cli.ts", "vibecoder.js");
 await bundle("src/daemon.ts", "vibecoder-queue.js");
 
 copyFileSync(join(root, "config.json"), join(outdir, "config.json"));
-console.log("dist/vibecoder.js · dist/vibecoder-queue.js · dist/config.json");
+console.log("dist/vibecoder.js · dist/vibecoder-queue.js · dist/version.json · dist/config.json");

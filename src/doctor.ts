@@ -30,9 +30,14 @@ export async function runDoctor(): Promise<number> {
   const version = pkg?.version ?? "dev";
   const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`;
 
+  const isTermux =
+    existsSync("/data/data/com.termux") ||
+    process.env.ANDROID_DATA !== undefined ||
+    process.env.EXTERNAL_STORAGE !== undefined;
+
   say("vibecoder doctor");
   say(`  version:   ${version}`);
-  say(`  runtime:   ${runtime} (${process.platform}/${process.arch})`);
+  say(`  runtime:   ${runtime} (${process.platform}/${process.arch})${isTermux ? " · Android (Termux)" : ""}`);
   say(`  install:   ${installMode()} mode`);
 
   // ── config ──────────────────────────────────────────────────────────────────
