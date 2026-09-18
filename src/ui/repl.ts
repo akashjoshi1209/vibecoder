@@ -10,6 +10,8 @@ import "../tools/bash";
 import "../tools/files";
 import "../tools/search";
 import "../tools/net";
+import "../tools/termux";
+import "../tools/tailscale";
 import { saveSession, saveLast, loadSession, loadLast, listSessions, deleteSession, resolveResumeArg, type SessionData } from "../session";
 import { resolve } from "../tools/fs-utils";
 import { hasControllingTty } from "./terminal";

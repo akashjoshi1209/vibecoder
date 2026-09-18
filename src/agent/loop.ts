@@ -229,10 +229,17 @@ export async function runAgent(
     }
   }
 
-  const summary = stepSummaries.length
-    ? `\nProgress: ${stepSummaries.slice(-5).join("; ")}`
-    : "";
-  const maxMsg = `(reached max steps without completion.${summary})`;
+  // Reached max steps without natural completion. Give a compact progress
+  // summary so even on a phone screen the user sees what was accomplished.
+  const progressLines: string[] = [];
+  if (stepSummaries.length) {
+    progressLines.push("Progress so far:");
+    for (const s of stepSummaries.slice(-8)) progressLines.push("  " + s);
+  }
+  const maxMsg =
+    progressLines.length > 0
+      ? `(reached max steps without completion.\n${progressLines.join("\n")}\n${stepSummaries.length} step(s) ran, ${toolCalls} tool call(s). Try a more focused task or raise --max-steps.)`
+      : `(reached max steps without completion. ${toolCalls} tool call(s) were attempted.)`;
   callbacks.onModelText?.(`\n${maxMsg}\n`);
   callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "max_steps" });
   return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false };
