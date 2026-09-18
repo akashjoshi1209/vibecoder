@@ -1,26 +1,35 @@
 import { registerTool, type ToolContext } from "./registry";
-import { join as pathJoin } from "node:path";
+import { join as pathJoin, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 
-/**
- * Read and write environment variables to the project's gitignored `.env` file.
- * Useful on phones where editing .env by hand is clunky. Values are masked in
- * output; binary names are checked with `which`.
- *
- * `env_get(key)` — read a value (masked display).
- * `env_set(key, value)` — write/update a key in .env (creates the file if needed).
- * `env_list()` — list keys (values shown as [set]/[not set]).
- */
+const _repoRoot = (() => {
+  try {
+    const file = fileURLToPath(import.meta.url);
+    let dir = dirname(file);
+    for (let i = 0; i < 10; i++) {
+      if (existsSync(pathJoin(dir, "package.json")) || existsSync(pathJoin(dir, ".git"))) {
+        return dir;
+      }
+      dir = dirname(dir);
+    }
+    return pathJoin(process.cwd(), "..", "..");
+  } catch {
+    return pathJoin(process.cwd(), "..", "..");
+  }
+})();
 
 const ENV_FILE = (() => {
   const override = process.env.VIBECODER_ENV_FILE;
   if (override) return override;
-  const repoRoot = pathJoin(import.meta.dir, "..", "..");
-  return pathJoin(repoRoot, ".env");
+  return pathJoin(_repoRoot, ".env");
 })();
 
 async function readEnv(): Promise<Record<string, string>> {
   try {
-    const text = await Bun.file(ENV_FILE).text();
+    const text = await readFile(ENV_FILE, "utf8");
     const out: Record<string, string> = {};
     for (const line of text.split("\n")) {
       const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
@@ -37,7 +46,7 @@ async function writeEnv(dict: Record<string, string>): Promise<void> {
     .filter(([, v]) => true)
     .map(([k, v]) => `${k}=${v}`)
     .join("\n");
-  await Bun.write(ENV_FILE, lines + "\n");
+  await writeFile(ENV_FILE, lines + "\n");
 }
 
 function mask(v: string): string {
@@ -47,18 +56,20 @@ function mask(v: string): string {
 }
 
 async function whichBin(name: string): Promise<boolean> {
-    try {
-    const proc = Bun.spawn({
-      cmd: ["which", name],
-      stdout: "pipe",
-      stderr: "pipe",
+  try {
+    const child = spawn("which", [name], {
+      stdio: ["ignore", "pipe", "pipe"],
       detached: true,
     });
-    const [out, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      proc.exited,
-    ]);
-    return exitCode === 0 && out.trim().length > 0;
+    let stdout = "";
+    let stderr = "";
+    const p = new Promise<void>((resolve) => {
+      child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
+      child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+      child.on("close", () => resolve());
+    });
+    await p;
+    return child.exitCode === 0 && stdout.trim().length > 0;
   } catch {
     return false;
   }
@@ -85,7 +96,7 @@ registerTool({
     if (!key) return "ERROR: key is required";
     const env = await readEnv();
     const val = env[key] ?? "";
-    const present = await whichBin(key.toLowerCase()) || val.length > 0;
+    const present = val.length > 0;
     return `${key}: ${present ? "set" : "not set"}\n  value: ${mask(val)}`;
   },
 });
@@ -132,8 +143,74 @@ registerTool({
     const env = await readEnv();
     const keys = Object.keys(env).sort();
     if (!keys.length) return "(no .env file or no variables set)";
-    const binMap: Record<string, boolean> = {};
-    for (const k of keys) binMap[k] = await whichBin(k.toLowerCase());
-    return keys.map((k) => `  ${k}: ${mask(env[k])}${binMap[k] ? "  [bin found]" : ""}`).join("\n");
+    return keys.map((k) => `  ${k}: ${mask(env[k])}`).join("\n");
+  },
+});
+
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "env_check",
+      description:
+        "Check whether a list of required environment variables are set in .env. Returns a report: which are set (masked), which are missing, and a pass/fail verdict. Use before a task that depends on specific keys.",
+      parameters: {
+        type: "object",
+        properties: {
+          keys: { type: "array", items: { type: "string" }, description: "List of env var names to check (required)" },
+        },
+        required: ["keys"],
+      },
+    },
+  },
+  async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    const keys = (args.keys as string[] | undefined)?.filter((k) => typeof k === "string" && k.trim()) ?? [];
+    if (!keys.length) return "ERROR: keys list is required and must be non-empty";
+    const env = await readEnv();
+    const missing: string[] = [];
+    const present: string[] = [];
+    for (const k of keys) {
+      const v = env[k.trim()] ?? "";
+      if (v) present.push(k.trim()); else missing.push(k.trim());
+    }
+    const lines: string[] = [];
+    lines.push(`env_check: ${present.length}/${keys.length} set`);
+    if (present.length) {
+      lines.push("set:");
+      for (const k of present) lines.push(`  ${k}: ${mask(env[k])}`);
+    }
+    if (missing.length) {
+      lines.push("missing:");
+      for (const k of missing) lines.push(`  ${k}: (not set)`);
+    }
+    if (missing.length) lines.push("\nVERDICT: FAIL — the following are missing and must be set before proceeding: " + missing.join(", "));
+    else lines.push("\nVERDICT: PASS — all required keys are set");
+    return lines.join("\n");
+  },
+});
+
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "env_require",
+      description:
+        "Require that a single environment variable is set in .env. Fails loudly with an actionable message if it is missing. Use at the start of a task that cannot proceed without a specific key (e.g. an API key).",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Environment variable name that must be set (required)" },
+        },
+        required: ["key"],
+      },
+    },
+  },
+  async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    const key = String(args.key ?? "").trim();
+    if (!key) return "ERROR: key is required";
+    const env = await readEnv();
+    const v = env[key] ?? "";
+    if (!v) return `FAIL: ${key} is not set in .env. Set it with env_set("${key}", "<value>") then re-run.`;
+    return `OK: ${key} is set (masked: ${mask(v)})`;
   },
 });
