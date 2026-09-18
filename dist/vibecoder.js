@@ -992,8 +992,8 @@ function trimMessages(messages, opts) {
   }
   if (budget < 1) {
     const lastIdx = blocks[blocks.length - 1];
-    const kept2 = lastIdx.map((j) => cloneMessage(nonSystem[j]));
-    return { messages: [...system.map(cloneMessage), ...kept2], trimmed: messages.length - (system.length + kept2.length), truncatedChars: 0 };
+    const kept = lastIdx.map((j) => cloneMessage(nonSystem[j]));
+    return { messages: [...system.map(cloneMessage), ...kept], trimmed: messages.length - (system.length + kept.length), truncatedChars: 0 };
   }
   let used = system.reduce((s, m) => s + estimateMessageTokens(m), 0);
   const firstUserBlock = blocks.findIndex((b) => nonSystem[b[0]].role === "user");
@@ -1596,8 +1596,8 @@ function repoRoot() {
 function installMode() {
   if (process.env.VIBECODER_REPO_ROOT)
     return "repo";
-  const root2 = dirname3(packageRoot());
-  if (existsSync4(join4(root2, ".git")) || existsSync4(join4(packageRoot(), ".git")))
+  const root = dirname3(packageRoot());
+  if (existsSync4(join4(root, ".git")) || existsSync4(join4(packageRoot(), ".git")))
     return "repo";
   return "user";
 }
@@ -1629,8 +1629,8 @@ function isSameFile(a, b) {
 }
 function reposWhere() {
   if (process.env.VIBECODER_REPO_ROOT) {
-    const root2 = resolve3(process.env.VIBECODER_REPO_ROOT);
-    return { root: root2, config: join4(root2, "config.json"), env: join4(root2, ".env") };
+    const root = resolve3(process.env.VIBECODER_REPO_ROOT);
+    return { root, config: join4(root, "config.json"), env: join4(root, ".env") };
   }
   return null;
 }
@@ -2021,13 +2021,13 @@ async function globScan(pattern, opts) {
     const head = remaining[0];
     if (head === "**") {
       if (remaining.length === 1) {
-        let entries3;
+        let entries;
         try {
-          entries3 = await opendir(dir);
+          entries = await opendir(dir);
         } catch {
           return;
         }
-        for await (const e of entries3) {
+        for await (const e of entries) {
           if (truncated || scanned >= maxScanned)
             break;
           if (exclusions.has(e.name))
@@ -2043,13 +2043,13 @@ async function globScan(pattern, opts) {
         return;
       }
       await recurse(remaining.slice(1), dir, rel);
-      let entries2;
+      let entries;
       try {
-        entries2 = await opendir(dir);
+        entries = await opendir(dir);
       } catch {
         return;
       }
-      for await (const e of entries2) {
+      for await (const e of entries) {
         if (truncated || scanned >= maxScanned)
           break;
         if (e.isDirectory() && !exclusions.has(e.name)) {
@@ -2437,7 +2437,7 @@ async function ollamaModels(baseUrl, timeoutMs = 800) {
   }
 }
 async function ensureOllamaServe(opts = {}) {
-  const log2 = opts.onLog ?? (() => {});
+  const log = opts.onLog ?? (() => {});
   if (process.env.VIBECODER_NO_OLLAMA_AUTOSTART === "1") {
     return { running: false, started: false, error: "autostart disabled by env" };
   }
@@ -2448,27 +2448,27 @@ async function ensureOllamaServe(opts = {}) {
   }
   const bin = ollamaBinary();
   if (!bin) {
-    const msg2 = `ollama not found — offline chat/planning unavailable
+    const msg = `ollama not found — offline chat/planning unavailable
 ` + `  → install it:  https://ollama.com  (or run:  curl -fsSL https://ollama.com/install.sh | sh)
 ` + `  → pull the local model:  ollama pull qwen2.5:1.5b
 ` + "  → or go online-only: ensure connectivity reaches a provider and GROQ_API_KEY (or another key) is set";
-    log2(msg2);
-    return { running: false, started: false, error: msg2 };
+    log(msg);
+    return { running: false, started: false, error: msg };
   }
-  log2(`starting ollama serve (${bin}) …`);
+  log(`starting ollama serve (${bin}) …`);
   try {
     const child = spawn2(bin, ["serve"], { detached: true, stdio: "ignore" });
     child.unref();
   } catch (err) {
-    const msg2 = `failed to start ollama serve: ${err?.message ?? err}`;
-    log2(msg2);
-    return { running: false, started: false, error: msg2 };
+    const msg = `failed to start ollama serve: ${err?.message ?? err}`;
+    log(msg);
+    return { running: false, started: false, error: msg };
   }
   const deadline = Date.now() + (opts.readyTimeoutMs ?? 6000);
   while (Date.now() < deadline) {
     if (await ollamaIsUp(baseUrl, 500)) {
       const models = await ollamaModels(baseUrl);
-      log2(models.length ? `ollama serve ready (${models.join(", ")})` : "ollama serve ready");
+      log(models.length ? `ollama serve ready (${models.join(", ")})` : "ollama serve ready");
       return { running: true, started: true, models };
     }
     await new Promise((r) => setTimeout(r, 300));
@@ -2477,7 +2477,7 @@ async function ensureOllamaServe(opts = {}) {
 ` + `  → check it with:  ollama list
 ` + `  → pull the configured model:  ollama pull qwen2.5:1.5b
 ` + "  → or set GROQ_API_KEY so online providers stay available while ollama is down";
-  log2(msg);
+  log(msg);
   return { running: false, started: true, error: msg };
 }
 
@@ -2624,8 +2624,815 @@ registerTool({
   }
 });
 
+// src/tools/network.ts
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "tailscale_status",
+      description: "Check Tailscale tunnel health: connected or not, this device's tailnet name/IP, and known peer machines (name + IP). Use before the agent tries to reach a server on another device (e.g. an Oppo home server). Inert when `tailscale` isn't installed.",
+      parameters: {
+        type: "object",
+        properties: {
+          host: { type: "string", description: "Optional: filter to a specific peer hostname (e.g. 'oppo-a9'). Returns its line, or 'not found'." }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const host = String(args.host ?? "").trim();
+    let hasBin = false;
+    try {
+      const bin = Bun.spawn({
+        cmd: ["which", "tailscale"],
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, NO_COLOR: "1" },
+        detached: true,
+        signal: ctx.signal
+      });
+      const [whichOut, whichErr, whichExit] = await Promise.all([
+        new Response(bin.stdout).text(),
+        new Response(bin.stderr).text(),
+        bin.exited
+      ]);
+      hasBin = whichExit === 0 && whichOut.trim().length > 0;
+    } catch {
+      hasBin = false;
+    }
+    if (!hasBin) {
+      return "NOTE: tailscale not found on PATH. Install it: https://tailscale.com/download (or pkg install tailscale on Termux).";
+    }
+    let lastErr = "";
+    async function tryJson() {
+      const proc = Bun.spawn({
+        cmd: ["tailscale", "status", "--json"],
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, NO_COLOR: "1" },
+        detached: true,
+        signal: ctx.signal
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited
+      ]);
+      lastErr = stderr || "(no stderr)";
+      if (exitCode !== 0 || !stdout.trim())
+        return null;
+      try {
+        const j = JSON.parse(stdout.trim());
+        if (host) {
+          const peer = j.Peers?.[host];
+          if (!peer) {
+            const known = Object.keys(j.Peers ?? {}).filter((k) => k).map((k) => `  ${k} → ${(j.Peers[k]?.TailscaleIPs ?? []).join(", ") || "(no IP)"}`).join(`
+`);
+            return `Peer "${host}" not found. Known peers:
+${known || "(none)"}`;
+          }
+          const ips = (peer.TailscaleIPs ?? []).filter(Boolean);
+          return `${host} → ${ips.join(", ") || "(no IP)"} · online: ${peer.Online}`;
+        }
+        const hostname = j.HostInfo?.HostName ?? "(unknown hostname)";
+        const selfIps = (j.Self?.TailscaleIPs ?? []).filter(Boolean);
+        const peers = j.Peers ?? {};
+        const peerList = Object.entries(peers).filter(([k, p]) => !!k).map(([k, p]) => `  ${k} → ${(p.TailscaleIPs ?? []).join(", ") || "(no IP)"} ${p.Online ? "" : "(offline)"}`).join(`
+`);
+        const connected = j.BackendState === "Running" || j.CanCarryPossibly === true;
+        if (!peerList)
+          return [
+            `tailscale: ${connected ? "connected" : "NOT connected"}`,
+            `  hostname: ${hostname}`,
+            `  self IP: ${selfIps.join(", ") || "(no tailnet IP)"}`,
+            "  peers: (none visible)"
+          ].join(`
+`);
+        return [
+          `tailscale: ${connected ? "connected" : "NOT connected"}`,
+          `  hostname: ${hostname}`,
+          `  self IP: ${selfIps.join(", ") || "(no tailnet IP)"}`,
+          `  peers: ${Object.keys(peers).length} total, ${Object.values(peers).filter((p) => p.Online).length} online`,
+          peerList
+        ].join(`
+`);
+      } catch {
+        return null;
+      }
+    }
+    const jsonOut = await tryJson();
+    if (jsonOut)
+      return jsonOut;
+    const plain = Bun.spawn({
+      cmd: ["tailscale", "status"],
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, NO_COLOR: "1" },
+      detached: true,
+      signal: ctx.signal
+    });
+    const [pOut, pErr, pExit] = await Promise.all([
+      new Response(plain.stdout).text(),
+      new Response(plain.stderr).text(),
+      plain.exited
+    ]);
+    let text = "";
+    if (pOut)
+      text += pOut;
+    if (pErr)
+      text += (text ? `
+` : "") + pErr;
+    if (pExit !== 0)
+      text += (text ? `
+` : "") + `[exit code: ${pExit}]`;
+    if (text)
+      return text;
+    return lastErr || "(no output)";
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "network_ping",
+      description: "Ping a host with a cap (3 packets, 5s timeout) to check basic connectivity. Returns the ping output, or a note if ping isn't available.",
+      parameters: {
+        type: "object",
+        properties: {
+          host: { type: "string", description: "Hostname or IP to ping (required)" }
+        },
+        required: ["host"]
+      }
+    }
+  },
+  async run(args, ctx) {
+    const host = String(args.host ?? "").trim();
+    if (!host)
+      return "ERROR: host is required";
+    try {
+      const proc = Bun.spawn({
+        cmd: ["ping", "-c", "3", "-W", "5", host],
+        stdout: "pipe",
+        stderr: "pipe",
+        env: { ...process.env, NO_COLOR: "1" },
+        detached: true,
+        signal: ctx.signal
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited
+      ]);
+      let out = "";
+      if (stdout)
+        out += stdout;
+      if (stderr)
+        out += (out ? `
+` : "") + stderr;
+      if (exitCode !== 0)
+        out += (out ? `
+` : "") + `[exit code: ${exitCode}]`;
+      return out || `(ping ${host})`;
+    } catch (err) {
+      return `NOTE: ping not available: ${err?.message ?? String(err)}`;
+    }
+  }
+});
+
+// src/tools/env.ts
+import { join as pathJoin, dirname as dirname5 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+import { readFile, writeFile } from "node:fs/promises";
+import { existsSync as existsSync7 } from "node:fs";
+var _repoRoot = (() => {
+  try {
+    const file = fileURLToPath2(import.meta.url);
+    let dir = dirname5(file);
+    for (let i = 0;i < 10; i++) {
+      if (existsSync7(pathJoin(dir, "package.json")) || existsSync7(pathJoin(dir, ".git"))) {
+        return dir;
+      }
+      dir = dirname5(dir);
+    }
+    return pathJoin(process.cwd(), "..", "..");
+  } catch {
+    return pathJoin(process.cwd(), "..", "..");
+  }
+})();
+var ENV_FILE = (() => {
+  const override = process.env.VIBECODER_ENV_FILE;
+  if (override)
+    return override;
+  return pathJoin(_repoRoot, ".env");
+})();
+async function readEnv() {
+  try {
+    const text = await readFile(ENV_FILE, "utf8");
+    const out = {};
+    for (const line of text.split(`
+`)) {
+      const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+      if (m)
+        out[m[1]] = m[2];
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+async function writeEnv(dict) {
+  const lines = Object.entries(dict).filter(([, v]) => true).map(([k, v]) => `${k}=${v}`).join(`
+`);
+  await writeFile(ENV_FILE, lines + `
+`);
+}
+function mask(v) {
+  if (!v)
+    return "(not set)";
+  if (v.length <= 4)
+    return "****";
+  return v.slice(0, 2) + "****" + (v.length > 6 ? v.slice(-2) : "");
+}
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "env_get",
+      description: "Read an environment variable from the project's gitignored .env file. Values are masked in the output for safety. Returns the key, whether it is set, and a masked value.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Environment variable name to read (required)" }
+        },
+        required: ["key"]
+      }
+    }
+  },
+  async run(args, ctx) {
+    const key = String(args.key ?? "").trim();
+    if (!key)
+      return "ERROR: key is required";
+    const env = await readEnv();
+    const val = env[key] ?? "";
+    const present = val.length > 0;
+    return `${key}: ${present ? "set" : "not set"}
+  value: ${mask(val)}`;
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "env_set",
+      description: "Set or update an environment variable in the project's gitignored .env file. The value is stored (not shown back for safety). Use env_get to confirm.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Environment variable name (required)" },
+          value: { type: "string", description: "Value to store (required; kept private — not echoed back)" }
+        },
+        required: ["key", "value"]
+      }
+    }
+  },
+  async run(args, ctx) {
+    const key = String(args.key ?? "").trim();
+    const value = String(args.value ?? "");
+    if (!key)
+      return "ERROR: key is required";
+    const env = await readEnv();
+    env[key] = value;
+    await writeEnv(env);
+    return `Set ${key} in .env (value stored, not echoed for safety). Run env_get("${key}") to confirm.`;
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "env_list",
+      description: "List environment variables from the project's .env file. Shows which keys are set (values masked). Useful for checking whether API keys are configured before running tasks.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  async run(_args, ctx) {
+    const env = await readEnv();
+    const keys = Object.keys(env).sort();
+    if (!keys.length)
+      return "(no .env file or no variables set)";
+    return keys.map((k) => `  ${k}: ${mask(env[k])}`).join(`
+`);
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "env_check",
+      description: "Check whether a list of required environment variables are set in .env. Returns a report: which are set (masked), which are missing, and a pass/fail verdict. Use before a task that depends on specific keys.",
+      parameters: {
+        type: "object",
+        properties: {
+          keys: { type: "array", items: { type: "string" }, description: "List of env var names to check (required)" }
+        },
+        required: ["keys"]
+      }
+    }
+  },
+  async run(args, ctx) {
+    const keys = args.keys?.filter((k) => typeof k === "string" && k.trim()) ?? [];
+    if (!keys.length)
+      return "ERROR: keys list is required and must be non-empty";
+    const env = await readEnv();
+    const missing = [];
+    const present = [];
+    for (const k of keys) {
+      const v = env[k.trim()] ?? "";
+      if (v)
+        present.push(k.trim());
+      else
+        missing.push(k.trim());
+    }
+    const lines = [];
+    lines.push(`env_check: ${present.length}/${keys.length} set`);
+    if (present.length) {
+      lines.push("set:");
+      for (const k of present)
+        lines.push(`  ${k}: ${mask(env[k])}`);
+    }
+    if (missing.length) {
+      lines.push("missing:");
+      for (const k of missing)
+        lines.push(`  ${k}: (not set)`);
+    }
+    if (missing.length)
+      lines.push(`
+VERDICT: FAIL — the following are missing and must be set before proceeding: ` + missing.join(", "));
+    else
+      lines.push(`
+VERDICT: PASS — all required keys are set`);
+    return lines.join(`
+`);
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "env_require",
+      description: "Require that a single environment variable is set in .env. Fails loudly with an actionable message if it is missing. Use at the start of a task that cannot proceed without a specific key (e.g. an API key).",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Environment variable name that must be set (required)" }
+        },
+        required: ["key"]
+      }
+    }
+  },
+  async run(args, ctx) {
+    const key = String(args.key ?? "").trim();
+    if (!key)
+      return "ERROR: key is required";
+    const env = await readEnv();
+    const v = env[key] ?? "";
+    if (!v)
+      return `FAIL: ${key} is not set in .env. Set it with env_set("${key}", "<value>") then re-run.`;
+    return `OK: ${key} is set (masked: ${mask(v)})`;
+  }
+});
+
+// src/tools/git.ts
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_status",
+      description: "Show the working tree status (git status --short --branch). Returns the current branch, ahead/behind tracking info, and staged/unstaged/untracked file listings. Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  async run(_args, ctx) {
+    return runGit(["status", "--short", "--branch", "--porcelain"], "git status --short --branch", ctx);
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_log",
+      description: "Show recent commit history (git log --oneline --decorate -20). Returns the last 20 commits with abbrev hashes, subjects, and decorations. Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          n: { type: "number", description: "Number of commits to show (optional, default 20, max 100)" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const n = Math.min(100, Math.max(1, Number(args.n ?? 20) || 20));
+    return runGit(["log", "--oneline", "--decorate", "-n", String(n)], `git log --oneline --decorate -n ${n}`, ctx);
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_diff",
+      description: "Show unstaged changes (git diff) and staged changes (git diff --cached) concisely. Returns both diffs (or a note if there are none). Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          maxLines: { type: "number", description: "Max lines to return per diff (optional, default 80)" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const maxLines = Math.max(10, Number(args.maxLines ?? 80) || 80);
+    const [unstaged, staged] = await Promise.all([
+      runGit(["diff"], "git diff", ctx),
+      runGit(["diff", "--cached"], "git diff --cached", ctx)
+    ]);
+    const head = unstaged || staged ? "" : "nothing to show (no unstaged or staged changes)";
+    const lines = [];
+    if (unstaged) {
+      lines.push("--- unstaged changes ---");
+      lines.push(truncate(unstaged, maxLines));
+    }
+    if (staged) {
+      lines.push("--- staged changes ---");
+      lines.push(truncate(staged, maxLines));
+    }
+    if (!unstaged && !staged)
+      lines.push(head);
+    return lines.join(`
+`);
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_branch",
+      description: "List local and remote branches (git branch -vv, git branch -r). Returns local branches with upstream tracking, then remote branches. Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  async run(_args, ctx) {
+    const [local, remote] = await Promise.all([
+      runGit(["branch", "-vv"], "git branch -vv", ctx),
+      runGit(["branch", "-r"], "git branch -r", ctx)
+    ]);
+    const lines = [];
+    if (local)
+      lines.push("--- local branches ---");
+    lines.push(local);
+    if (remote)
+      lines.push("--- remote branches ---");
+    lines.push(remote);
+    return lines.join(`
+`) || "(no branches found)";
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_remote",
+      description: "Show configured remotes (git remote -v). Returns fetch/push URLs for each remote. Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  async run(_args, ctx) {
+    return runGit(["remote", "-v"], "git remote -v", ctx) || "(no remotes configured)";
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_tag",
+      description: "List tags (git tag -l, newest first). Returns all tags sorted by version. Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Optional glob pattern to filter tags (e.g. 'v1.*')" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const pattern = String(args.pattern ?? "").trim();
+    const cmd = pattern ? ["tag", "-l", pattern] : ["tag", "-l"];
+    const out = await runGit(cmd, `git tag -l${pattern ? " " + pattern : ""}`, ctx);
+    if (!out)
+      return "(no tags found)";
+    return out.split(`
+`).sort().reverse().join(`
+`);
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_show",
+      description: "Show a commit (git show --stat). Returns the commit metadata and stat. Pass a commit-ish (hash, tag, branch, HEAD~N). Defaults to HEAD. Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Commit-ish to show (optional, default HEAD)" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const ref = String(args.ref ?? "HEAD").trim() || "HEAD";
+    return runGit(["show", "--stat", "--oneline", ref], `git show --stat ${ref}`, ctx);
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_push_ff",
+      description: "Push the current branch to its upstream, fast-forward only (git push --ff-only). Safe non-destructive push. Returns the push output or a note if there is no upstream. Read-only in effect (no force, no rebase).",
+      parameters: {
+        type: "object",
+        properties: {
+          remote: { type: "string", description: "Remote name (optional, default origin)" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const remote = String(args.remote ?? "origin").trim() || "origin";
+    const branchOut = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], "git rev-parse --abbrev-ref HEAD", ctx);
+    const branch = branchOut.trim();
+    if (!branch || branch === "HEAD")
+      return "NOTE: not on a named branch (detached HEAD) — nothing to push";
+    const push = await runGit(["push", "--force-with-lease", remote, branch], `git push --force-with-lease ${remote} ${branch}`, ctx);
+    if (push.includes("Everything up-to-date"))
+      return `up to date on ${remote}/${branch}`;
+    return push;
+  }
+});
+async function runGit(args, label, ctx) {
+  const res = await spawnCollect({
+    cmd: ["git", ...args],
+    cwd: ctx.cwd,
+    env: { ...process.env, NO_COLOR: "1", GIT_PAGER: "cat" },
+    signal: ctx.signal
+  });
+  let out = "";
+  if (res.stdout)
+    out += res.stdout;
+  if (res.stderr)
+    out += res.stderr ? (out ? `
+` : "") + res.stderr : "";
+  if (res.exitCode !== 0)
+    out += (out ? `
+` : "") + `[exit code: ${res.exitCode}]`;
+  if (!out)
+    out = "(no output)";
+  return out;
+}
+function truncate(s, maxLines) {
+  const lines = s.split(`
+`);
+  if (lines.length <= maxLines)
+    return s;
+  return lines.slice(0, maxLines).join(`
+`) + `
+...[${lines.length - maxLines} more lines truncated]`;
+}
+
+// src/tools/connectivity.ts
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "network_check",
+      description: "Run a capped local network diagnostic: ping a host, resolve its DNS, probe an HTTP(S) URL, discover the LAN gateway, and return a one-line summary. Use before reaching out to another host so the agent knows the network path is alive. Each sub-check is inert when the needed binary is missing.",
+      parameters: {
+        type: "object",
+        properties: {
+          host: { type: "string", description: "Hostname or IP to ping + DNS-resolve + HTTP-probe (optional)" },
+          url: { type: "string", description: "HTTP(S) URL to probe (optional, overrides host if both given)" },
+          summaryOnly: { type: "boolean", description: "When true, return only the one-line summary (default false)" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const host = String(args.host ?? "").trim();
+    const url = String(args.url ?? "").trim();
+    const summaryOnly = Boolean(args.summaryOnly);
+    const target = url || host;
+    if (!target)
+      return "ERROR: host or url is required";
+    const results = [];
+    const checks = [];
+    if (host) {
+      const ping = await pingHost(ctx, host);
+      results.push(ping);
+      checks.push("ping");
+    }
+    if (host && host !== target) {}
+    const dns = await resolveDNS(ctx, host || target);
+    results.push(dns);
+    checks.push("dns");
+    if (url) {
+      const http = await probeHTTP(ctx, url);
+      results.push(http);
+      checks.push("http");
+    } else if (/^https?:\/\//i.test(host || "")) {
+      const http = await probeHTTP(ctx, host);
+      results.push(http);
+      checks.push("http");
+    }
+    const gateway = await lanGateway(ctx);
+    results.push(gateway);
+    checks.push("gateway");
+    const summary = buildSummary(checks, results);
+    if (summaryOnly)
+      return summary;
+    return [summary, "", ...results].join(`
+`);
+  }
+});
+async function pingHost(ctx, host) {
+  try {
+    const res = await spawnCollect({
+      cmd: ["ping", "-c", "3", "-W", "5", host],
+      env: { ...process.env, NO_COLOR: "1" },
+      signal: ctx.signal
+    });
+    let out = "";
+    if (res.stdout)
+      out += res.stdout;
+    if (res.stderr)
+      out += res.stderr ? (out ? `
+` : "") + res.stderr : "";
+    if (res.exitCode !== 0 && !out)
+      out += (out ? `
+` : "") + `[exit code: ${res.exitCode}]`;
+    const avg = out.match(/rtt[mina-z0-9 ]+=\s*([\d.]+)\/mu\/?l/gi)?.[0]?.slice(/\d/.test(out[0]) ? 0 : 0) ?? "";
+    return `ping ${host}: ${res.exitCode === 0 ? "reachable" : "unreachable"}${avg ? " (avg " + avg.split("=")[1].trim() + " ms)" : ""}`;
+  } catch (err) {
+    const msg = err && typeof err === "object" && "message" in err ? err.message : String(err);
+    return `ping ${host}: unavailable (${msg})`;
+  }
+}
+async function resolveDNS(ctx, host) {
+  if (await binaryExists(ctx, "dig")) {
+    try {
+      const res = await spawnCollect({
+        cmd: ["dig", "+short", host],
+        env: { ...process.env, NO_COLOR: "1" },
+        signal: ctx.signal
+      });
+      const ips = res.stdout.trim().split(`
+`).filter(Boolean);
+      if (ips.length)
+        return `dns ${host}: ${ips.join(", ")}`;
+      return `dns ${host}: no records (dig returned empty)`;
+    } catch {}
+  }
+  if (await binaryExists(ctx, "getent")) {
+    try {
+      const res = await spawnCollect({
+        cmd: ["getent", "hosts", host],
+        env: { ...process.env, NO_COLOR: "1" },
+        signal: ctx.signal
+      });
+      const lines = res.stdout.trim().split(`
+`).filter(Boolean);
+      if (lines.length) {
+        const ips = lines.map((l) => l.split(/\s+/)[0]).filter(Boolean);
+        return `dns ${host}: ${ips.join(", ")}`;
+      }
+      return `dns ${host}: no records (getent returned empty)`;
+    } catch {}
+  }
+  try {
+    const { lookup } = await import("node:dns");
+    const result = await new Promise((resolve, reject) => {
+      lookup(host, { all: true }, (err, addresses) => {
+        if (err)
+          reject(err);
+        else
+          resolve(addresses?.map((a) => a.address) ?? []);
+      });
+    });
+    if (result.length)
+      return `dns ${host}: ${result.join(", ")}`;
+    return `dns ${host}: no records (node lookup returned empty)`;
+  } catch (err) {
+    const msg = err && typeof err === "object" && "message" in err ? err.message : String(err);
+    return `dns ${host}: unavailable (${msg})`;
+  }
+}
+async function probeHTTP(ctx, url) {
+  try {
+    const ac = new AbortController;
+    const timer = setTimeout(() => ac.abort(), 8000);
+    const res = await fetch(url, { method: "HEAD", signal: ac.signal });
+    clearTimeout(timer);
+    const status = res.status;
+    const reachable = status >= 200 && status < 500;
+    return `http ${new URL(url).hostname}: ${status} ${reachable ? "reachable" : "error"}`;
+  } catch (err) {
+    const msg = err && typeof err === "object" && "message" in err ? String(err.message) : String(err);
+    const msgStr = msg;
+    if (msgStr.includes("abort") || msgStr.includes("timed out")) {
+      return `http ${new URL(url).hostname}: timed out / unreachable`;
+    }
+    return `http ${new URL(url).hostname}: unreachable (${msg})`;
+  }
+}
+async function lanGateway(ctx) {
+  if (await binaryExists(ctx, "ip")) {
+    try {
+      const res = await spawnCollect({
+        cmd: ["ip", "route"],
+        env: { ...process.env, NO_COLOR: "1" },
+        signal: ctx.signal
+      });
+      const lines = res.stdout.split(`
+`).filter((l) => l.startsWith("default via"));
+      if (lines.length) {
+        const gw = lines[0].split(/\s+/)[2];
+        return `lan gateway: ${gw}`;
+      }
+      return "lan gateway: (no default route found)";
+    } catch {}
+  }
+  if (await binaryExists(ctx, "netstat")) {
+    try {
+      const res = await spawnCollect({
+        cmd: ["netstat", "-rn"],
+        env: { ...process.env, NO_COLOR: "1" },
+        signal: ctx.signal
+      });
+      const lines = res.stdout.split(`
+`).filter((l) => l.startsWith("default"));
+      if (lines.length) {
+        const gw = lines[0].split(/\s+/)[1];
+        return `lan gateway: ${gw}`;
+      }
+      return "lan gateway: (no default route found)";
+    } catch {}
+  }
+  try {
+    const { networkInterfaces } = await import("node:os");
+    const ifs = networkInterfaces();
+    for (const name of Object.keys(ifs)) {
+      if (name === "Loopback" || name.startsWith("Loopback"))
+        continue;
+      for (const iface of ifs[name] ?? []) {
+        if (iface.family === "IPv4" && !iface.internal && iface.address) {
+          return `lan gateway: (could not determine — primary IPv4 on ${name}: ${iface.address})`;
+        }
+      }
+    }
+    return "lan gateway: (no non-loopback IPv4 interface found)";
+  } catch {
+    return "lan gateway: unavailable";
+  }
+}
+async function binaryExists(ctx, name) {
+  try {
+    const res = await spawnCollect({
+      cmd: ["which", name],
+      env: { ...process.env, NO_COLOR: "1" },
+      signal: ctx.signal
+    });
+    return res.exitCode === 0 && res.stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+function buildSummary(checks, results) {
+  const lines = [];
+  const pingOk = results[0]?.includes("reachable") ?? false;
+  const dnsOk = (results[1]?.includes(": ") && !results[1]?.includes("unavailable") && !results[1]?.includes("no records")) ?? false;
+  const httpOk = results[2]?.includes("reachable") ?? false;
+  const gwOk = (results[3]?.includes(": ") && !results[3]?.includes("unavailable")) ?? false;
+  lines.push(`network: ${checks.length} checks · ${[
+    pingOk ? "ping ok" : "ping fail",
+    dnsOk ? "dns ok" : "dns fail",
+    checks.includes("http") ? httpOk ? "http ok" : "http fail" : "http n/a",
+    gwOk ? "gateway ok" : "gateway fail"
+  ].filter(Boolean).join(", ")}`);
+  return lines.join(`
+`);
+}
+
 // src/session.ts
-import { existsSync as existsSync7, mkdirSync as mkdirSync5, readdirSync as readdirSync3, readFileSync as readFileSync5, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "node:fs";
+import { existsSync as existsSync8, mkdirSync as mkdirSync5, readdirSync as readdirSync3, readFileSync as readFileSync5, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 import { join as join7 } from "node:path";
 var _root2 = null;
@@ -2675,7 +3482,7 @@ function loadSession(id) {
   if (!id)
     return null;
   const f = sessionFile(id);
-  if (!existsSync7(f))
+  if (!existsSync8(f))
     return null;
   try {
     return JSON.parse(readFileSync5(f, "utf8"));
@@ -2685,7 +3492,7 @@ function loadSession(id) {
 }
 function deleteSession(id) {
   const f = sessionFile(id);
-  if (!existsSync7(f))
+  if (!existsSync8(f))
     return false;
   try {
     rmSync2(f, { force: true });
@@ -2697,7 +3504,7 @@ function deleteSession(id) {
 function listSessions() {
   const out = [];
   const dir = join7(root2(), "sessions");
-  if (!existsSync7(dir))
+  if (!existsSync8(dir))
     return out;
   for (const name of readdirSync3(dir)) {
     if (!name.endsWith(".json"))
@@ -2727,7 +3534,7 @@ function saveLast(s) {
   writeFileSync4(lastFile(), JSON.stringify(s, null, 2));
 }
 function loadLast() {
-  if (!existsSync7(lastFile()))
+  if (!existsSync8(lastFile()))
     return null;
   try {
     return JSON.parse(readFileSync5(lastFile(), "utf8"));
@@ -3048,13 +3855,13 @@ class KeyParser {
   hold = [];
   feed(bytes) {
     const all = [...this.hold, ...bytes];
-    const out2 = [];
+    const out = [];
     let i = 0;
     this.hold = [];
     while (i < all.length) {
       const b = all[i];
       if (b !== 27) {
-        out2.push(singleKey(b));
+        out.push(singleKey(b));
         i++;
         continue;
       }
@@ -3077,7 +3884,7 @@ class KeyParser {
           i = all.length;
           break;
         }
-        out2.push(csiKey(rest.slice(1, fin + 1)));
+        out.push(csiKey(rest.slice(1, fin + 1)));
         i += 1 + fin + 1;
       } else if (rest[0] === 79) {
         if (rest.length < 2 || !FINAL_BYTE(rest[1])) {
@@ -3095,14 +3902,14 @@ class KeyParser {
           72: { kind: "home" },
           70: { kind: "end" }
         };
-        out2.push(map[c] ?? { kind: "unknown", raw: `SS3${String.fromCharCode(c)}` });
+        out.push(map[c] ?? { kind: "unknown", raw: `SS3${String.fromCharCode(c)}` });
         i += 3;
       } else {
-        out2.push({ kind: "esc" });
+        out.push({ kind: "esc" });
         i += 1;
       }
     }
-    return out2;
+    return out;
   }
   finalize() {
     if (this.hold.length === 1 && this.hold[0] === 27) {
@@ -3493,22 +4300,22 @@ class TUI {
   askConfirm(question) {
     if (this.approveMode === "off")
       return Promise.resolve("yes");
-    return new Promise((resolve4) => {
+    return new Promise((resolve) => {
       this.promptOverride = `${question}  ${ansi.bold}[y/n/a]${ansi.reset}`;
       this.render();
       this.keyHandler = (ev) => {
         if (ev.kind === "char" && (ev.char === "y" || ev.char === "Y")) {
           this.promptOverride = null;
-          resolve4("yes");
+          resolve("yes");
         } else if (ev.kind === "char" && (ev.char === "n" || ev.char === "N")) {
           this.promptOverride = null;
-          resolve4("no");
+          resolve("no");
         } else if (ev.kind === "char" && (ev.char === "a" || ev.char === "A")) {
           this.promptOverride = null;
-          resolve4("all");
+          resolve("all");
         } else if (ev.kind === "ctrl-c") {
           this.promptOverride = null;
-          resolve4("no");
+          resolve("no");
         } else {
           this.render();
         }
@@ -3886,9 +4693,9 @@ registerTool({
 import { createInterface as createInterface2 } from "node:readline";
 
 // src/env.ts
-import { existsSync as existsSync8, readFileSync as readFileSync6 } from "node:fs";
+import { existsSync as existsSync9, readFileSync as readFileSync6 } from "node:fs";
 import { homedir as homedir5 } from "node:os";
-import { dirname as dirname5, join as join8 } from "node:path";
+import { dirname as dirname6, join as join8 } from "node:path";
 var loaded = new Set;
 function envLine(line) {
   const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
@@ -3906,14 +4713,14 @@ function loadDotEnv() {
     return;
   const candidates = [
     join8(packageRoot(), ".env"),
-    join8(dirname5(packageRoot()), ".env"),
+    join8(dirname6(packageRoot()), ".env"),
     join8(homedir5(), ".vibecoder", ".env")
   ];
   for (const file of candidates) {
     if (loaded.has(file))
       continue;
     loaded.add(file);
-    if (!existsSync8(file))
+    if (!existsSync9(file))
       continue;
     const text = readFileSync6(file, "utf8");
     for (const raw of text.split(`
@@ -3931,7 +4738,7 @@ function loadDotEnv() {
 }
 
 // src/doctor.ts
-import { existsSync as existsSync9 } from "node:fs";
+import { existsSync as existsSync10 } from "node:fs";
 function maskKey(v) {
   if (!v)
     return "not set";
@@ -3948,12 +4755,12 @@ async function probeReachable(url, timeoutMs = 3000) {
   }
 }
 async function runDoctor() {
-  const out2 = [];
-  const say = (s = "") => out2.push(s);
+  const out = [];
+  const say = (s = "") => out.push(s);
   const pkg = readPackageJson();
   const version = pkg?.version ?? "dev";
   const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`;
-  const isTermux = existsSync9("/data/data/com.termux") || process.env.ANDROID_DATA !== undefined || process.env.EXTERNAL_STORAGE !== undefined;
+  const isTermux = existsSync10("/data/data/com.termux") || process.env.ANDROID_DATA !== undefined || process.env.EXTERNAL_STORAGE !== undefined;
   say("vibecoder doctor");
   say(`  version:   ${version}`);
   say(`  runtime:   ${runtime} (${process.platform}/${process.arch})${isTermux ? " · Android (Termux)" : ""}`);
@@ -3963,16 +4770,16 @@ async function runDoctor() {
   try {
     ({ config: cfg, paths } = await loadConfigInfo());
   } catch (err) {
-    out2.push("");
-    out2.push(`  config:    ERROR — ${err?.message ?? String(err)}`);
-    out2.push("             run: vibecoder setup");
-    out2.push("");
-    process.stdout.write(out2.join(`
+    out.push("");
+    out.push(`  config:    ERROR — ${err?.message ?? String(err)}`);
+    out.push("             run: vibecoder setup");
+    out.push("");
+    process.stdout.write(out.join(`
 `) + `
 `);
     return 1;
   }
-  out2.push("");
+  out.push("");
   say("config");
   say(`  built-in defaults: ${paths.builtin ?? "not found"}`);
   say(`  your overrides:    ${paths.userFile ?? "(none — creating one is optional; see 'vibecoder setup')"}`);
@@ -3982,7 +4789,7 @@ async function runDoctor() {
   if (cfg.routing) {
     say(`  router:            chat ${cfg.routing.chatProvider}/${cfg.routing.chatModel}  ·  heavy ${cfg.routing.heavyProvider}/${cfg.routing.heavyModel}${cfg.routing.offlineProvider ? `  ·  offline ${cfg.routing.offlineProvider}/${cfg.routing.offlineModel ?? cfg.routing.chatModel}` : ""}`);
   }
-  out2.push("");
+  out.push("");
   say("providers");
   for (const name of Object.keys(cfg.providers ?? {})) {
     const p = cfg.providers[name];
@@ -3992,7 +4799,7 @@ async function runDoctor() {
     say(`    api key:   ${p.apiKeyEnv ? `${p.apiKeyEnv} → ${maskKey(key)}` : "(none — local)"}`);
     say(`    models:    ${(p.models ?? []).join(", ")}`);
   }
-  out2.push("");
+  out.push("");
   say("ollama (local, no cost)");
   const bin = ollamaBinary();
   const up = ollamaIsUp(ollamaBaseUrl());
@@ -4012,26 +4819,26 @@ async function runDoctor() {
       return "https://api.groq.com/openai/v1/models";
     }
   })();
-  out2.push("");
+  out.push("");
   say("connectivity");
   say(`  probe:   ${probeUrl} → ${await probeReachable(probeUrl)}`);
   say(`  note:    offline is fine — chat falls back to your local ollama, and heavy tasks queue until online`);
-  out2.push("");
+  out.push("");
   say("data");
   say(`  sessions:  ~/.vibecoder/sessions/  (saved conversations)`);
   say(`  queue:     ~/.vibecoder/queue.json (offline task queue)`);
   say(`  ledger:    ${ledgerPath()}`);
   say(`  user env:  ~/.vibecoder/.env      (optional API keys, e.g. GROQ_API_KEY=...)`);
-  const userCfgExists = existsSync9(userConfigFile());
+  const userCfgExists = existsSync10(userConfigFile());
   const keysPresent = Object.keys(cfg.providers ?? {}).map((n) => cfg.providers[n].apiKeyEnv).filter(Boolean).some((k) => process.env[k]);
-  out2.push("");
+  out.push("");
   say("next steps");
   if (!userCfgExists)
     say("  - customize:   vibecoder setup   (generates ~/.vibecoder/config.json)");
   if (!keysPresent)
     say("  - free online:  get a free GROQ_API_KEY (console.groq.com) and add it to ~/.vibecoder/.env");
   say('  - run it:      vibecoder        (or: vibecoder --prompt "your task")');
-  process.stdout.write(out2.join(`
+  process.stdout.write(out.join(`
 `) + `
 `);
   return 0;
@@ -4040,7 +4847,7 @@ async function runDoctor() {
 // src/setup.ts
 import { createInterface } from "node:readline/promises";
 import { stdin as stdinInput, stdout as stdoutOutput } from "node:process";
-import { appendFileSync as appendFileSync2, existsSync as existsSync10, mkdirSync as mkdirSync6 } from "node:fs";
+import { appendFileSync as appendFileSync2, existsSync as existsSync11, mkdirSync as mkdirSync6 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
 import { join as join9 } from "node:path";
 var LOCAL_MODEL = "qwen2.5:1.5b";
@@ -4071,7 +4878,7 @@ async function runSetup(argv) {
   line();
   const builtinPath = resolvePackageFile("config.json");
   const builtin = builtinPath ? loadJsonFile(builtinPath) : null;
-  if (existsSync10(userConfigFile())) {
+  if (existsSync11(userConfigFile())) {
     line(`An existing customization file exists: ${userConfigFile()}`);
     if (!await confirm("Overwrite it? (n keeps your current config)", false, interactive)) {
       line("OK — leaving your config untouched. Run `vibecoder doctor` to inspect it.");
@@ -4931,13 +5738,13 @@ async function main() {
     }
   }
   const promptIdx = process.argv.indexOf("--prompt");
-  let prompt2 = promptIdx !== -1 ? process.argv[promptIdx + 1] : undefined;
-  if (prompt2 === undefined && process.argv.length === 3 && process.argv[2] && !process.argv[2].startsWith("-")) {
-    prompt2 = process.argv[2];
+  let prompt = promptIdx !== -1 ? process.argv[promptIdx + 1] : undefined;
+  if (prompt === undefined && process.argv.length === 3 && process.argv[2] && !process.argv[2].startsWith("-")) {
+    prompt = process.argv[2];
   }
-  if (prompt2) {
+  if (prompt) {
     mainLine();
-    await runPrompt(prompt2);
+    await runPrompt(prompt);
     return;
   }
   if (hasControllingTty()) {

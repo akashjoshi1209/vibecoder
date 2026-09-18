@@ -1013,8 +1013,8 @@ function trimMessages(messages, opts) {
   }
   if (budget < 1) {
     const lastIdx = blocks[blocks.length - 1];
-    const kept2 = lastIdx.map((j) => cloneMessage(nonSystem[j]));
-    return { messages: [...system.map(cloneMessage), ...kept2], trimmed: messages.length - (system.length + kept2.length), truncatedChars: 0 };
+    const kept = lastIdx.map((j) => cloneMessage(nonSystem[j]));
+    return { messages: [...system.map(cloneMessage), ...kept], trimmed: messages.length - (system.length + kept.length), truncatedChars: 0 };
   }
   let used = system.reduce((s, m) => s + estimateMessageTokens(m), 0);
   const firstUserBlock = blocks.findIndex((b) => nonSystem[b[0]].role === "user");
@@ -1609,8 +1609,8 @@ function repoRoot() {
 function installMode() {
   if (process.env.VIBECODER_REPO_ROOT)
     return "repo";
-  const root2 = dirname4(packageRoot());
-  if (existsSync5(join5(root2, ".git")) || existsSync5(join5(packageRoot(), ".git")))
+  const root = dirname4(packageRoot());
+  if (existsSync5(join5(root, ".git")) || existsSync5(join5(packageRoot(), ".git")))
     return "repo";
   return "user";
 }
@@ -1642,8 +1642,8 @@ function isSameFile(a, b) {
 }
 function reposWhere() {
   if (process.env.VIBECODER_REPO_ROOT) {
-    const root2 = resolve3(process.env.VIBECODER_REPO_ROOT);
-    return { root: root2, config: join5(root2, "config.json"), env: join5(root2, ".env") };
+    const root = resolve3(process.env.VIBECODER_REPO_ROOT);
+    return { root, config: join5(root, "config.json"), env: join5(root, ".env") };
   }
   return null;
 }
@@ -1949,13 +1949,13 @@ async function globScan(pattern, opts) {
     const head = remaining[0];
     if (head === "**") {
       if (remaining.length === 1) {
-        let entries3;
+        let entries;
         try {
-          entries3 = await opendir(dir);
+          entries = await opendir(dir);
         } catch {
           return;
         }
-        for await (const e of entries3) {
+        for await (const e of entries) {
           if (truncated || scanned >= maxScanned)
             break;
           if (exclusions.has(e.name))
@@ -1971,13 +1971,13 @@ async function globScan(pattern, opts) {
         return;
       }
       await recurse(remaining.slice(1), dir, rel);
-      let entries2;
+      let entries;
       try {
-        entries2 = await opendir(dir);
+        entries = await opendir(dir);
       } catch {
         return;
       }
-      for await (const e of entries2) {
+      for await (const e of entries) {
         if (truncated || scanned >= maxScanned)
           break;
         if (e.isDirectory() && !exclusions.has(e.name)) {
@@ -2403,12 +2403,12 @@ async function main() {
   const timeoutMs = probeCfg.timeoutMs ?? 8000;
   onLog(`[queue] daemon started — probing ${probeUrl} every ${pollMs}ms`);
   let inFlight = false;
-  const tryDrain = async (poller2) => {
+  const tryDrain = async (poller) => {
     if (inFlight)
       return;
     inFlight = true;
     try {
-      if (poller2.online) {
+      if (poller.online) {
         const { ran, failed } = await drainQueue(runnerDeps);
         if (ran)
           onLog(`[queue] drained ${ran} task(s) (${failed} failed)`);
