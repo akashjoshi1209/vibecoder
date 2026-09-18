@@ -186,7 +186,7 @@ registerTool({
     const branchOut = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], "git rev-parse --abbrev-ref HEAD", ctx);
     const branch = branchOut.trim();
     if (!branch || branch === "HEAD") return "NOTE: not on a named branch (detached HEAD) — nothing to push";
-    const push = await runGit(["push", "--ff-only", remote, branch], `git push --ff-only ${remote} ${branch}`, ctx);
+    const push = await runGit(["push", "--force-with-lease", remote, branch], `git push --force-with-lease ${remote} ${branch}`, ctx);
     if (push.includes("Everything up-to-date")) return `up to date on ${remote}/${branch}`;
     return push;
   },
