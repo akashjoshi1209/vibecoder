@@ -12,7 +12,6 @@ import "../tools/files";
 import "../tools/search";
 import "../tools/net";
 import "../tools/termux";
-import "../tools/tailscale";
 import "../tools/network";
 import "../tools/env";
 import "../tools/git";

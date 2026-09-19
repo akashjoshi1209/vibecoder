@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
+
 // src/llm/types.ts
 class ContextTooLargeError extends Error {
   status;
@@ -992,8 +995,8 @@ function trimMessages(messages, opts) {
   }
   if (budget < 1) {
     const lastIdx = blocks[blocks.length - 1];
-    const kept = lastIdx.map((j) => cloneMessage(nonSystem[j]));
-    return { messages: [...system.map(cloneMessage), ...kept], trimmed: messages.length - (system.length + kept.length), truncatedChars: 0 };
+    const kept2 = lastIdx.map((j) => cloneMessage(nonSystem[j]));
+    return { messages: [...system.map(cloneMessage), ...kept2], trimmed: messages.length - (system.length + kept2.length), truncatedChars: 0 };
   }
   let used = system.reduce((s, m) => s + estimateMessageTokens(m), 0);
   const firstUserBlock = blocks.findIndex((b) => nonSystem[b[0]].role === "user");
@@ -1430,6 +1433,14 @@ function killProcessGroup(child, signal = "SIGKILL") {
     } catch {}
   }
 }
+function killProcessTree(child, signal = "SIGKILL") {
+  if (child.pid === undefined || child.pid <= 0)
+    return;
+  killProcessGroup(child, signal);
+  try {
+    child.kill(signal);
+  } catch {}
+}
 function spawnCollect(opts) {
   return new Promise((resolvePromise) => {
     const child = spawn(opts.cmd[0], opts.cmd.slice(1), {
@@ -1447,12 +1458,15 @@ function spawnCollect(opts) {
     let settled = false;
     let spawnError = "";
     let timer = null;
+    let forceTimer = null;
     const settle = (exitCode) => {
       if (settled)
         return;
       settled = true;
       if (timer)
         clearTimeout(timer);
+      if (forceTimer)
+        clearTimeout(forceTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       if (spawnError) {
         stderr = (stderr ? stderr + `
@@ -1460,16 +1474,35 @@ function spawnCollect(opts) {
       }
       resolvePromise({ stdout, stderr, exitCode, timedOut, aborted });
     };
+    const forceSettle = (exitCode) => {
+      if (settled)
+        return;
+      killProcessTree(child);
+      try {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      } catch {}
+      settle(exitCode);
+    };
+    const armForceSettle = () => {
+      if (forceTimer)
+        return;
+      forceTimer = setTimeout(() => forceSettle(-1), 150);
+    };
     if (opts.timeoutMs && opts.timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
         opts.onTimeout?.();
-        killProcessGroup(child);
+        killProcessTree(child);
+        armForceSettle();
       }, opts.timeoutMs);
     }
     const onAbort = () => {
+      if (settled)
+        return;
       aborted = true;
-      killProcessGroup(child);
+      killProcessTree(child);
+      armForceSettle();
     };
     if (opts.signal?.aborted)
       onAbort();
@@ -1486,23 +1519,21 @@ function spawnCollect(opts) {
 // src/tools/bash.ts
 var MAX_OUTPUT = 30000;
 var PLAN_MODE_BANNED = [
-  { re: /(^|[;&|]\s*)(rm|rmdir|mv|dd|mkfs(\.[a-z0-9]+)?|truncate|fdisk|parted|mkfs)\s/, why: "file/directory-destroying command" },
-  { re: /(^|[;&|]\s*)git\s+(reset\s+--hard|clean\s+-(f|d|fd)|checkout\s+\S+\s+--?[^;]*|push\b|remote\s+set-url|branch\s+-D|stash\s+drop|rebase\b|merge\b|cherry-pick\b)/, why: "git state mutation" },
-  { re: /(^|[;&|]\s*)(npm|pnpm|yarn|bun|deno)\s+(i|install|add|update|remove|uninstall|upgrade)\b/, why: "package manager install/remove" },
-  { re: /(^|[;&|]\s*)(pip|pip3)\s+(install|uninstall|download)\b/, why: "pip install/remove" },
-  { re: /(^|[;&|]\s*)(apt|apt-get|dnf|yum|zypper|brew)\s+(install|remove|uninstall|purge|update|upgrade)\b/, why: "system package manager" },
-  { re: /(^|[;&|]\s*)(cargo|go)\s+(install|add)\b/, why: "language package manager" },
+  { re: /(?:^|[;&|\n])\s*(rm|rmdir|mv|dd|mkfs(\.[a-z0-9]+)?|truncate|fdisk|parted)\s/, why: "file/directory-destroying command" },
+  { re: /(?:^|[;&|\n])\s*git\s+(reset\s+--hard|clean\s+-(f|d|fd)|checkout\s+\S+\s+--?[^;]*|push\b|remote\s+set-url|branch\s+-D|stash\s+drop|rebase\b|merge\b|cherry-pick\b)/, why: "git state mutation" },
+  { re: /(?:^|[;&|\n])\s*(npm|pnpm|yarn|bun|deno)\s+(i|install|add|update|remove|uninstall|upgrade)\b/, why: "package manager install/remove" },
+  { re: /(?:^|[;&|\n])\s*(pip|pip3)\s+(install|uninstall|download)\b/, why: "pip install/remove" },
+  { re: /(?:^|[;&|\n])\s*(apt|apt-get|dnf|yum|zypper|brew)\s+(install|remove|uninstall|purge|update|upgrade)\b/, why: "system package manager" },
+  { re: /(?:^|[;&|\n])\s*(cargo|go)\s+(install|add)\b/, why: "language package manager" },
   { re: /\b(kill|pkill|killall|systemctl|service|reboot|shutdown|halt|poweroff|init|swapoff|mkswap)\b/, why: "process/system control" },
-  { re: /(^|[;&|]\s*)sudo\b/, why: "sudo" },
+  { re: /(?:^|[;&|\n])\s*sudo\b/, why: "sudo" },
   { re: /\s(>|>>|2>)\s*/, why: "output redirection writes a file" },
   { re: /\btee\s+-?a?\s+/, why: "tee writes to a file" }
 ];
 function bannedReason(command) {
   const c = command.trim();
   for (const { re, why } of PLAN_MODE_BANNED) {
-    if (re.test(`
-` + c + `
-`))
+    if (re.test(c))
       return why;
   }
   return null;
@@ -1546,15 +1577,16 @@ registerTool({
     if (res.stderr)
       output += res.stderr ? (output ? `
 ` : "") + res.stderr : "";
-    if (res.exitCode !== 0)
-      output += (output ? `
-` : "") + `[exit code: ${res.exitCode}]`;
     if (res.timedOut)
       output += (output ? `
 ` : "") + `[killed: timed out after ${timeout}ms]`;
     if (res.aborted)
       output += (output ? `
 ` : "") + "[killed: interrupted]";
+    if (!res.timedOut && !res.aborted && res.exitCode !== 0) {
+      output += (output ? `
+` : "") + `[exit code: ${res.exitCode}]`;
+    }
     if (!output)
       output = "(no output)";
     if (output.length > MAX_OUTPUT) {
@@ -1596,8 +1628,8 @@ function repoRoot() {
 function installMode() {
   if (process.env.VIBECODER_REPO_ROOT)
     return "repo";
-  const root = dirname3(packageRoot());
-  if (existsSync4(join4(root, ".git")) || existsSync4(join4(packageRoot(), ".git")))
+  const root2 = dirname3(packageRoot());
+  if (existsSync4(join4(root2, ".git")) || existsSync4(join4(packageRoot(), ".git")))
     return "repo";
   return "user";
 }
@@ -1629,8 +1661,8 @@ function isSameFile(a, b) {
 }
 function reposWhere() {
   if (process.env.VIBECODER_REPO_ROOT) {
-    const root = resolve3(process.env.VIBECODER_REPO_ROOT);
-    return { root, config: join4(root, "config.json"), env: join4(root, ".env") };
+    const root2 = resolve3(process.env.VIBECODER_REPO_ROOT);
+    return { root: root2, config: join4(root2, "config.json"), env: join4(root2, ".env") };
   }
   return null;
 }
@@ -1952,6 +1984,10 @@ registerTool({
   }
 });
 
+// src/tools/search.ts
+import { readdir, readFile, stat } from "node:fs/promises";
+import { join as join7 } from "node:path";
+
 // src/tools/glob.ts
 import { opendir } from "node:fs/promises";
 import { access } from "node:fs/promises";
@@ -2021,13 +2057,13 @@ async function globScan(pattern, opts) {
     const head = remaining[0];
     if (head === "**") {
       if (remaining.length === 1) {
-        let entries;
+        let entries3;
         try {
-          entries = await opendir(dir);
+          entries3 = await opendir(dir);
         } catch {
           return;
         }
-        for await (const e of entries) {
+        for await (const e of entries3) {
           if (truncated || scanned >= maxScanned)
             break;
           if (exclusions.has(e.name))
@@ -2043,13 +2079,13 @@ async function globScan(pattern, opts) {
         return;
       }
       await recurse(remaining.slice(1), dir, rel);
-      let entries;
+      let entries2;
       try {
-        entries = await opendir(dir);
+        entries2 = await opendir(dir);
       } catch {
         return;
       }
-      for await (const e of entries) {
+      for await (const e of entries2) {
         if (truncated || scanned >= maxScanned)
           break;
         if (e.isDirectory() && !exclusions.has(e.name)) {
@@ -2103,8 +2139,98 @@ async function globScan(pattern, opts) {
 
 // src/tools/search.ts
 var MAX_RESULTS = 50;
-var MAX_SCANNED = 2000;
+var MAX_SCANNED = 1e5;
+var MAX_FILE_BYTES = 4 * 1024 * 1024;
+var MAX_LINE_CHARS = 2000;
+var EXCLUDED_DIRS = new Set(["node_modules", ".git", ".hg", ".svn"]);
 var DEFAULT_TIMEOUT_MS = 60000;
+function globToRegExp(glob) {
+  let rx = "^";
+  for (let i = 0;i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        rx += ".*";
+        i++;
+      } else {
+        rx += "[^/]*";
+      }
+    } else if (c === "?") {
+      rx += "[^/]";
+    } else {
+      rx += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(rx + "$");
+}
+async function scanDir(root2, pattern, includeRx, limit, deadline) {
+  const hits = [];
+  let scanned = 0;
+  let timedOut = false;
+  const walk = async (dir, rel) => {
+    if (hits.length >= limit || timedOut)
+      return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    for (const e of entries) {
+      if (hits.length >= limit || timedOut)
+        return;
+      if (EXCLUDED_DIRS.has(e.name))
+        continue;
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      const full = join7(dir, e.name);
+      if (e.isDirectory()) {
+        if (Date.now() >= deadline) {
+          timedOut = true;
+          return;
+        }
+        await walk(full, childRel);
+      } else if (e.isFile()) {
+        if (++scanned > MAX_SCANNED)
+          return;
+        if (!includeRx.test(e.name) && !includeRx.test(childRel))
+          continue;
+        let size;
+        try {
+          size = (await stat(full)).size;
+        } catch {
+          continue;
+        }
+        if (size > MAX_FILE_BYTES)
+          continue;
+        let content;
+        try {
+          content = await readFile(full, "utf8");
+        } catch {
+          continue;
+        }
+        if (content.includes("\x00"))
+          continue;
+        const lines = content.split(`
+`);
+        for (let i = 0;i < lines.length && hits.length < limit; i++) {
+          if (pattern.test(lines[i])) {
+            let text = lines[i];
+            if (text.length > MAX_LINE_CHARS)
+              text = text.slice(0, MAX_LINE_CHARS) + "…";
+            hits.push({ path: childRel, line: i + 1, text });
+          }
+        }
+        if (Date.now() >= deadline) {
+          timedOut = true;
+          return;
+        }
+      }
+    }
+  };
+  await walk(root2, "");
+  return { hits, timedOut };
+}
 registerTool({
   definition: {
     type: "function",
@@ -2161,46 +2287,44 @@ registerTool({
     }
   },
   async run(args, ctx) {
-    const pattern = String(args.pattern ?? "");
+    const patternText = String(args.pattern ?? "");
     const dir = args.path ? String(args.path) : ctx.cwd;
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
-    const res = await spawnCollect({
-      cmd: [
-        "grep",
-        "-rn",
-        "-E",
-        "-e",
-        pattern,
-        `--include=${include}`,
-        "--exclude-dir=node_modules",
-        "--exclude-dir=.git",
-        "--",
-        dir
-      ],
-      env: { ...process.env, NO_COLOR: "1" },
-      timeoutMs: timeout,
-      signal: ctx.signal
-    });
-    const lines = res.stdout.split(`
-`).filter(Boolean);
-    const shown = lines.slice(0, MAX_RESULTS);
-    let result = shown.join(`
+    let pattern;
+    try {
+      pattern = new RegExp(patternText);
+    } catch (err) {
+      return `ERROR: invalid search pattern: ${err?.message ?? String(err)}`;
+    }
+    let includeRx;
+    try {
+      includeRx = globToRegExp(include);
+    } catch (err) {
+      return `ERROR: invalid include pattern: ${err?.message ?? String(err)}`;
+    }
+    let rootInfo;
+    try {
+      rootInfo = await stat(dir);
+    } catch (err) {
+      return `ERROR: cannot search directory "${dir}": ${err?.message ?? String(err)}`;
+    }
+    if (!rootInfo.isDirectory())
+      return `ERROR: not a directory: ${dir}`;
+    const { hits, timedOut } = await scanDir(dir, pattern, includeRx, MAX_RESULTS + 1, Date.now() + timeout);
+    const shown = hits.slice(0, MAX_RESULTS);
+    let output = shown.map((h) => `${h.path}:${h.line}:${h.text}`).join(`
 `);
-    if (res.timedOut)
-      result += `
-[killed: timed out after ${timeout} ms]`;
-    else if (res.aborted)
-      result += `
-[aborted]`;
-    if (res.exitCode !== 0 && !lines.length)
-      result += res.stderr.trim() ? `ERROR: ${res.stderr.trim()}` : "";
-    if (!lines.length)
-      result = result.trim() || "(no matches)";
-    else if (lines.length > MAX_RESULTS)
-      result += `
-...(${lines.length - MAX_RESULTS} more)`;
-    return result;
+    if (timedOut)
+      output += (output ? `
+` : "") + `[killed: timed out after ${timeout} ms]`;
+    if (shown.length === 0) {
+      output = output.trim() || "(no matches)";
+    } else if (hits.length > shown.length) {
+      output += `
+...(${hits.length - shown.length} more)`;
+    }
+    return output;
   }
 });
 
@@ -2437,7 +2561,7 @@ async function ollamaModels(baseUrl, timeoutMs = 800) {
   }
 }
 async function ensureOllamaServe(opts = {}) {
-  const log = opts.onLog ?? (() => {});
+  const log2 = opts.onLog ?? (() => {});
   if (process.env.VIBECODER_NO_OLLAMA_AUTOSTART === "1") {
     return { running: false, started: false, error: "autostart disabled by env" };
   }
@@ -2448,27 +2572,27 @@ async function ensureOllamaServe(opts = {}) {
   }
   const bin = ollamaBinary();
   if (!bin) {
-    const msg = `ollama not found — offline chat/planning unavailable
+    const msg2 = `ollama not found — offline chat/planning unavailable
 ` + `  → install it:  https://ollama.com  (or run:  curl -fsSL https://ollama.com/install.sh | sh)
 ` + `  → pull the local model:  ollama pull qwen2.5:1.5b
 ` + "  → or go online-only: ensure connectivity reaches a provider and GROQ_API_KEY (or another key) is set";
-    log(msg);
-    return { running: false, started: false, error: msg };
+    log2(msg2);
+    return { running: false, started: false, error: msg2 };
   }
-  log(`starting ollama serve (${bin}) …`);
+  log2(`starting ollama serve (${bin}) …`);
   try {
     const child = spawn2(bin, ["serve"], { detached: true, stdio: "ignore" });
     child.unref();
   } catch (err) {
-    const msg = `failed to start ollama serve: ${err?.message ?? err}`;
-    log(msg);
-    return { running: false, started: false, error: msg };
+    const msg2 = `failed to start ollama serve: ${err?.message ?? err}`;
+    log2(msg2);
+    return { running: false, started: false, error: msg2 };
   }
   const deadline = Date.now() + (opts.readyTimeoutMs ?? 6000);
   while (Date.now() < deadline) {
     if (await ollamaIsUp(baseUrl, 500)) {
       const models = await ollamaModels(baseUrl);
-      log(models.length ? `ollama serve ready (${models.join(", ")})` : "ollama serve ready");
+      log2(models.length ? `ollama serve ready (${models.join(", ")})` : "ollama serve ready");
       return { running: true, started: true, models };
     }
     await new Promise((r) => setTimeout(r, 300));
@@ -2477,11 +2601,71 @@ async function ensureOllamaServe(opts = {}) {
 ` + `  → check it with:  ollama list
 ` + `  → pull the configured model:  ollama pull qwen2.5:1.5b
 ` + "  → or set GROQ_API_KEY so online providers stay available while ollama is down";
-  log(msg);
+  log2(msg);
   return { running: false, started: true, error: msg };
 }
 
+// src/agent/plan-mode.ts
+var PLAN_MODE_PROMPT = `You are in PLAN MODE. This entire turn is ONLY for understanding and planning — you MUST NOT change anything. write_file and edit_file are disabled, and destructive bash commands are rejected; any attempt is blocked and reported to the human.
+
+RULES:
+- Use read-only tools to actually investigate before you say anything: list_dir, read_file, and non-destructive bash (ls, find, grep, cat, git status/diff/log, running tests is fine). Do NOT guess — base every line of the plan on what you observed.
+- Figure out the current state: what already exists, how the pieces fit together, what the task really needs, and what could break if you changed things.
+- Do not write code files, do not run installs, do not mutate git, sockets, processes, or permissions.
+
+Finish by producing a plan in EXACTLY this format:
+
+UNDERSTAND: <2-4 sentences: the current state you observed + what the task requires>
+PLAN:
+1. <concrete step>
+2. <concrete step>
+...
+FILES: <the files you intend to create or modify>
+RISKS: <risks, unknowns, and how you will verify the work>
+
+If the request is genuinely not a task you can act on, or is missing information, say so briefly instead of inventing a plan.`;
+function isPlanOutput(text) {
+  return /PLAN\s*:/.test(text) || /UNDERSTAND\s*:/.test(text);
+}
+function stripPlanEnvelope(text) {
+  const t = text.trim();
+  const i = t.indexOf("UNDERSTAND:");
+  const j = t.indexOf("PLAN:");
+  const start = i === -1 ? j === -1 ? 0 : j : i;
+  const nofence = t.slice(start).replace(/(^|\n)```(\w*)\n?/, "$1").replace(/\n?```$/, "").trim();
+  return nofence || t;
+}
+
 // src/tools/termux.ts
+var ENV = () => ({ ...process.env, NO_COLOR: "1" });
+async function runTermux(cmd, ctx, opts = {}) {
+  const res = await spawnCollect({
+    cmd,
+    env: ENV(),
+    timeoutMs: opts.timeoutMs ?? 30000,
+    signal: ctx.signal
+  });
+  if (res.exitCode < 0) {
+    return `ERROR: ${cmd[0]} failed: ${res.stderr.trim() || "could not be spawned"} (is termux-api installed? pkg install termux-api)`;
+  }
+  let output = "";
+  if (res.stdout)
+    output += res.stdout;
+  if (res.stderr)
+    output += res.stderr ? (output ? `
+` : "") + res.stderr : "";
+  if (res.timedOut)
+    output += (output ? `
+` : "") + "[killed: timed out]";
+  if (res.aborted)
+    output += (output ? `
+` : "") + "[killed: interrupted]";
+  if (!res.timedOut && !res.aborted && res.exitCode !== 0) {
+    output += (output ? `
+` : "") + `[exit code: ${res.exitCode}]`;
+  }
+  return output || opts.emptyText || `(ran ${cmd[0]})`;
+}
 registerTool({
   definition: {
     type: "function",
@@ -2491,8 +2675,8 @@ registerTool({
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Notification title (short)" },
-          message: { type: "string", description: "Notification body (optional, defaults to title)" }
+          title: { type: "string", description: "Notification title (short, ≤100 chars)" },
+          message: { type: "string", description: "Notification body (optional, ≤500 chars; defaults to title)" }
         },
         required: ["title"]
       }
@@ -2503,124 +2687,43 @@ registerTool({
     const message = String(args.message ?? title).slice(0, 500);
     if (!title)
       return "ERROR: title is required";
-    const proc = Bun.spawn({
-      cmd: [
-        "termux-notification",
-        "--title",
-        title,
-        "--content",
-        message
-      ],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true
+    return runTermux(["termux-notification", "--title", title, "--content", message], ctx, {
+      emptyText: `notification pushed: "${title}"`
     });
-    try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited
-      ]);
-      let output = "";
-      if (stdout)
-        output += stdout;
-      if (stderr)
-        output += stderr ? (output ? `
-` : "") + stderr : "";
-      if (exitCode !== 0)
-        output += (output ? `
-` : "") + `[exit code: ${exitCode}]`;
-      return output || `notification pushed: "${title}"`;
-    } catch (err) {
-      return `ERROR: termux-notification failed: ${err?.message ?? String(err)} (is termux-api installed? pkg install termux-api)`;
-    }
   }
 });
-
-// src/tools/tailscale.ts
 registerTool({
   definition: {
     type: "function",
     function: {
-      name: "tailscale_status",
-      description: "Check Tailscale tunnel status: whether connected, the machine's tailnet IP, peer devices, and any upstream exit node / ACL status. Returns the full `tailscale status` output (or a concise summary if the output is large). Inert when tailscale isn't installed.",
+      name: "termux_wake_lock",
+      description: "Acquire or release a Termux wake lock (termux-wake-lock / termux-wake-unlock). Keeps the phone awake during a long agent run so it does not sleep mid-task. Without args or acquire=true acquires the lock; pass acquire=false to release. Inert when the binary isn't installed.",
       parameters: {
         type: "object",
         properties: {
-          summary: {
-            type: "boolean",
-            description: "When true, return only a short human-readable summary (connected + tailnet IP + peer count) instead of the full table."
-          }
-        },
-        required: []
+          acquire: { type: "boolean", description: "true to acquire (default), false to release" }
+        }
       }
     }
   },
   async run(args, ctx) {
-    const wantSummary = Boolean(args.summary);
-    const bin = Bun.spawn({
-      cmd: ["which", "tailscale"],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true
+    const acquire = args.acquire !== false;
+    return runTermux(acquire ? ["termux-wake-lock"] : ["termux-wake-unlock"], ctx, {
+      emptyText: acquire ? "wake lock acquired" : "wake lock released"
     });
-    const [whichOut, whichErr, whichExit] = await Promise.all([
-      new Response(bin.stdout).text(),
-      new Response(bin.stderr).text(),
-      bin.exited
-    ]);
-    if (whichExit !== 0 || !whichOut.trim()) {
-      return "ERROR: tailscale not found on PATH — install it: https://tailscale.com/download (or termux: pkg install tailscale)";
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "termux_battery",
+      description: "Get battery status via Termux:API (termux-battery-status): level, status (charging/discharging/full), temperature, voltage. Check before long tasks to confirm the phone is charging. Inert when the binary isn't installed.",
+      parameters: { type: "object", properties: {} }
     }
-    const useJson = wantSummary;
-    const proc = Bun.spawn({
-      cmd: useJson ? ["tailscale", "status", "--json"] : ["tailscale", "status"],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true
-    });
-    try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited
-      ]);
-      let output = "";
-      if (stdout)
-        output += stdout;
-      if (stderr)
-        output += stderr ? (output ? `
-` : "") + stderr : "";
-      if (exitCode !== 0)
-        output += (output ? `
-` : "") + `[exit code: ${exitCode}]`;
-      if (useJson && stdout) {
-        try {
-          const j = JSON.parse(stdout);
-          const dnsName = j.dnsName ?? "(no dnsName)";
-          const magicSrc = j.magicDNSSrcIP ?? "(no magicDNSSrcIP)";
-          const selfPeer = j.Self ?? null;
-          const peerIps = ((selfPeer?.MagicDNSSrcIP) ? [(selfPeer.MagicDNSSrcIP ?? "").replace(/\.(\d+)$/, "") + ".local"] : []).concat(selfPeer?.TailscaleIPs ?? []).filter(Boolean);
-          const peers = j.Peers ?? {};
-          const peerCount = Object.keys(peers).length;
-          const onlinePeers = Object.values(peers).filter((p) => p.Online === true).length;
-          return [
-            `tailscale: ${j.CanCarryPossibly ? "connected" : "not connected"}${j.BackendState ? ` (backend: ${j.BackendState})` : ""}`,
-            `  hostname: ${dnsName}`,
-            `  tailnet IP: ${peerIps.join(", ") || "(none)"}`,
-            `  peers: ${peerCount} total, ${onlinePeers} online`,
-            j.BackendState === "Connecting" ? "  ⚠ still connecting — give it a moment" : ""
-          ].filter(Boolean).join(`
-`);
-        } catch {}
-      }
-      return output || "(no output)";
-    } catch (err) {
-      return `ERROR: tailscale status failed: ${err?.message ?? String(err)}`;
-    }
+  },
+  async run(_args, ctx) {
+    return runTermux(["termux-battery-status"], ctx, { emptyText: "(no battery output)" });
   }
 });
 
@@ -2641,48 +2744,20 @@ registerTool({
   },
   async run(args, ctx) {
     const host = String(args.host ?? "").trim();
-    let hasBin = false;
-    try {
-      const bin = Bun.spawn({
-        cmd: ["which", "tailscale"],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal
-      });
-      const [whichOut, whichErr, whichExit] = await Promise.all([
-        new Response(bin.stdout).text(),
-        new Response(bin.stderr).text(),
-        bin.exited
-      ]);
-      hasBin = whichExit === 0 && whichOut.trim().length > 0;
-    } catch {
-      hasBin = false;
-    }
+    const env = { ...process.env, NO_COLOR: "1" };
+    const which = await spawnCollect({ cmd: ["which", "tailscale"], env, timeoutMs: 15000, signal: ctx.signal });
+    const hasBin = which.exitCode === 0 && which.stdout.trim().length > 0;
     if (!hasBin) {
       return "NOTE: tailscale not found on PATH. Install it: https://tailscale.com/download (or pkg install tailscale on Termux).";
     }
     let lastErr = "";
     async function tryJson() {
-      const proc = Bun.spawn({
-        cmd: ["tailscale", "status", "--json"],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited
-      ]);
-      lastErr = stderr || "(no stderr)";
-      if (exitCode !== 0 || !stdout.trim())
+      const proc = await spawnCollect({ cmd: ["tailscale", "status", "--json"], env, timeoutMs: 30000, signal: ctx.signal });
+      lastErr = proc.stderr || "(no stderr)";
+      if (proc.exitCode !== 0 || !proc.stdout.trim())
         return null;
       try {
-        const j = JSON.parse(stdout.trim());
+        const j = JSON.parse(proc.stdout.trim());
         if (host) {
           const peer = j.Peers?.[host];
           if (!peer) {
@@ -2697,7 +2772,7 @@ ${known || "(none)"}`;
         const hostname = j.HostInfo?.HostName ?? "(unknown hostname)";
         const selfIps = (j.Self?.TailscaleIPs ?? []).filter(Boolean);
         const peers = j.Peers ?? {};
-        const peerList = Object.entries(peers).filter(([k, p]) => !!k).map(([k, p]) => `  ${k} → ${(p.TailscaleIPs ?? []).join(", ") || "(no IP)"} ${p.Online ? "" : "(offline)"}`).join(`
+        const peerList = Object.entries(peers).filter(([k]) => !!k).map(([k, p]) => `  ${k} → ${(p.TailscaleIPs ?? []).join(", ") || "(no IP)"} ${p.Online ? "" : "(offline)"}`).join(`
 `);
         const connected = j.BackendState === "Running" || j.CanCarryPossibly === true;
         if (!peerList)
@@ -2723,28 +2798,24 @@ ${known || "(none)"}`;
     const jsonOut = await tryJson();
     if (jsonOut)
       return jsonOut;
-    const plain = Bun.spawn({
-      cmd: ["tailscale", "status"],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true,
-      signal: ctx.signal
-    });
-    const [pOut, pErr, pExit] = await Promise.all([
-      new Response(plain.stdout).text(),
-      new Response(plain.stderr).text(),
-      plain.exited
-    ]);
+    const plain = await spawnCollect({ cmd: ["tailscale", "status"], env, timeoutMs: 30000, signal: ctx.signal });
     let text = "";
-    if (pOut)
-      text += pOut;
-    if (pErr)
+    if (plain.stdout)
+      text += plain.stdout;
+    if (plain.stderr)
       text += (text ? `
-` : "") + pErr;
-    if (pExit !== 0)
+` : "") + plain.stderr;
+    if (plain.timedOut)
       text += (text ? `
-` : "") + `[exit code: ${pExit}]`;
+` : "") + "[killed: timed out]";
+    if (plain.aborted)
+      text += (text ? `
+` : "") + "[killed: interrupted]";
+    if (plain.exitCode < 0)
+      return `ERROR: tailscale status failed: ${plain.stderr.trim() || "could not be spawned"}`;
+    if (!plain.timedOut && !plain.aborted && plain.exitCode !== 0)
+      text += (text ? `
+` : "") + `[exit code: ${plain.exitCode}]`;
     if (text)
       return text;
     return lastErr || "(no output)";
@@ -2769,40 +2840,38 @@ registerTool({
     const host = String(args.host ?? "").trim();
     if (!host)
       return "ERROR: host is required";
-    try {
-      const proc = Bun.spawn({
-        cmd: ["ping", "-c", "3", "-W", "5", host],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited
-      ]);
-      let out = "";
-      if (stdout)
-        out += stdout;
-      if (stderr)
-        out += (out ? `
-` : "") + stderr;
-      if (exitCode !== 0)
-        out += (out ? `
-` : "") + `[exit code: ${exitCode}]`;
-      return out || `(ping ${host})`;
-    } catch (err) {
-      return `NOTE: ping not available: ${err?.message ?? String(err)}`;
-    }
+    const env = { ...process.env, NO_COLOR: "1" };
+    const proc = await spawnCollect({
+      cmd: ["ping", "-c", "3", "-W", "5", host],
+      env,
+      timeoutMs: 20000,
+      signal: ctx.signal
+    });
+    if (proc.exitCode < 0)
+      return `NOTE: ping not available: ${proc.stderr.trim() || "could not be spawned"}`;
+    let out = "";
+    if (proc.stdout)
+      out += proc.stdout;
+    if (proc.stderr)
+      out += (out ? `
+` : "") + proc.stderr;
+    if (proc.timedOut)
+      out += (out ? `
+` : "") + "[killed: timed out]";
+    if (proc.aborted)
+      out += (out ? `
+` : "") + "[killed: interrupted]";
+    if (!proc.timedOut && !proc.aborted && proc.exitCode !== 0)
+      out += (out ? `
+` : "") + `[exit code: ${proc.exitCode}]`;
+    return out || `(ping ${host})`;
   }
 });
 
 // src/tools/env.ts
 import { join as pathJoin, dirname as dirname5 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile as readFile2, writeFile } from "node:fs/promises";
 import { existsSync as existsSync7 } from "node:fs";
 var _repoRoot = (() => {
   try {
@@ -2827,7 +2896,7 @@ var ENV_FILE = (() => {
 })();
 async function readEnv() {
   try {
-    const text = await readFile(ENV_FILE, "utf8");
+    const text = await readFile2(ENV_FILE, "utf8");
     const out = {};
     for (const line of text.split(`
 `)) {
@@ -3319,12 +3388,12 @@ async function resolveDNS(ctx, host) {
   }
   try {
     const { lookup } = await import("node:dns");
-    const result = await new Promise((resolve, reject) => {
+    const result = await new Promise((resolve4, reject) => {
       lookup(host, { all: true }, (err, addresses) => {
         if (err)
           reject(err);
         else
-          resolve(addresses?.map((a) => a.address) ?? []);
+          resolve4(addresses?.map((a) => a.address) ?? []);
       });
     });
     if (result.length)
@@ -3434,15 +3503,15 @@ function buildSummary(checks, results) {
 // src/session.ts
 import { existsSync as existsSync8, mkdirSync as mkdirSync5, readdirSync as readdirSync3, readFileSync as readFileSync5, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "node:fs";
 import { homedir as homedir4 } from "node:os";
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 var _root2 = null;
 function root2() {
   if (_root2)
     return _root2;
   const envDir = process.env.VIBECODER_SESSION_DIR;
-  _root2 = envDir || join7(homedir4(), ".vibecoder");
+  _root2 = envDir || join8(homedir4(), ".vibecoder");
   mkdirSync5(_root2, { recursive: true });
-  mkdirSync5(join7(_root2, "sessions"), { recursive: true });
+  mkdirSync5(join8(_root2, "sessions"), { recursive: true });
   return _root2;
 }
 function sanitizeId(id) {
@@ -3463,12 +3532,12 @@ function resolveResumeArg(argv) {
   return { resume: true, name };
 }
 function lastFile() {
-  return join7(root2(), "last.json");
+  return join8(root2(), "last.json");
 }
 function sessionFile(id) {
   const clean = sanitizeId(id);
   const fname = clean === id ? clean : `${clean}--${shortHash(id)}`;
-  return join7(root2(), "sessions", `${fname}.json`);
+  return join8(root2(), "sessions", `${fname}.json`);
 }
 function saveSession(s) {
   s.updatedAt = Date.now();
@@ -3503,7 +3572,7 @@ function deleteSession(id) {
 }
 function listSessions() {
   const out = [];
-  const dir = join7(root2(), "sessions");
+  const dir = join8(root2(), "sessions");
   if (!existsSync8(dir))
     return out;
   for (const name of readdirSync3(dir)) {
@@ -3511,7 +3580,7 @@ function listSessions() {
       continue;
     let s = null;
     try {
-      const parsed = JSON.parse(readFileSync5(join7(dir, name), "utf8"));
+      const parsed = JSON.parse(readFileSync5(join8(dir, name), "utf8"));
       if (parsed && typeof parsed.id === "string" && Array.isArray(parsed.messages))
         s = parsed;
     } catch {}
@@ -3855,13 +3924,13 @@ class KeyParser {
   hold = [];
   feed(bytes) {
     const all = [...this.hold, ...bytes];
-    const out = [];
+    const out2 = [];
     let i = 0;
     this.hold = [];
     while (i < all.length) {
       const b = all[i];
       if (b !== 27) {
-        out.push(singleKey(b));
+        out2.push(singleKey(b));
         i++;
         continue;
       }
@@ -3884,7 +3953,7 @@ class KeyParser {
           i = all.length;
           break;
         }
-        out.push(csiKey(rest.slice(1, fin + 1)));
+        out2.push(csiKey(rest.slice(1, fin + 1)));
         i += 1 + fin + 1;
       } else if (rest[0] === 79) {
         if (rest.length < 2 || !FINAL_BYTE(rest[1])) {
@@ -3902,14 +3971,14 @@ class KeyParser {
           72: { kind: "home" },
           70: { kind: "end" }
         };
-        out.push(map[c] ?? { kind: "unknown", raw: `SS3${String.fromCharCode(c)}` });
+        out2.push(map[c] ?? { kind: "unknown", raw: `SS3${String.fromCharCode(c)}` });
         i += 3;
       } else {
-        out.push({ kind: "esc" });
+        out2.push({ kind: "esc" });
         i += 1;
       }
     }
-    return out;
+    return out2;
   }
   finalize() {
     if (this.hold.length === 1 && this.hold[0] === 27) {
@@ -4300,22 +4369,22 @@ class TUI {
   askConfirm(question) {
     if (this.approveMode === "off")
       return Promise.resolve("yes");
-    return new Promise((resolve) => {
+    return new Promise((resolve4) => {
       this.promptOverride = `${question}  ${ansi.bold}[y/n/a]${ansi.reset}`;
       this.render();
       this.keyHandler = (ev) => {
         if (ev.kind === "char" && (ev.char === "y" || ev.char === "Y")) {
           this.promptOverride = null;
-          resolve("yes");
+          resolve4("yes");
         } else if (ev.kind === "char" && (ev.char === "n" || ev.char === "N")) {
           this.promptOverride = null;
-          resolve("no");
+          resolve4("no");
         } else if (ev.kind === "char" && (ev.char === "a" || ev.char === "A")) {
           this.promptOverride = null;
-          resolve("all");
+          resolve4("all");
         } else if (ev.kind === "ctrl-c") {
           this.promptOverride = null;
-          resolve("no");
+          resolve4("no");
         } else {
           this.render();
         }
@@ -4695,7 +4764,7 @@ import { createInterface as createInterface2 } from "node:readline";
 // src/env.ts
 import { existsSync as existsSync9, readFileSync as readFileSync6 } from "node:fs";
 import { homedir as homedir5 } from "node:os";
-import { dirname as dirname6, join as join8 } from "node:path";
+import { dirname as dirname6, join as join9 } from "node:path";
 var loaded = new Set;
 function envLine(line) {
   const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
@@ -4712,9 +4781,9 @@ function loadDotEnv() {
   if (process.env.VIBECODER_NO_DOTENV === "1")
     return;
   const candidates = [
-    join8(packageRoot(), ".env"),
-    join8(dirname6(packageRoot()), ".env"),
-    join8(homedir5(), ".vibecoder", ".env")
+    join9(packageRoot(), ".env"),
+    join9(dirname6(packageRoot()), ".env"),
+    join9(homedir5(), ".vibecoder", ".env")
   ];
   for (const file of candidates) {
     if (loaded.has(file))
@@ -4755,8 +4824,8 @@ async function probeReachable(url, timeoutMs = 3000) {
   }
 }
 async function runDoctor() {
-  const out = [];
-  const say = (s = "") => out.push(s);
+  const out2 = [];
+  const say = (s = "") => out2.push(s);
   const pkg = readPackageJson();
   const version = pkg?.version ?? "dev";
   const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`;
@@ -4770,16 +4839,16 @@ async function runDoctor() {
   try {
     ({ config: cfg, paths } = await loadConfigInfo());
   } catch (err) {
-    out.push("");
-    out.push(`  config:    ERROR — ${err?.message ?? String(err)}`);
-    out.push("             run: vibecoder setup");
-    out.push("");
-    process.stdout.write(out.join(`
+    out2.push("");
+    out2.push(`  config:    ERROR — ${err?.message ?? String(err)}`);
+    out2.push("             run: vibecoder setup");
+    out2.push("");
+    process.stdout.write(out2.join(`
 `) + `
 `);
     return 1;
   }
-  out.push("");
+  out2.push("");
   say("config");
   say(`  built-in defaults: ${paths.builtin ?? "not found"}`);
   say(`  your overrides:    ${paths.userFile ?? "(none — creating one is optional; see 'vibecoder setup')"}`);
@@ -4789,7 +4858,7 @@ async function runDoctor() {
   if (cfg.routing) {
     say(`  router:            chat ${cfg.routing.chatProvider}/${cfg.routing.chatModel}  ·  heavy ${cfg.routing.heavyProvider}/${cfg.routing.heavyModel}${cfg.routing.offlineProvider ? `  ·  offline ${cfg.routing.offlineProvider}/${cfg.routing.offlineModel ?? cfg.routing.chatModel}` : ""}`);
   }
-  out.push("");
+  out2.push("");
   say("providers");
   for (const name of Object.keys(cfg.providers ?? {})) {
     const p = cfg.providers[name];
@@ -4799,7 +4868,7 @@ async function runDoctor() {
     say(`    api key:   ${p.apiKeyEnv ? `${p.apiKeyEnv} → ${maskKey(key)}` : "(none — local)"}`);
     say(`    models:    ${(p.models ?? []).join(", ")}`);
   }
-  out.push("");
+  out2.push("");
   say("ollama (local, no cost)");
   const bin = ollamaBinary();
   const up = ollamaIsUp(ollamaBaseUrl());
@@ -4819,11 +4888,11 @@ async function runDoctor() {
       return "https://api.groq.com/openai/v1/models";
     }
   })();
-  out.push("");
+  out2.push("");
   say("connectivity");
   say(`  probe:   ${probeUrl} → ${await probeReachable(probeUrl)}`);
   say(`  note:    offline is fine — chat falls back to your local ollama, and heavy tasks queue until online`);
-  out.push("");
+  out2.push("");
   say("data");
   say(`  sessions:  ~/.vibecoder/sessions/  (saved conversations)`);
   say(`  queue:     ~/.vibecoder/queue.json (offline task queue)`);
@@ -4831,14 +4900,14 @@ async function runDoctor() {
   say(`  user env:  ~/.vibecoder/.env      (optional API keys, e.g. GROQ_API_KEY=...)`);
   const userCfgExists = existsSync10(userConfigFile());
   const keysPresent = Object.keys(cfg.providers ?? {}).map((n) => cfg.providers[n].apiKeyEnv).filter(Boolean).some((k) => process.env[k]);
-  out.push("");
+  out2.push("");
   say("next steps");
   if (!userCfgExists)
     say("  - customize:   vibecoder setup   (generates ~/.vibecoder/config.json)");
   if (!keysPresent)
     say("  - free online:  get a free GROQ_API_KEY (console.groq.com) and add it to ~/.vibecoder/.env");
   say('  - run it:      vibecoder        (or: vibecoder --prompt "your task")');
-  process.stdout.write(out.join(`
+  process.stdout.write(out2.join(`
 `) + `
 `);
   return 0;
@@ -4849,7 +4918,7 @@ import { createInterface } from "node:readline/promises";
 import { stdin as stdinInput, stdout as stdoutOutput } from "node:process";
 import { appendFileSync as appendFileSync2, existsSync as existsSync11, mkdirSync as mkdirSync6 } from "node:fs";
 import { homedir as homedir6 } from "node:os";
-import { join as join9 } from "node:path";
+import { join as join10 } from "node:path";
 var LOCAL_MODEL = "qwen2.5:1.5b";
 async function prompt(question, fallback, interactive) {
   if (!interactive)
@@ -4924,8 +4993,8 @@ async function runSetup(argv) {
   }
   const written = writeUserConfig(cfg);
   if (groqKey || nvidiaKey) {
-    const envFile = join9(homedir6(), ".vibecoder", ".env");
-    mkdirSync6(join9(homedir6(), ".vibecoder"), { recursive: true });
+    const envFile = join10(homedir6(), ".vibecoder", ".env");
+    mkdirSync6(join10(homedir6(), ".vibecoder"), { recursive: true });
     if (groqKey)
       appendFileSync2(envFile, `GROQ_API_KEY=${groqKey}
 `);
@@ -4977,6 +5046,7 @@ var rootConfig = null;
 var router = null;
 var routerMode = "auto";
 var taskActive = false;
+var planMode = false;
 var connectivityPoller = null;
 var online = false;
 var nowDraining = false;
@@ -5086,7 +5156,7 @@ async function init() {
     online = now;
     if (tuiRef) {
       const rl = routeLabel();
-      tuiRef.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
+      tuiRef.setStatus(`${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     }
     if (online)
       inAppDrain();
@@ -5116,12 +5186,17 @@ async function init() {
     if (Number.isFinite(n) && n > 0)
       maxSteps = n;
   }
+  if (process.argv.includes("--plan"))
+    planMode = true;
 }
 function onlineStatus() {
   if (online)
     return "";
   const off = router?.offlineIdentity();
   return off ? `offline (${off.provider}/${off.model}) · ` : "offline · ";
+}
+function planTag() {
+  return planMode ? "plan · " : "";
 }
 async function queueOfflineTask(userInput, tui) {
   if (!router || !rootConfig)
@@ -5186,7 +5261,7 @@ async function handleCommand(line, tui) {
   const setStatus = () => {
     if (tui) {
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
   };
   if (["exit", "quit", "/exit", "/quit"].includes(line.trim())) {
@@ -5201,6 +5276,7 @@ ${colors.bold}Commands${colors.reset}`);
     print(`  ${colors.green}/provider <name>${colors.reset}  switch provider (groq, ollama, openai, anthropic…)`);
     print(`  ${colors.green}/model <id>${colors.reset}       switch model`);
     print(`  ${colors.green}/route [auto|chat|heavy]${colors.reset} ${colors.dim}model routing: auto-classify, or force chat/heavy model${colors.reset}`);
+    print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}plan mode: investigate + return a plan, change nothing${colors.reset}`);
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
     print(`  ${colors.green}/save [name]${colors.reset}      save this conversation`);
     print(`  ${colors.green}/resume [name]${colors.reset}    resume a saved conversation (or the last one)`);
@@ -5335,6 +5411,22 @@ ${colors.bold}Saved conversations${colors.reset}`);
     } else {
       print(`${colors.red}usage: /route [auto|chat|heavy]${colors.reset}`);
     }
+    return true;
+  }
+  if (line === "/plan" || line.startsWith("/plan ")) {
+    const arg = line.slice(5).trim().toLowerCase();
+    if (arg === "on")
+      planMode = true;
+    else if (arg === "off")
+      planMode = false;
+    else if (!arg)
+      planMode = !planMode;
+    else {
+      print(`${colors.red}usage: /plan [on|off]${colors.reset}`);
+      return true;
+    }
+    setStatus();
+    print(planMode ? `${colors.green}plan mode on${colors.reset} ${colors.dim}— read-only: the agent investigates and returns a plan; write_file, edit_file, and destructive bash are blocked${colors.reset}` : `${colors.dim}plan mode off — the agent may execute changes again${colors.reset}`);
     return true;
   }
   if (line.startsWith("/approve")) {
@@ -5515,12 +5607,15 @@ async function runPrompt(userInput, tui) {
     tui?.setStatus(`${spinnerFrames[spin++ % spinnerFrames.length]} ${label}… ${secs}s (ctrl-c to interrupt)`, 8);
   }, 120) : null;
   try {
+    const turnSystemPrompt = planMode ? `${PLAN_MODE_PROMPT}
+
+${systemPrompt}` : systemPrompt;
     const result = await runAgent({
       provider: turnProvider,
-      systemPrompt,
+      systemPrompt: turnSystemPrompt,
       model: turnModel,
       initialMessages: messages,
-      toolCtx: { cwd, signal: ac.signal },
+      toolCtx: { cwd, signal: ac.signal, planPhase: planMode },
       signal: ac.signal,
       chatOptions: {
         temperature: chatTemperature,
@@ -5588,11 +5683,21 @@ ${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.
         aborted = res.finishReason === "aborted";
       }
     });
-    messages.push({ role: "assistant", content: result.finalText });
+    const isPlan = planMode && isPlanOutput(result.finalText);
+    messages.push({ role: "assistant", content: isPlan ? stripPlanEnvelope(result.finalText) : result.finalText });
     if (result.aborted)
       taskActive = false;
     else
       taskActive = heavyRoute && result.toolCalls > 0;
+    if (isPlan) {
+      const note = "plan ready — review it, then /plan off to let the agent execute (or paste it into a new prompt)";
+      if (tui)
+        tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
+      else
+        process.stdout.write(`
+${colors.dim}${note}${colors.reset}
+`);
+    }
   } catch (err) {
     const msg = err?.message ?? String(err);
     if (tui)
@@ -5610,7 +5715,7 @@ ${colors.red}${msg}${colors.reset}
     if (tui) {
       tui.busy = false;
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     } else {
       process.stdout.write(`
 `);
@@ -5645,7 +5750,7 @@ function mainTUI() {
   });
   tui.start();
   const rl0 = routeLabel();
-  tui.setStatus(`${onlineStatus()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
+  tui.setStatus(`${onlineStatus()}${planTag()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
 }
 function mainLine() {
   console.log(banner(providerName, llmModel, cwd).join(`
@@ -5695,6 +5800,7 @@ function printUsage() {
   console.log("  --provider <name>   pick provider (groq, ollama, openai, anthropic, nvidia…)");
   console.log("  --model <id>        pick model");
   console.log("  --resume [name]     resume last (or named) conversation");
+  console.log("  --plan              plan mode: investigate and return a plan without changing anything");
   console.log("  --max-steps <n>     cap the agent loop (default 40)");
   console.log("  --cwd <path>        work from another directory");
   console.log("  --version, -v       print version");
@@ -5738,13 +5844,13 @@ async function main() {
     }
   }
   const promptIdx = process.argv.indexOf("--prompt");
-  let prompt = promptIdx !== -1 ? process.argv[promptIdx + 1] : undefined;
-  if (prompt === undefined && process.argv.length === 3 && process.argv[2] && !process.argv[2].startsWith("-")) {
-    prompt = process.argv[2];
+  let prompt2 = promptIdx !== -1 ? process.argv[promptIdx + 1] : undefined;
+  if (prompt2 === undefined && process.argv.length === 3 && process.argv[2] && !process.argv[2].startsWith("-")) {
+    prompt2 = process.argv[2];
   }
-  if (prompt) {
+  if (prompt2) {
     mainLine();
-    await runPrompt(prompt);
+    await runPrompt(prompt2);
     return;
   }
   if (hasControllingTty()) {

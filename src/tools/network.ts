@@ -1,4 +1,5 @@
 import { registerTool, type ToolContext } from "./registry";
+import { spawnCollect } from "./proc";
 
 /**
  * Tailscale tunnel health check. Reports whether this device is connected
@@ -28,27 +29,12 @@ registerTool({
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const host = String(args.host ?? "").trim();
+    const env = { ...process.env, NO_COLOR: "1" } as Record<string, string>;
 
-    // Confirm the binary exists.
-    let hasBin = false;
-    try {
-      const bin = Bun.spawn({
-        cmd: ["which", "tailscale"],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal,
-      });
-      const [whichOut, whichErr, whichExit] = await Promise.all([
-        new Response(bin.stdout).text(),
-        new Response(bin.stderr).text(),
-        bin.exited,
-      ]);
-      hasBin = whichExit === 0 && whichOut.trim().length > 0;
-    } catch {
-      hasBin = false;
-    }
+    // Confirm the binary exists. spawnCollect never throws: a missing binary
+    // surfaces as a non-zero exit code, which means "not installed" here.
+    const which = await spawnCollect({ cmd: ["which", "tailscale"], env, timeoutMs: 15_000, signal: ctx.signal });
+    const hasBin = which.exitCode === 0 && which.stdout.trim().length > 0;
     if (!hasBin) {
       return "NOTE: tailscale not found on PATH. Install it: https://tailscale.com/download (or pkg install tailscale on Termux).";
     }
@@ -56,23 +42,11 @@ registerTool({
     let lastErr = "";
 
     async function tryJson(): Promise<string | null> {
-      const proc = Bun.spawn({
-        cmd: ["tailscale", "status", "--json"],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal,
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      lastErr = stderr || "(no stderr)";
-      if (exitCode !== 0 || !stdout.trim()) return null;
+      const proc = await spawnCollect({ cmd: ["tailscale", "status", "--json"], env, timeoutMs: 30_000, signal: ctx.signal });
+      lastErr = proc.stderr || "(no stderr)";
+      if (proc.exitCode !== 0 || !proc.stdout.trim()) return null;
       try {
-        const j = JSON.parse(stdout.trim());
+        const j = JSON.parse(proc.stdout.trim());
         if (host) {
           const peer = j.Peers?.[host];
           if (!peer) {
@@ -89,7 +63,7 @@ registerTool({
         const selfIps = (j.Self?.TailscaleIPs ?? []).filter(Boolean);
         const peers = j.Peers ?? {};
         const peerList = Object.entries(peers)
-          .filter(([k, p]) => !!k)
+          .filter(([k]) => !!k)
           .map(([k, p]) => `  ${k} → ${((p as any).TailscaleIPs ?? []).join(", ") || "(no IP)"} ${((p as any).Online) ? "" : "(offline)"}`)
           .join("\n");
         const connected = j.BackendState === "Running" || (j.CanCarryPossibly === true);
@@ -116,23 +90,14 @@ registerTool({
     if (jsonOut) return jsonOut;
 
     // Plain fallback.
-    const plain = Bun.spawn({
-      cmd: ["tailscale", "status"],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true,
-      signal: ctx.signal,
-    });
-    const [pOut, pErr, pExit] = await Promise.all([
-      new Response(plain.stdout).text(),
-      new Response(plain.stderr).text(),
-      plain.exited,
-    ]);
+    const plain = await spawnCollect({ cmd: ["tailscale", "status"], env, timeoutMs: 30_000, signal: ctx.signal });
     let text = "";
-    if (pOut) text += pOut;
-    if (pErr) text += (text ? "\n" : "") + pErr;
-    if (pExit !== 0) text += (text ? "\n" : "") + `[exit code: ${pExit}]`;
+    if (plain.stdout) text += plain.stdout;
+    if (plain.stderr) text += (text ? "\n" : "") + plain.stderr;
+    if (plain.timedOut) text += (text ? "\n" : "") + "[killed: timed out]";
+    if (plain.aborted) text += (text ? "\n" : "") + "[killed: interrupted]";
+    if (plain.exitCode < 0) return `ERROR: tailscale status failed: ${plain.stderr.trim() || "could not be spawned"}`;
+    if (!plain.timedOut && !plain.aborted && plain.exitCode !== 0) text += (text ? "\n" : "") + `[exit code: ${plain.exitCode}]`;
     if (text) return text;
     return lastErr || "(no output)";
   },
@@ -162,27 +127,20 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const host = String(args.host ?? "").trim();
     if (!host) return "ERROR: host is required";
-    try {
-      const proc = Bun.spawn({
-        cmd: ["ping", "-c", "3", "-W", "5", host],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal,
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      let out = "";
-      if (stdout) out += stdout;
-      if (stderr) out += (out ? "\n" : "") + stderr;
-      if (exitCode !== 0) out += (out ? "\n" : "") + `[exit code: ${exitCode}]`;
-      return out || `(ping ${host})`;
-    } catch (err: any) {
-      return `NOTE: ping not available: ${err?.message ?? String(err)}`;
-    }
+    const env = { ...process.env, NO_COLOR: "1" } as Record<string, string>;
+    const proc = await spawnCollect({
+      cmd: ["ping", "-c", "3", "-W", "5", host],
+      env,
+      timeoutMs: 20_000,
+      signal: ctx.signal,
+    });
+    if (proc.exitCode < 0) return `NOTE: ping not available: ${proc.stderr.trim() || "could not be spawned"}`;
+    let out = "";
+    if (proc.stdout) out += proc.stdout;
+    if (proc.stderr) out += (out ? "\n" : "") + proc.stderr;
+    if (proc.timedOut) out += (out ? "\n" : "") + "[killed: timed out]";
+    if (proc.aborted) out += (out ? "\n" : "") + "[killed: interrupted]";
+    if (!proc.timedOut && !proc.aborted && proc.exitCode !== 0) out += (out ? "\n" : "") + `[exit code: ${proc.exitCode}]`;
+    return out || `(ping ${host})`;
   },
 });

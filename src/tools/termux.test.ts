@@ -66,3 +66,31 @@ describe("termux_notify", () => {
     expect(calls.length).toBe(0);
   });
 });
+
+describe("termux_wake_lock", () => {
+  test("acquires by default and releases on acquire=false", async () => {
+    const acquired = await executeTool("termux_wake_lock", {}, ctx);
+    expect(acquired).toBe("wake lock acquired");
+    expect(calls[0].cmd[0]).toBe("termux-wake-lock");
+
+    const released = await executeTool("termux_wake_lock", { acquire: false }, ctx);
+    expect(released).toBe("wake lock released");
+    expect(calls[1].cmd[0]).toBe("termux-wake-unlock");
+  });
+
+  test("hints termux-api when the binary is missing", async () => {
+    queue.push({ stdout: "", stderr: "spawn error: ENOENT", exitCode: -1, timedOut: false, aborted: false });
+    const res = await executeTool("termux_wake_lock", {}, ctx);
+    expect(res).toContain("ERROR");
+    expect(res).toContain("termux-api");
+  });
+});
+
+describe("termux_battery", () => {
+  test("returns the battery status output", async () => {
+    queue.push({ stdout: '{"percentage":87,"status":"CHARGING"}', stderr: "", exitCode: 0, timedOut: false, aborted: false });
+    const res = await executeTool("termux_battery", {}, ctx);
+    expect(res).toContain('"percentage":87');
+    expect(calls[0].cmd[0]).toBe("termux-battery-status");
+  });
+});
