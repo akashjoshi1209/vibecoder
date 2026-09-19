@@ -1,10 +1,113 @@
+// Native recursive text search (grep). Runs entirely in-process, so it is
+// fast everywhere (Node and Bun, incl. Termux/proot), never passes the pattern
+// or include glob through a shell (no injection), and treats the pattern as
+// data even when it starts with "-".
 import { registerTool, type ToolContext } from "./registry";
-import { spawnCollect } from "./proc";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { join } from "node:path";
 import { globScan } from "./glob";
 
 const MAX_RESULTS = 50;
-const MAX_SCANNED = 2000;
+const MAX_SCANNED = 100_000;
+const MAX_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_LINE_CHARS = 2000;
+const EXCLUDED_DIRS = new Set(["node_modules", ".git", ".hg", ".svn"]);
 const DEFAULT_TIMEOUT_MS = 60_000;
+
+interface ScanHit {
+  path: string;
+  line: number;
+  text: string;
+}
+
+/** Convert a glob (e.g. `*.ts`, `src/**&#47;*.ts`) to a regex over path strings. */
+function globToRegExp(glob: string): RegExp {
+  let rx = "^";
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        rx += ".*";
+        i++;
+      } else {
+        rx += "[^/]*";
+      }
+    } else if (c === "?") {
+      rx += "[^/]";
+    } else {
+      rx += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(rx + "$");
+}
+
+async function scanDir(
+  root: string,
+  pattern: RegExp,
+  includeRx: RegExp,
+  limit: number,
+  deadline: number,
+): Promise<{ hits: ScanHit[]; timedOut: boolean }> {
+  const hits: ScanHit[] = [];
+  let scanned = 0;
+  let timedOut = false;
+
+  const walk = async (dir: string, rel: string): Promise<void> => {
+    if (hits.length >= limit || timedOut) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const e of entries) {
+      if (hits.length >= limit || timedOut) return;
+      if (EXCLUDED_DIRS.has(e.name)) continue;
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (Date.now() >= deadline) {
+          timedOut = true;
+          return;
+        }
+        await walk(full, childRel);
+      } else if (e.isFile()) {
+        if (++scanned > MAX_SCANNED) return;
+        if (!includeRx.test(e.name) && !includeRx.test(childRel)) continue;
+        let size: number;
+        try {
+          size = (await stat(full)).size;
+        } catch {
+          continue;
+        }
+        if (size > MAX_FILE_BYTES) continue;
+        let content: string;
+        try {
+          content = await readFile(full, "utf8");
+        } catch {
+          continue;
+        }
+        if (content.includes("\0")) continue; // skip binary files
+        const lines = content.split("\n");
+        for (let i = 0; i < lines.length && hits.length < limit; i++) {
+          if (pattern.test(lines[i])) {
+            let text = lines[i];
+            if (text.length > MAX_LINE_CHARS) text = text.slice(0, MAX_LINE_CHARS) + "…";
+            hits.push({ path: childRel, line: i + 1, text });
+          }
+        }
+        if (Date.now() >= deadline) {
+          timedOut = true;
+          return;
+        }
+      }
+    }
+  };
+
+  await walk(root, "");
+  return { hits, timedOut };
+}
 
 registerTool({
   definition: {
@@ -61,37 +164,43 @@ registerTool({
     },
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-    const pattern = String(args.pattern ?? "");
+    const patternText = String(args.pattern ?? "");
     const dir = args.path ? String(args.path) : ctx.cwd;
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
 
-    const res = await spawnCollect({
-      cmd: [
-        "grep",
-        "-rn",
-        "-E",
-        "-e",
-        pattern,
-        `--include=${include}`,
-        "--exclude-dir=node_modules",
-        "--exclude-dir=.git",
-        "--",
-        dir,
-      ],
-      env: { ...process.env, NO_COLOR: "1" } as Record<string, string>,
-      timeoutMs: timeout,
-      signal: ctx.signal,
-    });
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(patternText);
+    } catch (err: any) {
+      return `ERROR: invalid search pattern: ${err?.message ?? String(err)}`;
+    }
 
-    const lines = res.stdout.split("\n").filter(Boolean);
-    const shown = lines.slice(0, MAX_RESULTS);
-    let result = shown.join("\n");
-    if (res.timedOut) result += `\n[killed: timed out after ${timeout} ms]`;
-    else if (res.aborted) result += "\n[aborted]";
-    if (res.exitCode !== 0 && !lines.length) result += (res.stderr.trim() ? `ERROR: ${res.stderr.trim()}` : "");
-    if (!lines.length) result = result.trim() || "(no matches)";
-    else if (lines.length > MAX_RESULTS) result += `\n...(${lines.length - MAX_RESULTS} more)`;
-    return result;
+    let includeRx: RegExp;
+    try {
+      includeRx = globToRegExp(include);
+    } catch (err: any) {
+      return `ERROR: invalid include pattern: ${err?.message ?? String(err)}`;
+    }
+
+    let rootInfo;
+    try {
+      rootInfo = await stat(dir);
+    } catch (err: any) {
+      return `ERROR: cannot search directory "${dir}": ${err?.message ?? String(err)}`;
+    }
+    if (!rootInfo.isDirectory()) return `ERROR: not a directory: ${dir}`;
+
+    const { hits, timedOut } = await scanDir(dir, pattern, includeRx, MAX_RESULTS + 1, Date.now() + timeout);
+
+    const shown = hits.slice(0, MAX_RESULTS);
+    let output = shown.map((h) => `${h.path}:${h.line}:${h.text}`).join("\n");
+    if (timedOut) output += (output ? "\n" : "") + `[killed: timed out after ${timeout} ms]`;
+    if (shown.length === 0) {
+      output = output.trim() || "(no matches)";
+    } else if (hits.length > shown.length) {
+      output += `\n...(${hits.length - shown.length} more)`;
+    }
+    return output;
   },
 });

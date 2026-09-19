@@ -2,7 +2,7 @@
 // src/daemon.ts
 import { mkdirSync as mkdirSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync4, unlinkSync } from "node:fs";
 import { homedir as homedir5 } from "node:os";
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 
 // src/llm/types.ts
 class ContextTooLargeError extends Error {
@@ -1444,6 +1444,14 @@ function killProcessGroup(child, signal = "SIGKILL") {
     } catch {}
   }
 }
+function killProcessTree(child, signal = "SIGKILL") {
+  if (child.pid === undefined || child.pid <= 0)
+    return;
+  killProcessGroup(child, signal);
+  try {
+    child.kill(signal);
+  } catch {}
+}
 function spawnCollect(opts) {
   return new Promise((resolvePromise) => {
     const child = spawn(opts.cmd[0], opts.cmd.slice(1), {
@@ -1461,12 +1469,15 @@ function spawnCollect(opts) {
     let settled = false;
     let spawnError = "";
     let timer = null;
+    let forceTimer = null;
     const settle = (exitCode) => {
       if (settled)
         return;
       settled = true;
       if (timer)
         clearTimeout(timer);
+      if (forceTimer)
+        clearTimeout(forceTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       if (spawnError) {
         stderr = (stderr ? stderr + `
@@ -1474,16 +1485,35 @@ function spawnCollect(opts) {
       }
       resolvePromise({ stdout, stderr, exitCode, timedOut, aborted });
     };
+    const forceSettle = (exitCode) => {
+      if (settled)
+        return;
+      killProcessTree(child);
+      try {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      } catch {}
+      settle(exitCode);
+    };
+    const armForceSettle = () => {
+      if (forceTimer)
+        return;
+      forceTimer = setTimeout(() => forceSettle(-1), 150);
+    };
     if (opts.timeoutMs && opts.timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
         opts.onTimeout?.();
-        killProcessGroup(child);
+        killProcessTree(child);
+        armForceSettle();
       }, opts.timeoutMs);
     }
     const onAbort = () => {
+      if (settled)
+        return;
       aborted = true;
-      killProcessGroup(child);
+      killProcessTree(child);
+      armForceSettle();
     };
     if (opts.signal?.aborted)
       onAbort();
@@ -1500,23 +1530,21 @@ function spawnCollect(opts) {
 // src/tools/bash.ts
 var MAX_OUTPUT = 30000;
 var PLAN_MODE_BANNED = [
-  { re: /(^|[;&|]\s*)(rm|rmdir|mv|dd|mkfs(\.[a-z0-9]+)?|truncate|fdisk|parted|mkfs)\s/, why: "file/directory-destroying command" },
-  { re: /(^|[;&|]\s*)git\s+(reset\s+--hard|clean\s+-(f|d|fd)|checkout\s+\S+\s+--?[^;]*|push\b|remote\s+set-url|branch\s+-D|stash\s+drop|rebase\b|merge\b|cherry-pick\b)/, why: "git state mutation" },
-  { re: /(^|[;&|]\s*)(npm|pnpm|yarn|bun|deno)\s+(i|install|add|update|remove|uninstall|upgrade)\b/, why: "package manager install/remove" },
-  { re: /(^|[;&|]\s*)(pip|pip3)\s+(install|uninstall|download)\b/, why: "pip install/remove" },
-  { re: /(^|[;&|]\s*)(apt|apt-get|dnf|yum|zypper|brew)\s+(install|remove|uninstall|purge|update|upgrade)\b/, why: "system package manager" },
-  { re: /(^|[;&|]\s*)(cargo|go)\s+(install|add)\b/, why: "language package manager" },
+  { re: /(?:^|[;&|\n])\s*(rm|rmdir|mv|dd|mkfs(\.[a-z0-9]+)?|truncate|fdisk|parted)\s/, why: "file/directory-destroying command" },
+  { re: /(?:^|[;&|\n])\s*git\s+(reset\s+--hard|clean\s+-(f|d|fd)|checkout\s+\S+\s+--?[^;]*|push\b|remote\s+set-url|branch\s+-D|stash\s+drop|rebase\b|merge\b|cherry-pick\b)/, why: "git state mutation" },
+  { re: /(?:^|[;&|\n])\s*(npm|pnpm|yarn|bun|deno)\s+(i|install|add|update|remove|uninstall|upgrade)\b/, why: "package manager install/remove" },
+  { re: /(?:^|[;&|\n])\s*(pip|pip3)\s+(install|uninstall|download)\b/, why: "pip install/remove" },
+  { re: /(?:^|[;&|\n])\s*(apt|apt-get|dnf|yum|zypper|brew)\s+(install|remove|uninstall|purge|update|upgrade)\b/, why: "system package manager" },
+  { re: /(?:^|[;&|\n])\s*(cargo|go)\s+(install|add)\b/, why: "language package manager" },
   { re: /\b(kill|pkill|killall|systemctl|service|reboot|shutdown|halt|poweroff|init|swapoff|mkswap)\b/, why: "process/system control" },
-  { re: /(^|[;&|]\s*)sudo\b/, why: "sudo" },
+  { re: /(?:^|[;&|\n])\s*sudo\b/, why: "sudo" },
   { re: /\s(>|>>|2>)\s*/, why: "output redirection writes a file" },
   { re: /\btee\s+-?a?\s+/, why: "tee writes to a file" }
 ];
 function bannedReason(command) {
   const c = command.trim();
   for (const { re, why } of PLAN_MODE_BANNED) {
-    if (re.test(`
-` + c + `
-`))
+    if (re.test(c))
       return why;
   }
   return null;
@@ -1560,15 +1588,16 @@ registerTool({
     if (res.stderr)
       output += res.stderr ? (output ? `
 ` : "") + res.stderr : "";
-    if (res.exitCode !== 0)
-      output += (output ? `
-` : "") + `[exit code: ${res.exitCode}]`;
     if (res.timedOut)
       output += (output ? `
 ` : "") + `[killed: timed out after ${timeout}ms]`;
     if (res.aborted)
       output += (output ? `
 ` : "") + "[killed: interrupted]";
+    if (!res.timedOut && !res.aborted && res.exitCode !== 0) {
+      output += (output ? `
+` : "") + `[exit code: ${res.exitCode}]`;
+    }
     if (!output)
       output = "(no output)";
     if (output.length > MAX_OUTPUT) {
@@ -1880,6 +1909,10 @@ registerTool({
   }
 });
 
+// src/tools/search.ts
+import { readdir, readFile, stat } from "node:fs/promises";
+import { join as join8 } from "node:path";
+
 // src/tools/glob.ts
 import { opendir } from "node:fs/promises";
 import { access } from "node:fs/promises";
@@ -2031,8 +2064,98 @@ async function globScan(pattern, opts) {
 
 // src/tools/search.ts
 var MAX_RESULTS = 50;
-var MAX_SCANNED = 2000;
+var MAX_SCANNED = 1e5;
+var MAX_FILE_BYTES = 4 * 1024 * 1024;
+var MAX_LINE_CHARS = 2000;
+var EXCLUDED_DIRS = new Set(["node_modules", ".git", ".hg", ".svn"]);
 var DEFAULT_TIMEOUT_MS = 60000;
+function globToRegExp(glob) {
+  let rx = "^";
+  for (let i = 0;i < glob.length; i++) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        rx += ".*";
+        i++;
+      } else {
+        rx += "[^/]*";
+      }
+    } else if (c === "?") {
+      rx += "[^/]";
+    } else {
+      rx += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(rx + "$");
+}
+async function scanDir(root2, pattern, includeRx, limit, deadline) {
+  const hits = [];
+  let scanned = 0;
+  let timedOut = false;
+  const walk = async (dir, rel) => {
+    if (hits.length >= limit || timedOut)
+      return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    for (const e of entries) {
+      if (hits.length >= limit || timedOut)
+        return;
+      if (EXCLUDED_DIRS.has(e.name))
+        continue;
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      const full = join8(dir, e.name);
+      if (e.isDirectory()) {
+        if (Date.now() >= deadline) {
+          timedOut = true;
+          return;
+        }
+        await walk(full, childRel);
+      } else if (e.isFile()) {
+        if (++scanned > MAX_SCANNED)
+          return;
+        if (!includeRx.test(e.name) && !includeRx.test(childRel))
+          continue;
+        let size;
+        try {
+          size = (await stat(full)).size;
+        } catch {
+          continue;
+        }
+        if (size > MAX_FILE_BYTES)
+          continue;
+        let content;
+        try {
+          content = await readFile(full, "utf8");
+        } catch {
+          continue;
+        }
+        if (content.includes("\x00"))
+          continue;
+        const lines = content.split(`
+`);
+        for (let i = 0;i < lines.length && hits.length < limit; i++) {
+          if (pattern.test(lines[i])) {
+            let text = lines[i];
+            if (text.length > MAX_LINE_CHARS)
+              text = text.slice(0, MAX_LINE_CHARS) + "…";
+            hits.push({ path: childRel, line: i + 1, text });
+          }
+        }
+        if (Date.now() >= deadline) {
+          timedOut = true;
+          return;
+        }
+      }
+    }
+  };
+  await walk(root2, "");
+  return { hits, timedOut };
+}
 registerTool({
   definition: {
     type: "function",
@@ -2089,46 +2212,44 @@ registerTool({
     }
   },
   async run(args, ctx) {
-    const pattern = String(args.pattern ?? "");
+    const patternText = String(args.pattern ?? "");
     const dir = args.path ? String(args.path) : ctx.cwd;
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
-    const res = await spawnCollect({
-      cmd: [
-        "grep",
-        "-rn",
-        "-E",
-        "-e",
-        pattern,
-        `--include=${include}`,
-        "--exclude-dir=node_modules",
-        "--exclude-dir=.git",
-        "--",
-        dir
-      ],
-      env: { ...process.env, NO_COLOR: "1" },
-      timeoutMs: timeout,
-      signal: ctx.signal
-    });
-    const lines = res.stdout.split(`
-`).filter(Boolean);
-    const shown = lines.slice(0, MAX_RESULTS);
-    let result = shown.join(`
+    let pattern;
+    try {
+      pattern = new RegExp(patternText);
+    } catch (err) {
+      return `ERROR: invalid search pattern: ${err?.message ?? String(err)}`;
+    }
+    let includeRx;
+    try {
+      includeRx = globToRegExp(include);
+    } catch (err) {
+      return `ERROR: invalid include pattern: ${err?.message ?? String(err)}`;
+    }
+    let rootInfo;
+    try {
+      rootInfo = await stat(dir);
+    } catch (err) {
+      return `ERROR: cannot search directory "${dir}": ${err?.message ?? String(err)}`;
+    }
+    if (!rootInfo.isDirectory())
+      return `ERROR: not a directory: ${dir}`;
+    const { hits, timedOut } = await scanDir(dir, pattern, includeRx, MAX_RESULTS + 1, Date.now() + timeout);
+    const shown = hits.slice(0, MAX_RESULTS);
+    let output = shown.map((h) => `${h.path}:${h.line}:${h.text}`).join(`
 `);
-    if (res.timedOut)
-      result += `
-[killed: timed out after ${timeout} ms]`;
-    else if (res.aborted)
-      result += `
-[aborted]`;
-    if (res.exitCode !== 0 && !lines.length)
-      result += res.stderr.trim() ? `ERROR: ${res.stderr.trim()}` : "";
-    if (!lines.length)
-      result = result.trim() || "(no matches)";
-    else if (lines.length > MAX_RESULTS)
-      result += `
-...(${lines.length - MAX_RESULTS} more)`;
-    return result;
+    if (timedOut)
+      output += (output ? `
+` : "") + `[killed: timed out after ${timeout} ms]`;
+    if (shown.length === 0) {
+      output = output.trim() || "(no matches)";
+    } else if (hits.length > shown.length) {
+      output += `
+...(${hits.length - shown.length} more)`;
+    }
+    return output;
   }
 });
 
@@ -2307,10 +2428,10 @@ function expandHome2(p) {
   if (p === "~")
     return homedir5();
   if (p.startsWith("~/"))
-    return join8(homedir5(), p.slice(2));
+    return join9(homedir5(), p.slice(2));
   return p;
 }
-var PID_FILE = join8(homedir5(), ".vibecoder", "queue-daemon.pid");
+var PID_FILE = join9(homedir5(), ".vibecoder", "queue-daemon.pid");
 function readPid() {
   try {
     const s = readFileSync6(PID_FILE, "utf8").trim();
@@ -2321,7 +2442,7 @@ function readPid() {
   }
 }
 function writePid() {
-  mkdirSync5(join8(homedir5(), ".vibecoder"), { recursive: true });
+  mkdirSync5(join9(homedir5(), ".vibecoder"), { recursive: true });
   writeFileSync4(PID_FILE, String(process.pid));
 }
 function removePid() {
@@ -2376,7 +2497,7 @@ async function main() {
     process.exit(1);
   });
   const rawLogFile = cfg.queue?.daemonLog;
-  const logFile = rawLogFile ? expandHome2(rawLogFile) : join8(homedir5(), ".vibecoder", "queue-daemon.log");
+  const logFile = rawLogFile ? expandHome2(rawLogFile) : join9(homedir5(), ".vibecoder", "queue-daemon.log");
   setQueueFileOverride(cfg.queue?.file);
   const onLog = logger(logFile);
   const onLogToConsole = (line) => {

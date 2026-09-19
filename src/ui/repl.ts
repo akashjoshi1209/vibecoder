@@ -6,6 +6,7 @@ import { enqueueTask, listTasks, setQueueFileOverride, type QueuedTask } from ".
 import { ensureOllamaServe } from "../ollama";
 import type { Message, ChatOptions, ChatChunk, StreamResult } from "../llm/types";
 import { runAgent } from "../agent/loop";
+import { PLAN_MODE_PROMPT, isPlanOutput, stripPlanEnvelope } from "../agent/plan-mode";
 import "../tools/bash";
 import "../tools/files";
 import "../tools/search";
@@ -58,6 +59,7 @@ let rootConfig: RootConfig | null = null;
 let router: ModelRouter | null = null;
 let routerMode: RoutingMode = "auto";
 let taskActive = false;
+let planMode = false;
 let connectivityPoller: ConnectivityPoller | null = null;
 let online = false;
 let nowDraining = false;
@@ -180,7 +182,7 @@ async function init() {
       if (tuiRef) {
         const rl = routeLabel();
         tuiRef.setStatus(
-          `${onlineStatus()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`,
+          `${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`,
           8,
         );
       }
@@ -213,12 +215,18 @@ async function init() {
     const n = parseInt(process.argv[stepsIdx + 1], 10);
     if (Number.isFinite(n) && n > 0) maxSteps = n;
   }
+
+  if (process.argv.includes("--plan")) planMode = true;
 }
 
 function onlineStatus(): string {
   if (online) return "";
   const off = router?.offlineIdentity();
   return off ? `offline (${off.provider}/${off.model}) · ` : "offline · ";
+}
+
+function planTag(): string {
+  return planMode ? "plan · " : "";
 }
 
 /** Queue a task that was given while offline. Draft a plan note with the local
@@ -280,7 +288,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   const setStatus = () => {
     if (tui) {
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
   };
 
@@ -294,6 +302,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/provider <name>${colors.reset}  switch provider (groq, ollama, openai, anthropic…)`);
     print(`  ${colors.green}/model <id>${colors.reset}       switch model`);
     print(`  ${colors.green}/route [auto|chat|heavy]${colors.reset} ${colors.dim}model routing: auto-classify, or force chat/heavy model${colors.reset}`);
+    print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}plan mode: investigate + return a plan, change nothing${colors.reset}`);
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
     print(`  ${colors.green}/save [name]${colors.reset}      save this conversation`);
     print(`  ${colors.green}/resume [name]${colors.reset}    resume a saved conversation (or the last one)`);
@@ -422,6 +431,23 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     } else {
       print(`${colors.red}usage: /route [auto|chat|heavy]${colors.reset}`);
     }
+    return true;
+  }
+  if (line === "/plan" || line.startsWith("/plan ")) {
+    const arg = line.slice(5).trim().toLowerCase();
+    if (arg === "on") planMode = true;
+    else if (arg === "off") planMode = false;
+    else if (!arg) planMode = !planMode;
+    else {
+      print(`${colors.red}usage: /plan [on|off]${colors.reset}`);
+      return true;
+    }
+    setStatus();
+    print(
+      planMode
+        ? `${colors.green}plan mode on${colors.reset} ${colors.dim}— read-only: the agent investigates and returns a plan; write_file, edit_file, and destructive bash are blocked${colors.reset}`
+        : `${colors.dim}plan mode off — the agent may execute changes again${colors.reset}`,
+    );
     return true;
   }
   if (line.startsWith("/approve")) {
@@ -603,13 +629,14 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     : null;
 
   try {
+    const turnSystemPrompt = planMode ? `${PLAN_MODE_PROMPT}\n\n${systemPrompt}` : systemPrompt;
     const result = await runAgent(
       {
         provider: turnProvider,
-        systemPrompt,
+        systemPrompt: turnSystemPrompt,
         model: turnModel,
         initialMessages: messages,
-        toolCtx: { cwd, signal: ac.signal },
+        toolCtx: { cwd, signal: ac.signal, planPhase: planMode },
         signal: ac.signal,
         chatOptions: {
           temperature: chatTemperature,
@@ -662,10 +689,16 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
       },
     );
 
-    messages.push({ role: "assistant", content: result.finalText });
+    const isPlan = planMode && isPlanOutput(result.finalText);
+    messages.push({ role: "assistant", content: isPlan ? stripPlanEnvelope(result.finalText) : result.finalText });
     if (result.aborted) taskActive = false;
     else taskActive = heavyRoute && result.toolCalls > 0;
     void aborted;
+    if (isPlan) {
+      const note = "plan ready — review it, then /plan off to let the agent execute (or paste it into a new prompt)";
+      if (tui) tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
+      else process.stdout.write(`\n${colors.dim}${note}${colors.reset}\n`);
+    }
   } catch (err: any) {
     const msg = err?.message ?? String(err);
     if (tui) tui.printToScrollback(`${colors.red}${msg}${colors.reset}`);
@@ -678,7 +711,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     if (tui) {
       tui.busy = false;
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     } else {
       process.stdout.write("\n");
     }
@@ -714,7 +747,7 @@ function mainTUI(): void {
 
   tui.start();
   const rl0 = routeLabel();
-  tui.setStatus(`${onlineStatus()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
+  tui.setStatus(`${onlineStatus()}${planTag()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
 }
 
 function mainLine(): void {
@@ -764,6 +797,7 @@ function printUsage(): void {
   console.log("  --provider <name>   pick provider (groq, ollama, openai, anthropic, nvidia…)");
   console.log("  --model <id>        pick model");
   console.log("  --resume [name]     resume last (or named) conversation");
+  console.log("  --plan              plan mode: investigate and return a plan without changing anything");
   console.log("  --max-steps <n>     cap the agent loop (default 40)");
   console.log("  --cwd <path>        work from another directory");
   console.log("  --version, -v       print version");

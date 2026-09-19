@@ -41,6 +41,24 @@ export function killProcessGroup(
   }
 }
 
+/**
+ * Kill the process group first (covers grandchildren such as a `sleep` spawned
+ * by the shell), then the child itself as a fallback for platforms where
+ * process groups are unavailable.
+ */
+export function killProcessTree(
+  child: { pid?: number; kill: (signal?: NodeJS.Signals) => boolean },
+  signal: NodeJS.Signals = "SIGKILL",
+): void {
+  if (child.pid === undefined || child.pid <= 0) return;
+  killProcessGroup(child, signal);
+  try {
+    child.kill(signal);
+  } catch {
+    // already gone
+  }
+}
+
 type SpawnedChild = { pid?: number; kill: (signal?: NodeJS.Signals) => boolean };
 
 export function killChildGroup(child: SpawnedChild, signal: NodeJS.Signals = "SIGKILL"): void {
@@ -66,11 +84,13 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
     let settled = false;
     let spawnError = "";
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let forceTimer: ReturnType<typeof setTimeout> | null = null;
 
     const settle = (exitCode: number) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       if (spawnError) {
         stderr = (stderr ? stderr + "\n" : "") + `spawn error: ${spawnError}`;
@@ -78,17 +98,40 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
       resolvePromise({ stdout, stderr, exitCode, timedOut, aborted });
     };
 
+    const forceSettle = (exitCode: number) => {
+      if (settled) return;
+      // Never leave the caller hanging: if the "close" event has not arrived
+      // after a kill (process group unsupported, a grandchild held a pipe,
+      // etc.), tear the child down and settle the promise ourselves.
+      killProcessTree(child);
+      try {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      } catch {
+        // streams may already be gone
+      }
+      settle(exitCode);
+    };
+
+    const armForceSettle = () => {
+      if (forceTimer) return;
+      forceTimer = setTimeout(() => forceSettle(-1), 150);
+    };
+
     if (opts.timeoutMs && opts.timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
         opts.onTimeout?.();
-        killProcessGroup(child);
+        killProcessTree(child);
+        armForceSettle();
       }, opts.timeoutMs);
     }
 
     const onAbort = () => {
+      if (settled) return;
       aborted = true;
-      killProcessGroup(child);
+      killProcessTree(child);
+      armForceSettle();
     };
     if (opts.signal?.aborted) onAbort();
     else opts.signal?.addEventListener("abort", onAbort, { once: true });

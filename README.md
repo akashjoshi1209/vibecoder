@@ -39,12 +39,13 @@ daemon, and offline Ollama all work. Feels like a native IDE on a phone.
 
 ### Desktop (Linux / macOS)
 
-Same one-liner above. Or, once the npm package is published, with your package
-manager:
+Same one-liner above. Or install the published npm package
+([`vibecoder-cli`](https://www.npmjs.com/package/vibecoder-cli)) — it ships the
+`vibecoder` command:
 
 ```bash
-npm install -g vibecoder     # requires Node ≥ 18.17
-bun add -g vibecoder         # if you prefer Bun
+npm install -g vibecoder-cli     # requires Node ≥ 18.17
+bun add -g vibecoder-cli         # if you prefer Bun
 ```
 
 Verify:

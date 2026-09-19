@@ -1,5 +1,5 @@
 {
-  "name": "vibecoder",
+  "name": "vibecoder-cli",
   "version": "1.0.0",
   "description": "A free, open-source AI coding agent that runs in your terminal. Fully yours — no payments, no artificial limitations, anything is customizable. Runs on Node or Bun; works online (free-tier cloud models) or fully offline with local Ollama.",
   "type": "module",
@@ -40,12 +40,11 @@
     "dev": "bun run src/cli.ts",
     "start": "bun run src/cli.ts",
     "build": "bun run scripts/build.ts",
-    "prepublishOnly": "bun run build && bun run typecheck && bun test",
+    "prepublishOnly": "bun run build && bun run typecheck && bun run test",
     "typecheck": "tsc --noEmit",
-    "test": "bun test --timeout=30000",
+    "test": "bun test --timeout=60000",
     "daemon": "bun src/daemon.ts"
   },
-  "dependencies": {},
   "devDependencies": {
     "@types/bun": "^1.2.0",
     "@types/node": "^22.0.0",

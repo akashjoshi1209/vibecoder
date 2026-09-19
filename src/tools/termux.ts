@@ -1,4 +1,5 @@
 import { registerTool, type ToolContext } from "./registry";
+import { spawnCollect } from "./proc";
 
 /**
  * Push a Termux notification. Useful for long-running agent tasks: the agent
@@ -27,31 +28,27 @@ registerTool({
     const message = String(args.message ?? title).slice(0, 500);
     if (!title) return "ERROR: title is required";
 
-    const proc = Bun.spawn({
-      cmd: [
-        "termux-notification",
-        "--title", title,
-        "--content", message,
-      ],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true,
+    const res = await spawnCollect({
+      cmd: ["termux-notification", "--title", title, "--content", message],
+      env: { ...process.env, NO_COLOR: "1" } as Record<string, string>,
+      timeoutMs: 30_000,
+      signal: ctx.signal,
     });
 
-    try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      let output = "";
-      if (stdout) output += stdout;
-      if (stderr) output += stderr ? (output ? "\n" : "") + stderr : "";
-      if (exitCode !== 0) output += (output ? "\n" : "") + `[exit code: ${exitCode}]`;
-      return output || `notification pushed: "${title}"`;
-    } catch (err: any) {
-      return `ERROR: termux-notification failed: ${err?.message ?? String(err)} (is termux-api installed? pkg install termux-api)`;
+    // A spawn error (exitCode -1) means the binary isn't installed.
+    if (res.exitCode < 0) {
+      return "ERROR: termux-notification failed: " + (res.stderr.trim() || "could not be spawned") +
+        " (is termux-api installed? pkg install termux-api)";
     }
+
+    let output = "";
+    if (res.stdout) output += res.stdout;
+    if (res.stderr) output += res.stderr ? (output ? "\n" : "") + res.stderr : "";
+    if (res.timedOut) output += (output ? "\n" : "") + "[killed: timed out]";
+    if (res.aborted) output += (output ? "\n" : "") + "[killed: interrupted]";
+    if (!res.timedOut && !res.aborted && res.exitCode !== 0) {
+      output += (output ? "\n" : "") + `[exit code: ${res.exitCode}]`;
+    }
+    return output || `notification pushed: "${title}"`;
   },
 });
