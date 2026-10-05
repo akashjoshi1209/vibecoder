@@ -546,7 +546,8 @@ var FALLBACK_CONFIG = {
   permissions: {
     destructive: "allow",
     network: "allow",
-    filesystem: "full"
+    filesystem: "full",
+    exposeSecrets: false
   },
   maxCostUsd: undefined
 };
@@ -607,10 +608,10 @@ function validateConfig(cfg) {
       if (typeof pc.apiKeyEnv !== "string") {
         errors.push(`providers."${name}".apiKeyEnv must be a string (can be empty for local providers like ollama)`);
       }
-      if (!Array.isArray(pc.models) || !pc.models.length) {
+      const models = pc.models;
+      if (!Array.isArray(models) || !models.length) {
         errors.push(`providers."${name}".models must be a non-empty array of model IDs`);
-      }
-      if (!pc.models.every((m) => typeof m === "string")) {
+      } else if (!models.every((m) => typeof m === "string")) {
         errors.push(`providers."${name}".models must all be strings`);
       }
     }
@@ -655,6 +656,9 @@ function validateConfig(cfg) {
       }
       if (p.filesystem !== undefined && !["workspace", "full"].includes(p.filesystem)) {
         errors.push('config.permissions.filesystem must be "workspace" or "full"');
+      }
+      if (p.exposeSecrets !== undefined && typeof p.exposeSecrets !== "boolean") {
+        errors.push("config.permissions.exposeSecrets must be true or false");
       }
     }
   }
@@ -1019,7 +1023,12 @@ function createConnectivityPoller(opts, onChange) {
 // src/tools/registry.ts
 var registry = new Map;
 function registerTool(tool) {
-  registry.set(tool.definition.function.name, tool);
+  const name = tool.definition.function.name;
+  const prior = registry.get(name);
+  if (prior) {
+    throw new Error(`Duplicate tool name "${name}". Refusing to overwrite an already-registered tool. ` + `Rename one of them, or make sure the old module is no longer imported.`);
+  }
+  registry.set(name, tool);
 }
 function listTools() {
   return [...registry.values()].map((t) => t.definition);
@@ -1582,7 +1591,7 @@ function markTaskRetry(id, attempts) {
   const now = Date.now();
   const backoffMs = Math.min(300000, 30000 * Math.pow(2, attempts - 1));
   return withLock(() => update(id, {
-    status: "queued",
+    status: "failed",
     runnerPid: undefined,
     error: undefined,
     attempts,
@@ -1686,6 +1695,7 @@ function resolveCommand(cmd) {
       return cmd;
     }
   }
+  return cmd;
 }
 function join22(a, b) {
   if (a.endsWith("/") || a.endsWith("\\"))
@@ -1755,96 +1765,686 @@ function spawnCollect(opts) {
 }
 
 // src/permissions.ts
-import { join as join5 } from "node:path";
+import { isAbsolute, join as join5, resolve, dirname as dirname4, basename } from "node:path";
+import { realpathSync } from "node:fs";
 import { homedir as homedir4 } from "node:os";
+function resolvePermissions(config, workspaceRoot) {
+  const p = config.permissions ?? {};
+  return {
+    destructive: p.destructive ?? "allow",
+    network: p.network ?? "allow",
+    filesystem: p.filesystem ?? "full",
+    workspaceRoot,
+    exposeSecrets: p.exposeSecrets ?? false
+  };
+}
 function isPathAllowed(path, perms) {
   if (perms.filesystem === "full")
     return true;
   const resolved = resolvePath(path);
   const root = resolvePath(perms.workspaceRoot);
-  return resolved.startsWith(root + "/") || resolved === root;
+  if (resolved === root)
+    return true;
+  const sep = process.platform === "win32" ? "\\" : "/";
+  const norm = (p) => {
+    const n = p.replace(/[\\/]+/g, sep);
+    const folded = process.platform === "win32" ? n.toLowerCase() : n;
+    return folded.length > 1 && folded.endsWith(sep) ? folded.slice(0, -1) : folded;
+  };
+  const nr = norm(resolved);
+  const nroot = norm(root);
+  return nr.startsWith(nroot + sep);
 }
-function checkDestructiveCommand(command, perms) {
-  if (perms.destructive === "allow")
-    return null;
-  const c = command.trim();
-  const segments = c.split(/([;&|]|&&|\|\|)/).map((s) => s.trim()).filter(Boolean);
-  for (const seg of segments) {
-    const reason = checkSingleSegment(seg);
-    if (reason) {
-      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): ${reason}` : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
+var NESTING_SHELLS = new Set(["sh", "bash", "zsh", "ksh", "dash", "fish", "busybox", "env", "sudo", "doas", "nohup", "timeout", "xargs", "watch", "stdbuf", "nice", "command", "builtin", "eval"]);
+function readParen(src, open) {
+  let depth = 0;
+  let quote = null;
+  for (let i = open;i < src.length; i++) {
+    const c = src[i];
+    if (quote) {
+      if (c === "\\" && quote === '"') {
+        i++;
+        continue;
+      }
+      if (c === quote)
+        quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      continue;
+    }
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "(")
+      depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0)
+        return { body: src.slice(open + 1, i), end: i + 1 };
     }
   }
   return null;
 }
-function checkSingleSegment(seg) {
-  const destructiveFileOps = [
-    { re: /^(rm|rmdir)\s/, why: "file/directory removal (rm/rmdir)" },
-    { re: /^\s*dd\s/, why: "low-level data copying (dd)" },
-    { re: /^(mkfs|mkswap)\s/, why: "filesystem creation/destruction (mkfs/mkswap)" },
-    { re: /^(truncate|fdisk|parted)\s/, why: "disk/partition manipulation" },
-    { re: /\b(kill|pkill|killall|systemctl|reboot|shutdown|halt|poweroff)\b/, why: "process/system control" },
-    { re: /\b(sudo|doas)\b/, why: "privilege escalation (sudo/doas)" }
-  ];
-  for (const { re, why } of destructiveFileOps) {
-    if (re.test(seg))
+function extractNested(src, depth, acc) {
+  if (depth > 6)
+    return src;
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "`") {
+      const close = src.indexOf("`", i + 1);
+      if (close > 0) {
+        acc.push(src.slice(i + 1, close));
+        out += " ";
+        i = close + 1;
+        continue;
+      }
+    }
+    if ((c === "$" || c === "<" || c === ">") && src[i + 1] === "(") {
+      const got = readParen(src, i + 1);
+      if (got) {
+        acc.push(got.body);
+        out += " ";
+        i = got.end;
+        continue;
+      }
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+function splitSegments(src) {
+  const segs = [];
+  let cur = "";
+  let quote = null;
+  for (let i = 0;i < src.length; i++) {
+    const c = src[i];
+    if (quote) {
+      cur += c;
+      if (c === "\\" && quote === '"') {
+        cur += src[++i] ?? "";
+        continue;
+      }
+      if (c === quote)
+        quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      cur += c;
+      continue;
+    }
+    if (c === "\\") {
+      cur += c + (src[++i] ?? "");
+      continue;
+    }
+    if (c === `
+` || c === ";" || c === "|") {
+      if (cur.trim())
+        segs.push(cur);
+      cur = "";
+      continue;
+    }
+    if (c === "&") {
+      if (cur.trim())
+        segs.push(cur);
+      cur = "";
+      if (src[i + 1] === "&")
+        i++;
+      continue;
+    }
+    cur += c;
+  }
+  if (cur.trim())
+    segs.push(cur);
+  return segs;
+}
+function tokenize(seg) {
+  const tokens = [];
+  let cur = "";
+  let quote = null;
+  let has = false;
+  for (let i = 0;i < seg.length; i++) {
+    const c = seg[i];
+    if (quote) {
+      if (c === "\\" && quote === '"') {
+        cur += seg[++i] ?? "";
+        has = true;
+        continue;
+      }
+      if (c === quote) {
+        quote = null;
+        continue;
+      }
+      cur += c;
+      continue;
+    }
+    if (c === "'" || c === '"') {
+      quote = c;
+      has = true;
+      continue;
+    }
+    if (c === "\\") {
+      cur += seg[++i] ?? "";
+      has = true;
+      continue;
+    }
+    if (c === "#" && !has)
+      break;
+    if (/\s/.test(c)) {
+      if (has || cur) {
+        tokens.push(cur);
+        cur = "";
+        has = false;
+      }
+      continue;
+    }
+    cur += c;
+    has = true;
+  }
+  if (has || cur)
+    tokens.push(cur);
+  return tokens;
+}
+function stripAssignments(argv) {
+  let i = 0;
+  while (i < argv.length && /^[A-Za-z_][A-Za-z0-9_]*(\+)?=/.test(argv[i]))
+    i++;
+  return argv.slice(i);
+}
+function expandVars(argv, vars) {
+  if (!vars.size)
+    return argv;
+  return argv.map((tok) => {
+    if (!tok.includes("$"))
+      return tok;
+    return tok.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (whole, name) => vars.has(name) ? vars.get(name) : whole);
+  });
+}
+function stripQuotes(v) {
+  const t = v.trim();
+  if (t.length > 1 && (t.startsWith('"') && t.endsWith('"') || t.startsWith("'") && t.endsWith("'"))) {
+    return t.slice(1, -1);
+  }
+  return t;
+}
+function commandName(word) {
+  let w = word;
+  if (/[\\/]/.test(w))
+    w = w.split(/[\\/]/).pop() ?? w;
+  return w.replace(/\.(exe|cmd|bat|com|ps1)$/i, "").toLowerCase();
+}
+var DESTRUCTIVE_FLAGS = {
+  git: [
+    { flags: /\b(clean)\b[\s\S]*\s-[a-z]*[fd]/, why: "git clean removing untracked files" },
+    { flags: /\breset\b[\s\S]*--hard/, why: "git reset --hard discarding committed work" },
+    { flags: /\bcheckout\b[\s\S]*\s--\s/, why: "git checkout -- discarding working-tree changes" },
+    { flags: /\brestore\b/, why: "git restore overwriting working-tree files" },
+    { flags: /\bpush\b[\s\S]*\s--force(?!-with-lease)/, why: "git push --force rewriting remote history" },
+    { flags: /\bremote\b[\s\S]*\bset-url\b/, why: "git remote set-url repointing the remote" },
+    { flags: /\bbranch\b[\s\S]*\s-D\b/, why: "git branch -D force-deleting a branch" }
+  ],
+  find: [
+    { flags: /\s-(delete|exec|execdir|ok)\b/, why: "find deleting or executing on matches" }
+  ],
+  chmod: [{ flags: /\s-R\b/, why: "recursive chmod" }],
+  chown: [{ flags: /\s-R\b/, why: "recursive chown" }],
+  dd: [{ flags: /\bof=/, why: "dd writing raw data to a device or file" }],
+  powershell: [
+    { flags: /\b(Remove-Item|Remove-ItemProperty|Clear-Content|rd|rm|del|erase)\b/i, why: "PowerShell file/directory removal" },
+    { flags: /\b(Format-Volume|Clear-Disk|Initialize-Disk|Remove-Partition)\b/i, why: "disk/volume destruction" },
+    { flags: /\bStop-Process|Stop-Service|Restart-Computer|Stop-Computer\b/i, why: "process/system control" }
+  ],
+  pwsh: [
+    { flags: /\b(Remove-Item|Clear-Content|rd|rm|del|erase)\b/i, why: "PowerShell file/directory removal" },
+    { flags: /\bStop-Process|Stop-Service|Restart-Computer|Stop-Computer\b/i, why: "process/system control" }
+  ],
+  cmd: [
+    { flags: /\b(rd|rmdir)\b[\s\S]*\/s/i, why: "recursive directory removal" }
+  ],
+  registry: [{ flags: /\b(delete|remove)\b/i, why: "registry deletion" }],
+  cipher: [{ flags: /\s\/w\b/, why: "cipher wiping free space" }],
+  diskpart: [{ flags: /\bclean\b/, why: "diskpart clean erasing a disk" }]
+};
+var DESTRUCTIVE_CMDS = {
+  rm: "file/directory removal (rm)",
+  rmdir: "directory removal (rmdir)",
+  unlink: "file removal (unlink)",
+  shred: "secure file overwrite (shred)",
+  srm: "secure file removal (srm)",
+  dd: "low-level data copying (dd)",
+  mkfs: "filesystem creation (mkfs)",
+  mkswap: "swap creation (mkswap)",
+  fdisk: "partition table manipulation (fdisk)",
+  parted: "partition manipulation (parted)",
+  truncate: "file truncation (truncate)",
+  kill: "process termination (kill)",
+  pkill: "process termination (pkill)",
+  killall: "process termination (killall)",
+  taskkill: "process termination (taskkill)",
+  systemctl: "systemd service control (systemctl)",
+  service: "service control (service)",
+  reboot: "system reboot",
+  shutdown: "system shutdown",
+  halt: "system halt",
+  poweroff: "system poweroff",
+  init: "system init control",
+  del: "file removal (del)",
+  erase: "file removal (erase)",
+  rd: "recursive directory removal (rd)",
+  format: "filesystem format (format)",
+  cipher: "file/disk wiping (cipher)",
+  bcdedit: "boot configuration edit (bcdedit)",
+  diskpart: "disk partitioning (diskpart)"
+};
+var NETWORK_CMDS = {
+  curl: "network client (curl)",
+  wget: "network client (wget)",
+  nc: "network client (nc)",
+  ncat: "network client (ncat)",
+  netcat: "network client (netcat)",
+  socat: "network client (socat)",
+  telnet: "network client (telnet)",
+  ssh: "remote shell (ssh)",
+  scp: "remote copy (scp)",
+  sftp: "remote file transfer (sftp)",
+  rsync: "remote sync (rsync)",
+  ftp: "file transfer (ftp)",
+  tftp: "file transfer (tftp)",
+  aria2c: "download client (aria2c)",
+  http: "HTTP client (http)",
+  httpie: "HTTP client (http)",
+  xh: "HTTP client (xh)",
+  dig: "DNS lookup (dig)",
+  nslookup: "DNS lookup (nslookup)",
+  host: "DNS lookup (host)",
+  ping: "network probe (ping)",
+  traceroute: "network trace (traceroute)",
+  mtr: "network trace (mtr)",
+  whois: "whois lookup (whois)",
+  arp: "ARP inspection (arp)",
+  nmap: "port scanner (nmap)",
+  openssl: "TLS client (openssl s_client)",
+  "ssh-keyscan": "host key scan (ssh-keyscan)",
+  bitsadmin: "BITS transfer (bitsadmin)",
+  certutil: "certutil download/URL fetch"
+};
+var NETWORK_CMDFLAGS = {
+  git: [{ flags: /\b(clone|fetch|pull|push|submodule|remote)\b/, why: "git network operation" }],
+  powershell: [
+    { flags: /\b(Invoke-WebRequest|Invoke-RestMethod|iwr|irm|Start-BitsTransfer|Net\.WebClient|System\.Net\.Http)\b/i, why: "PowerShell web request" }
+  ],
+  pwsh: [
+    { flags: /\b(Invoke-WebRequest|Invoke-RestMethod|iwr|irm|Start-BitsTransfer|Net\.WebClient|System\.Net\.Http)\b/i, why: "PowerShell web request" }
+  ]
+};
+var NETWORK_INTERPRETERS = {
+  python: "python",
+  python3: "python",
+  py: "python",
+  node: "node",
+  deno: "deno",
+  bun: "bun",
+  perl: "perl",
+  ruby: "ruby",
+  php: "php",
+  lua: "lua",
+  osascript: "osascript",
+  curl_: "curl"
+};
+var INLINE_EVAL_FLAGS = /^(-[a-z]*[ce]|--eval|--execute|-Command|-EncodedCommand|-c)$/i;
+var HELP_FLAGS = new Set([
+  "-h",
+  "--help",
+  "-help",
+  "/?",
+  "/h",
+  "-v",
+  "--version",
+  "--usage"
+]);
+function isHelpInvocation(cmd) {
+  return cmd.argv.slice(1).some((a) => HELP_FLAGS.has(a.toLowerCase()));
+}
+function destructiveReasonFor(cmd) {
+  const name = commandName(cmd.argv[0] ?? "");
+  if (!name)
+    return null;
+  if (isHelpInvocation(cmd))
+    return null;
+  const base = DESTRUCTIVE_CMDS[name];
+  if (base)
+    return base;
+  if (name.startsWith("mkfs."))
+    return `filesystem creation (${name})`;
+  for (const { flags, why } of DESTRUCTIVE_FLAGS[name] ?? []) {
+    if (flags.test(cmd.raw))
       return why;
   }
-  if (/\s[>|]\s*\S/.test(seg) || /\s>>\s*\S/.test(seg)) {
-    const redirectTarget = seg.match(/[>|]\s*(\S+)/);
-    if (redirectTarget) {
-      const target = redirectTarget[1];
-      if (target === "/dev/null" || target.startsWith("/tmp/") || target.startsWith("/var/tmp/"))
-        return null;
+  if (name === "find") {
+    const ex = cmd.argv.findIndex((a) => a === "-exec" || a === "-execdir" || a === "-ok");
+    if (ex >= 0) {
+      const inner = stripAssignments(cmd.argv.slice(ex + 1)).map(commandName);
+      const innerName = inner[0] ?? "";
+      if (DESTRUCTIVE_CMDS[innerName])
+        return `find -exec ${innerName} (${DESTRUCTIVE_CMDS[innerName]})`;
     }
-    return "output redirection (may overwrite files)";
+  }
+  if (name === "powershell" || name === "pwsh") {
+    const joined = cmd.argv.join(" ");
+    if (/\b(Remove-Item|Clear-Content|rd\s|rm\s|del\s|erase\s|Stop-Process|Stop-Service|Format-Volume)\b/i.test(joined)) {
+      return "PowerShell destructive cmdlet";
+    }
+  }
+  return null;
+}
+function networkReasonFor(cmd) {
+  const name = commandName(cmd.argv[0] ?? "");
+  if (!name)
+    return null;
+  const base = NETWORK_CMDS[name];
+  if (base)
+    return base;
+  for (const { flags, why } of NETWORK_CMDFLAGS[name] ?? []) {
+    if (flags.test(cmd.raw))
+      return why;
+  }
+  if (NETWORK_INTERPRETERS[name]) {
+    const inline = cmd.argv.slice(1).find((a) => INLINE_EVAL_FLAGS.test(a));
+    if (inline)
+      return `${NETWORK_INTERPRETERS[name]} inline code (${inline}) can open network connections`;
+  }
+  if (/\b(Invoke-WebRequest|Invoke-RestMethod|Start-BitsTransfer)\b/i.test(cmd.raw)) {
+    return "PowerShell web request";
+  }
+  return null;
+}
+function parseCommands(command, depth = 0) {
+  if (depth > 8)
+    return [];
+  const vars = new Map;
+  const nested = [];
+  const stripped = extractNested(command, depth, nested);
+  const out = [];
+  for (const body of nested)
+    out.push(...parseCommands(body, depth + 1));
+  for (const seg of splitSegments(stripped)) {
+    const argv = tokenize(seg);
+    if (!argv.length)
+      continue;
+    for (const tok of argv) {
+      const m = tok.match(/^([A-Za-z_][A-Za-z0-9_]*)(\+)?=([\s\S]*)$/);
+      if (m)
+        vars.set(m[1], stripQuotes(m[3]));
+    }
+    const effective = stripAssignments(argv);
+    if (!effective.length)
+      continue;
+    out.push({ argv: expandVars(effective, vars), raw: seg });
+    const name = commandName(effective[0]);
+    if (!name)
+      continue;
+    if (NESTING_SHELLS.has(name)) {
+      const rest = effective.slice(1);
+      if (name === "xargs") {
+        const inner = rest.filter((a, i) => i === 0 ? !a.startsWith("-") : !/^[{}]$/.test(a));
+        if (inner.length)
+          out.push(...parseCommands(inner.join(" "), depth + 1));
+      } else if (name === "env" || name === "nohup" || name === "stdbuf" || name === "nice" || name === "timeout" || name === "watch" || name === "command" || name === "builtin") {
+        const inner = stripAssignments(rest.filter((a) => !/^-/.test(a) || /^-[A-Za-z_]+=/.test(a)));
+        if (inner.length)
+          out.push(...parseCommands(inner.join(" "), depth + 1));
+      } else {
+        const ci = rest.findIndex((a) => a === "-c" || a === "--login" || a === "-lc" || a === "-lic");
+        if (ci >= 0 && rest[ci + 1])
+          out.push(...parseCommands(rest[ci + 1], depth + 1));
+        else if (rest.length && !rest[0].startsWith("-")) {
+          out.push(...parseCommands(rest.join(" "), depth + 1));
+        }
+      }
+    }
+  }
+  return out;
+}
+function checkDestructiveCommand(command, perms) {
+  if (perms.destructive === "allow")
+    return null;
+  for (const cmd of parseCommands(command)) {
+    const reason = destructiveReasonFor(cmd);
+    if (reason) {
+      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): ${reason}` : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
+    }
+    if (/(^|[^0-9<>])>{1,2}|\d>&/.test(cmd.raw)) {
+      const target = cmd.raw.match(/>{1,2}\s*"?([^\s"';|&]+)"?/);
+      const t = target?.[1] ?? "";
+      const isScratch = t === "/dev/null" || t === "/dev/stdout" || t === "NUL" || t.startsWith("/tmp/") || t.startsWith("/var/tmp/") || t.startsWith("C:/Windows/Temp/") || t.startsWith("C:\\Windows\\Temp\\");
+      if (!isScratch)
+        return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): output redirection (may overwrite files)` : `PENDING (${perms.destructive}): output redirection (may overwrite files) — awaiting approval`;
+    }
+    if (commandName(cmd.argv[0] ?? "") === "tee") {
+      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): tee writes to a file` : `PENDING (${perms.destructive}): tee writes to a file — awaiting approval`;
+    }
   }
   return null;
 }
 function checkNetworkCommand(command, perms) {
   if (perms.network === "allow")
     return null;
-  const c = command.trim();
-  const networkCommands = [
-    { re: /\b(curl|wget|fetch|nc|ncat|netcat|telnet|scp|ssh|rsync)\b/, why: "network client (curl/wget/ssh/etc.)" },
-    { re: /\b(dig|nslookup|host|ping|traceroute|mtr)\b/, why: "network diagnostic" },
-    { re: /\b(sock|netstat|lsof\s+-i)\b/, why: "network inspection" }
-  ];
-  for (const { re, why } of networkCommands) {
-    if (re.test(c))
-      return `BLOCKED (${perms.network}): ${why}`;
+  const cmds = parseCommands(command);
+  for (const cmd of cmds) {
+    const reason = networkReasonFor(cmd);
+    if (reason)
+      return `BLOCKED (${perms.network}): ${reason}`;
+  }
+  for (const cmd of cmds) {
+    const squashed = (cmd.argv[0] ?? "").replace(/[\s${}()]/g, "").toLowerCase();
+    if (squashed && NETWORK_CMDS[squashed]) {
+      return `BLOCKED (${perms.network}): ${NETWORK_CMDS[squashed]} (obfuscated invocation)`;
+    }
+  }
+  if (/\$\{?IFS\}?/.test(command)) {
+    for (const cmd of cmds) {
+      if (/\b(curl|wget|nc|ncat|ssh|scp|ftp|telnet|git|python3?|node|openssl)\b/i.test(cmd.raw)) {
+        return `BLOCKED (${perms.network}): IFS-expanded network invocation`;
+      }
+    }
   }
   return null;
 }
 function resolvePath(p) {
-  if (p.startsWith("~"))
-    return join5(homedir4(), p.slice(1));
-  if (p.startsWith("/"))
-    return p;
-  return join5(process.cwd(), p);
+  let expanded = p;
+  if (expanded === "~")
+    expanded = homedir4();
+  else if (expanded.startsWith("~/") || expanded.startsWith("~\\")) {
+    expanded = join5(homedir4(), expanded.slice(2));
+  }
+  if (!isAbsolute(expanded))
+    expanded = join5(process.cwd(), expanded);
+  return realPath(resolve(expanded));
+}
+function realPath(abs) {
+  const tail = [];
+  let current = abs;
+  for (let i = 0;i < 64; i++) {
+    try {
+      const real = realpathSync.native(current);
+      return tail.length ? join5(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = dirname4(current);
+      if (parent === current)
+        return abs;
+      tail.push(basename(current));
+      current = parent;
+    }
+  }
+  return abs;
+}
+var SECRET_NAME = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|ACCESS_KEY|PRIVATE_KEY|SESSION|COOKIE|AUTH)/i;
+function filterEnv(env, perms) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined)
+      continue;
+    if (perms?.exposeSecrets) {
+      out[k] = v;
+      continue;
+    }
+    if (SECRET_NAME.test(k) && !k.startsWith("VIBECODER_"))
+      continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 // src/tools/bash.ts
 var MAX_OUTPUT = 30000;
-var PLAN_MODE_BANNED = [
-  { re: /(^|[;&|]\s*)(rm|rmdir|mv|dd|mkfs(\.[a-z0-9]+)?|truncate|fdisk|parted|mkfs)\s/, why: "file/directory-destroying command" },
-  { re: /(^|[;&|]\s*)git\s+(reset\s+--hard|clean\s+-(f|d|fd)|checkout\s+\S+\s+--?[^;]*|push\b|remote\s+set-url|branch\s+-D|stash\s+drop|rebase\b|merge\b|cherry-pick\b)/, why: "git state mutation" },
-  { re: /(^|[;&|]\s*)(npm|pnpm|yarn|bun|deno)\s+(i|install|add|update|remove|uninstall|upgrade)\b/, why: "package manager install/remove" },
-  { re: /(^|[;&|]\s*)(pip|pip3)\s+(install|uninstall|download)\b/, why: "pip install/remove" },
-  { re: /(^|[;&|]\s*)(apt|apt-get|dnf|yum|zypper|brew)\s+(install|remove|uninstall|purge|update|upgrade)\b/, why: "system package manager" },
-  { re: /(^|[;&|]\s*)(cargo|go)\s+(install|add)\b/, why: "language package manager" },
-  { re: /\b(kill|pkill|killall|systemctl|service|reboot|shutdown|halt|poweroff|init|swapoff|mkswap)\b/, why: "process/system control" },
-  { re: /(^|[;&|]\s*)sudo\b/, why: "sudo" },
-  { re: /\s(>|>>|2>)\s*/, why: "output redirection writes a file" },
-  { re: /\btee\s+-?a?s+\s+/, why: "tee writes to a file" }
-];
-function bannedReason(command) {
-  const c = command.trim();
-  for (const { re, why } of PLAN_MODE_BANNED) {
-    if (re.test(`
-` + c + `
-`))
+var PLAN_MODE_BANNED = {
+  rm: "file/directory-destroying command",
+  rmdir: "directory removal",
+  del: "file removal (del)",
+  erase: "file removal (erase)",
+  rd: "directory removal (rd)",
+  shred: "secure file overwrite",
+  mv: "moving/overwriting files",
+  dd: "low-level data copying (dd)",
+  mkfs: "filesystem creation",
+  truncate: "file truncation",
+  fdisk: "partition manipulation",
+  parted: "partition manipulation",
+  npm: "package manager",
+  pnpm: "package manager",
+  yarn: "package manager",
+  bun: "runtime/package manager",
+  deno: "runtime/package manager",
+  pip: "pip install/remove",
+  pip3: "pip install/remove",
+  apt: "system package manager",
+  "apt-get": "system package manager",
+  dnf: "system package manager",
+  yum: "system package manager",
+  zypper: "system package manager",
+  brew: "system package manager",
+  cargo: "language package manager",
+  go: "language package manager",
+  kill: "process termination",
+  pkill: "process termination",
+  killall: "process termination",
+  taskkill: "process termination",
+  systemctl: "process/system control",
+  service: "process/system control",
+  reboot: "process/system control",
+  shutdown: "process/system control",
+  halt: "process/system control",
+  poweroff: "process/system control",
+  sudo: "sudo",
+  doas: "privilege escalation",
+  git: "git state mutation",
+  gh: "GitHub CLI mutation"
+};
+var PLAN_MODE_GIT_ALLOWED = new Set([
+  "status",
+  "log",
+  "diff",
+  "show",
+  "branch",
+  "remote",
+  "tag",
+  "blame",
+  "rev-parse",
+  "ls-files",
+  "describe",
+  "shortlog",
+  "config",
+  "stash"
+]);
+var PLAN_MODE_GIT_READONLY = new Set([
+  "status",
+  "log",
+  "diff",
+  "show",
+  "blame",
+  "rev-parse",
+  "ls-files",
+  "describe"
+]);
+var HELP_FLAGS2 = new Set(["-h", "--help", "-help", "/?", "/h", "-v", "--version"]);
+function findIsDestructive(argv) {
+  for (const a of argv) {
+    if (a === "-delete" || a === "-exec" || a === "-execdir" || a === "-ok" || a === "-okdir")
+      return true;
+  }
+  return false;
+}
+function planBannedReason(command) {
+  for (const cmd of parseCommands(command)) {
+    const name = (cmd.argv[0] ?? "").toLowerCase().replace(/\.(exe|cmd|bat)$/, "");
+    if (cmd.argv.slice(1).some((a) => HELP_FLAGS2.has(a.toLowerCase())))
+      continue;
+    if (name === "find") {
+      if (findIsDestructive(cmd.argv))
+        return "find deleting or executing on matches";
+      continue;
+    }
+    const why = PLAN_MODE_BANNED[name];
+    if (!why)
+      continue;
+    if (name === "git") {
+      const sub = (cmd.argv[1] ?? "").toLowerCase();
+      if (PLAN_MODE_GIT_READONLY.has(sub))
+        continue;
+      if ((sub === "branch" || sub === "remote" || sub === "tag") && !cmd.argv.slice(2).some((a) => /^-/.test(a) && !/^(--list|-l|-v|-a|--get|get)$/i.test(a))) {
+        continue;
+      }
+      if (sub === "stash" && (cmd.argv[2] ?? "") === "list")
+        continue;
+      if (sub === "config" && (cmd.argv[2] ?? "") === "--get")
+        continue;
+      return `git ${sub || "state mutation"}`;
+    }
+    if (name === "bun" || name === "go") {
+      const sub = (cmd.argv[1] ?? "").toLowerCase();
+      if (sub === "test" || sub === "build" || sub === "run" || sub === "vet")
+        continue;
+    }
+    if (name === "cargo") {
+      if (["test", "build", "check", "clippy"].includes((cmd.argv[1] ?? "").toLowerCase()))
+        continue;
+    }
+    if (name === "python" || name === "python3" || name === "py" || name === "node") {
+      continue;
+    }
+    if (name === "mv") {
       return why;
+    }
+    return why;
+  }
+  for (const cmd of parseCommands(command)) {
+    if (/(^|[^0-9<>])>{1,2}|\d>&/.test(cmd.raw)) {
+      const t = cmd.raw.match(/>{1,2}\s*"?([^\s"';|&]+)"?/)?.[1] ?? "";
+      if (t !== "/dev/null" && t !== "NUL" && !t.startsWith("/tmp/") && !t.startsWith("/var/tmp/")) {
+        return "output redirection writes a file";
+      }
+    }
+    if ((cmd.argv[0] ?? "").toLowerCase() === "tee")
+      return "tee writes to a file";
+  }
+  return null;
+}
+function bannedReason(command) {
+  return planBannedReason(command);
+}
+var SECRET_FILE = /(^|[\s"'=/\\])\.env(\.[A-Za-z0-9_-]+)?($|[\s"';|&])/;
+function secretFileInvolved(command) {
+  for (const cmd of parseCommands(command)) {
+    for (const tok of cmd.argv) {
+      if (SECRET_FILE.test(tok))
+        return tok.replace(/["']/g, "");
+    }
   }
   return null;
 }
@@ -1869,9 +2469,15 @@ registerTool({
     const permissions = ctx.permissions;
     const command = String(args.command ?? "");
     if (ctx.planPhase) {
-      const why = bannedReason(command);
+      const why = planBannedReason(command);
       if (why)
         return `BLOCKED IN PLAN MODE (read-only): ${why}. Use read-only commands (ls, grep, cat, git status/diff/log, running tests) to investigate, and describe any changes you would make in your PLAN instead.`;
+    }
+    if (!permissions?.exposeSecrets) {
+      const secret = secretFileInvolved(command);
+      if (secret) {
+        return `BLOCKED: refusing to read ${secret} through bash — it holds live credentials. Use env_get("<KEY>") to read a single value (it masks), or run with --expose-secrets if you truly need the raw file.`;
+      }
     }
     if (permissions) {
       const destructiveCheck = checkDestructiveCommand(command, permissions);
@@ -1899,7 +2505,7 @@ registerTool({
       res = await spawnCollect({
         cmd: ["bash", "-lc", command],
         cwd,
-        env: { ...process.env, NO_COLOR: "1" },
+        env: { ...filterEnv(process.env, permissions), NO_COLOR: "1" },
         timeoutMs: timeout,
         signal: ctx.signal
       });
@@ -1936,14 +2542,23 @@ registerTool({
 
 // src/tools/fs-utils.ts
 import * as path from "path";
-function resolve2(p, ctx) {
-  if (p.startsWith("/"))
+function resolve3(p, ctx) {
+  if (path.isAbsolute(p))
     return path.resolve(p);
   return path.resolve(ctx.cwd, p);
 }
+function pathDenied(p, ctx) {
+  const perms = ctx.permissions;
+  if (!perms)
+    return null;
+  const abs = resolve3(p, ctx);
+  if (isPathAllowed(abs, perms))
+    return null;
+  return `BLOCKED: ${abs} is outside the allowed workspace (${perms.workspaceRoot}). Set permissions.filesystem to "full" to allow it.`;
+}
 
 // src/tools/files.ts
-import { dirname as dirname5, join as join7 } from "node:path";
+import { dirname as dirname6, join as join7 } from "node:path";
 import { mkdirSync as mkdirSync4, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
 import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
 
@@ -1951,18 +2566,18 @@ import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync5, appendFileSync, readdirSync, writeFileSync as writeFileSync3 } from "node:fs";
 import { homedir as homedir5 } from "node:os";
-import { join as join6, resolve as resolve3, dirname as dirname4 } from "node:path";
+import { join as join6, resolve as resolve4, dirname as dirname5 } from "node:path";
 var LEDGER_NAME = "SELF_EDITS.jsonl";
 function repoRoot() {
   const env = process.env.VIBECODER_REPO_ROOT;
   if (env)
-    return resolve3(env);
-  return dirname4(packageRoot());
+    return resolve4(env);
+  return dirname5(packageRoot());
 }
 function installMode() {
   if (process.env.VIBECODER_REPO_ROOT)
     return "repo";
-  const root = dirname4(packageRoot());
+  const root = dirname5(packageRoot());
   if (existsSync6(join6(root, ".git")) || existsSync6(join6(packageRoot(), ".git")))
     return "repo";
   return "user";
@@ -1991,17 +2606,17 @@ function backupsDir() {
   return join6(userDataRoot(), "backups");
 }
 function isSameFile(a, b) {
-  return resolve3(a) === resolve3(b);
+  return resolve4(a) === resolve4(b);
 }
 function reposWhere() {
   if (process.env.VIBECODER_REPO_ROOT) {
-    const root = resolve3(process.env.VIBECODER_REPO_ROOT);
+    const root = resolve4(process.env.VIBECODER_REPO_ROOT);
     return { root, config: join6(root, "config.json"), env: join6(root, ".env") };
   }
   return null;
 }
 function isSelfFile(abs) {
-  const a = resolve3(abs);
+  const a = resolve4(abs);
   const repo = reposWhere();
   if (repo && (isSameFile(a, repo.config) || isSameFile(a, repo.env)))
     return true;
@@ -2018,7 +2633,7 @@ function shaOf(text) {
 function appendLedger(entry) {
   try {
     const full = { ts: new Date().toISOString(), ...entry };
-    mkdirSync3(dirname4(ledgerPath()), { recursive: true });
+    mkdirSync3(dirname5(ledgerPath()), { recursive: true });
     appendFileSync(ledgerPath(), JSON.stringify(full) + `
 `, "utf8");
     return true;
@@ -2097,7 +2712,10 @@ registerTool({
     }
   },
   async run(args, ctx) {
-    const p = args.path ? resolve2(String(args.path), ctx) : ctx.cwd;
+    const p = args.path ? resolve3(String(args.path), ctx) : ctx.cwd;
+    const denied = pathDenied(p, ctx);
+    if (denied)
+      return denied;
     let entries;
     try {
       entries = readdirSync2(p, { withFileTypes: true });
@@ -2147,7 +2765,10 @@ registerTool({
     }
   },
   async run(args, ctx) {
-    const p = resolve2(String(args.path), ctx);
+    const p = resolve3(String(args.path), ctx);
+    const denied = pathDenied(p, ctx);
+    if (denied)
+      return denied;
     if (!await fileExists(p))
       return `ERROR: file not found: ${p}`;
     const text = await fileText(p);
@@ -2186,12 +2807,15 @@ registerTool({
   async run(args, ctx) {
     if (ctx.planPhase)
       return `BLOCKED IN PLAN MODE: write_file is disabled while investigating. Record what you would write in your PLAN (FILES: ...) instead; the human approves before any file is touched.`;
-    const p = resolve2(String(args.path), ctx);
+    const p = resolve3(String(args.path), ctx);
+    const denied = pathDenied(p, ctx);
+    if (denied)
+      return denied;
     const content = String(args.content ?? "");
     const guard = await preWriteNote(p, content);
     if (!guard.ok)
       return guard.note;
-    mkdirSync4(dirname5(p), { recursive: true });
+    mkdirSync4(dirname6(p), { recursive: true });
     await writeFileAsync(p, content, "utf8");
     return `Wrote ${content.length} bytes to ${p}${guard.note ? `
 ` + guard.note : ""}`;
@@ -2218,7 +2842,10 @@ registerTool({
   async run(args, ctx) {
     if (ctx.planPhase)
       return `BLOCKED IN PLAN MODE: edit_file is disabled while investigating. Describe the exact change in your PLAN instead; the human approves before any file is touched.`;
-    const p = resolve2(String(args.path), ctx);
+    const p = resolve3(String(args.path), ctx);
+    const denied = pathDenied(p, ctx);
+    if (denied)
+      return denied;
     const oldString = String(args.oldString ?? "");
     const newString = String(args.newString ?? "");
     const replaceAll = Boolean(args.replaceAll);
@@ -2420,6 +3047,9 @@ registerTool({
   async run(args, ctx) {
     const pattern = String(args.pattern ?? "");
     const dir = args.cwd ? String(args.cwd) : ctx.cwd;
+    const denied = pathDenied(dir, ctx);
+    if (denied)
+      return denied;
     const matches = [];
     try {
       const found = await globScan(pattern, { cwd: dir, onlyFiles: true, maxResults: MAX_SCANNED });
@@ -2459,6 +3089,9 @@ registerTool({
   async run(args, ctx) {
     const pattern = String(args.pattern ?? "");
     const dir = args.path ? String(args.path) : ctx.cwd;
+    const denied = pathDenied(dir, ctx);
+    if (denied)
+      return denied;
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
     const res = await spawnCollect({
@@ -2592,10 +3225,24 @@ var OFFLINE_PLAN_SYSTEM = "You are planning a coding task while this machine is 
 ` + "RISKS: <caveats, assumptions, or unknown repo state>";
 function queuedToolPolicy(deps, signal) {
   return async (name, args) => {
-    if (deps.autoApproveExceptDestructive !== false && name === "bash") {
-      const command = String(args.command ?? "");
-      const why = bannedReason(command);
-      if (why) {
+    if (deps.autoApproveExceptDestructive !== false) {
+      if (name === "bash") {
+        const why = bannedReason(String(args.command ?? ""));
+        if (why) {
+          log(deps, `  [[auto-run policy]] blocked ${name}: ${why}`);
+          return false;
+        }
+      }
+      const mutating = {
+        git_commit: "commits changes",
+        git_checkout_branch: "switches branches",
+        git_push_ff: "pushes to a remote",
+        env_set: "writes to .env",
+        write_file: "writes files",
+        edit_file: "edits files"
+      };
+      const why = mutating[name];
+      if (why && deps.autoApproveMutating === false) {
         log(deps, `  [[auto-run policy]] blocked ${name}: ${why}`);
         return false;
       }
@@ -2632,7 +3279,11 @@ async function runQueuedTask(task, deps, signal) {
       systemPrompt: task.systemPrompt,
       model: route.model,
       initialMessages: messages,
-      toolCtx: { cwd: task.cwd, signal },
+      toolCtx: {
+        cwd: task.cwd,
+        signal,
+        permissions: resolvePermissions(deps.permissions ?? { permissions: { filesystem: "workspace", exposeSecrets: false } }, task.cwd)
+      },
       signal,
       chatOptions,
       maxInputTokens: route.maxInputTokens,
@@ -2658,9 +3309,7 @@ async function runQueuedTask(task, deps, signal) {
       return failed ?? claimed;
     }
     const backoffMs = Math.min(300000, 30000 * Math.pow(2, nextAttempts - 1));
-    const retryAfter = Date.now() + backoffMs;
     const retried = markTaskRetry(task.id, nextAttempts);
-    retried.retryAfter = retryAfter;
     log(deps, `↻ [${task.id}] failed (attempt ${nextAttempts}/5) — will retry in ${(backoffMs / 1000).toFixed(0)}s`);
     return retried ?? claimed;
   }

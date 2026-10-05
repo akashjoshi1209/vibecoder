@@ -29,6 +29,8 @@ import { loadDotEnv } from "../env";
 import { runDoctor } from "../doctor";
 import { runSetup } from "../setup";
 import { readPackageJson } from "../paths";
+import { resolvePermissions, type Permissions } from "../permissions";
+import { PLAN_MODE_PROMPT } from "../agent/plan-mode";
 
 const colors = {
   dim: "\x1b[2m",
@@ -63,6 +65,15 @@ let connectivityPoller: ConnectivityPoller | null = null;
 let online = false;
 let nowDraining = false;
 let tuiRef: TUI | null = null;
+let permissions: Permissions = resolvePermissions({}, process.cwd());
+/** The directory the agent is scoped to. Set from --cwd before init() runs so
+ *  the permission model is resolved against the right root. */
+let sessionCwd = process.cwd();
+/** Plan mode: the next task turn investigates and plans only. */
+let planPhase = false;
+/** Plan mode is a one-turn gate; the phase applies to the turn that follows a
+ *  /plan command, then clears so the next message can execute the plan. */
+let planPhaseNextTurn = false;
 
 function limitsFor(cfg: RootConfig): { maxInputTokens?: number; maxInputTokensPerMinute?: number } {
   return {
@@ -144,6 +155,10 @@ async function init() {
   const config = await loadConfig();
   rootConfig = config;
   setQueueFileOverride((config as any).queue?.file);
+  // Resolve the permission model once and thread it into every tool call.
+  // Previously ctx.permissions was never set at runtime, so a config with
+  // permissions.filesystem = "workspace" or destructive = "deny" was inert.
+  permissions = resolvePermissions(config, sessionCwd);
   const resolved = createProvider(config);
   providerName = resolved.name;
   llmModel = resolved.model;
@@ -208,11 +223,27 @@ async function init() {
   if (dirArg !== -1 && process.argv[dirArg + 1]) {
     cwd = resolve(process.argv[dirArg + 1], { cwd: process.cwd() });
   }
+  // Re-resolve permissions against the final working directory, since --cwd
+  // can move the session after the first resolution in init().
+  sessionCwd = cwd;
+  permissions = resolvePermissions(config, sessionCwd);
 
   const stepsIdx = process.argv.indexOf("--max-steps");
   if (stepsIdx !== -1 && process.argv[stepsIdx + 1]) {
     const n = parseInt(process.argv[stepsIdx + 1], 10);
     if (Number.isFinite(n) && n > 0) maxSteps = n;
+  }
+
+  // CLI overrides for the permission model, so a run can be locked down without
+  // editing config.json: --no-network, --sandbox, --no-secrets, --deny-destructive
+  if (process.argv.includes("--deny-destructive")) permissions.destructive = "deny";
+  if (process.argv.includes("--ask-destructive")) permissions.destructive = "ask";
+  if (process.argv.includes("--no-network")) permissions.network = "deny";
+  if (process.argv.includes("--sandbox")) permissions.filesystem = "workspace";
+  if (process.argv.includes("--expose-secrets")) permissions.exposeSecrets = true;
+  if (process.argv.includes("--plan")) {
+    planPhase = true;
+    planPhaseNextTurn = true;
   }
 }
 
@@ -296,6 +327,8 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/model <id>${colors.reset}       switch model`);
     print(`  ${colors.green}/route [auto|chat|heavy]${colors.reset} ${colors.dim}model routing: auto-classify, or force chat/heavy model${colors.reset}`);
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
+  print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}next turn plans only — no writes, installs, or git changes${colors.reset}`);
+  print(`  ${colors.green}/permissions${colors.reset}         ${colors.dim}show the active permission model${colors.reset}`);
     print(`  ${colors.green}/save [name]${colors.reset}      save this conversation`);
     print(`  ${colors.green}/resume [name]${colors.reset}    resume a saved conversation (or the last one)`);
     print(`  ${colors.green}/list${colors.reset}             list saved conversations`);
@@ -434,6 +467,31 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
       setStatus();
       print(`${colors.dim}tool approval: ${tui.approveMode === "on" ? "on (you approve each tool call)" : "off (agents act freely)"}${colors.reset}`);
     }
+    return true;
+  }
+  if (line.startsWith("/plan")) {
+    const arg = line.slice(5).trim().toLowerCase();
+    if (arg === "on" || arg === "off") planPhase = arg === "on";
+    else if (arg === "") planPhase = !planPhase;
+    else {
+      print(`${colors.red}usage: /plan [on|off]${colors.reset}`);
+      return true;
+    }
+    planPhaseNextTurn = planPhase;
+    setStatus();
+    print(
+      `${colors.dim}plan mode: ${planPhase ? "on — the next turn investigates and plans only (no writes, no installs, no git changes)" : "off"}${colors.reset}`,
+    );
+    return true;
+  }
+  if (line.startsWith("/permissions")) {
+    const p = permissions;
+    print(`${colors.bold}permissions${colors.reset}  (workspace root: ${p.workspaceRoot})`);
+    print(`  destructive : ${p.destructive}`);
+    print(`  network     : ${p.network}`);
+    print(`  filesystem  : ${p.filesystem}`);
+    print(`  secrets     : ${p.exposeSecrets ? "exposed to child processes" : "withheld from child processes"}`);
+    print(`${colors.dim}  set in config.json under "permissions", or per-run: --sandbox --deny-destructive --no-network${colors.reset}`);
     return true;
   }
   if (line.trim() === "/about") {
@@ -587,6 +645,12 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     tui.setStatus(`router ${routerMode}${taskActive ? " · task" : ""}${heavyRoute ? " · heavy" : ""} — thinking…  (ctrl-c to interrupt)`, 8);
   }
 
+  // Plan mode applies to this turn only; consume the pending request so the
+  // following turn can execute whatever plan the human approved.
+  const thisTurnIsPlan = planPhaseNextTurn;
+  planPhaseNextTurn = false;
+  const turnSystemPrompt = thisTurnIsPlan ? systemPrompt + "\n\n" + PLAN_MODE_PROMPT : systemPrompt;
+
   let aborted = false;
   const ac = new AbortController();
   activeAbort = ac;
@@ -607,10 +671,10 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     const result = await runAgent(
       {
         provider: turnProvider,
-        systemPrompt,
+        systemPrompt: turnSystemPrompt,
         model: turnModel,
         initialMessages: messages,
-        toolCtx: { cwd, signal: ac.signal },
+        toolCtx: { cwd, signal: ac.signal, permissions, planPhase: thisTurnIsPlan },
         signal: ac.signal,
         chatOptions: {
           temperature: chatTemperature,
@@ -767,6 +831,12 @@ function printUsage(): void {
   console.log("  --resume [name]     resume last (or named) conversation");
   console.log("  --max-steps <n>     cap the agent loop (default 40)");
   console.log("  --cwd <path>        work from another directory");
+  console.log("  --sandbox           restrict file tools + bash to --cwd");
+  console.log("  --deny-destructive  block rm/mkfs/force-push/etc. outright");
+  console.log("  --ask-destructive   require approval for destructive commands");
+  console.log("  --no-network        block curl/wget/ssh and inline network code");
+  console.log("  --expose-secrets    pass API-key env vars into child processes");
+  console.log("  --plan              run the first turn in plan mode (investigate + propose, no changes)");
   console.log("  --version, -v       print version");
   console.log("  --help, -h          this help");
   console.log("");

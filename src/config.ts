@@ -52,6 +52,10 @@ export const FALLBACK_CONFIG: RootConfig = {
     destructive: "allow",
     network: "allow",
     filesystem: "full",
+    /** Withhold *_API_KEY / *_TOKEN / *_SECRET from spawned child processes so
+     *  `printenv GROQ_API_KEY` inside bash cannot exfiltrate credentials.
+     *  Set true only when a task genuinely needs those vars in a subprocess. */
+    exposeSecrets: false,
   },
   /** Optional per-session cost cap in USD. When set, the agent stops after the
    *  cumulative estimated cost exceeds this value. Default: undefined (no cap). */
@@ -169,6 +173,9 @@ export function validateConfig(cfg: unknown): string[] {
       }
       if (p.filesystem !== undefined && !["workspace", "full"].includes(p.filesystem as string)) {
         errors.push('config.permissions.filesystem must be "workspace" or "full"');
+      }
+      if (p.exposeSecrets !== undefined && typeof p.exposeSecrets !== "boolean") {
+        errors.push("config.permissions.exposeSecrets must be true or false");
       }
     }
   }

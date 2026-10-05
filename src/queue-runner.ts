@@ -12,6 +12,7 @@ import {
   type QueuedTask,
 } from "./queue";
 import { bannedReason } from "./tools/bash";
+import { resolvePermissions, type PermissionsConfig } from "./permissions";
 import type { Message } from "./llm/types";
 import type { RouteResult } from "./llm/router";
 import "./tools/bash";
@@ -27,6 +28,13 @@ export interface QueueRunnerDeps {
   onLog?: (line: string) => void;
   /** When true, destructive commands are blocked even in auto-run. */
   autoApproveExceptDestructive?: boolean;
+  /** When false, mutating tools (git_commit, env_set, write_file, ...) are also
+   *  refused during auto-run. Defaults to true to preserve existing behaviour;
+   *  set false for unattended runs you do not want touching git or .env. */
+  autoApproveMutating?: boolean;
+  /** Permission model for unattended runs. When omitted, a queued task is
+   *  sandboxed to its own cwd and does not get API-key env vars. */
+  permissions?: PermissionsConfig;
 }
 
 const log = (deps: QueueRunnerDeps, line: string) => deps.onLog?.(line);
@@ -69,18 +77,43 @@ export async function draftPlanNote(
  * runs without prompting except Bash commands that match the destructive guard
  * (rm -rf, mkfs, force-push, package uninstall, system control, sudo …). The
  * gate returns `false` for those, and the agent sees a "rejected by policy"
- * tool result telling it to avoid the command. Also rejects when the task's
- * runner is mid-abort (signal fired) so queued tasks stop promptly on interrupt.
+ * tool result telling it to avoid the command.
+ *
+ * `autoApproveMutating: false` additionally refuses the tools that change state
+ * through a non-shell path — git_commit, git_checkout_branch, git_push_ff,
+ * env_set, write_file, edit_file. The bash guard cannot see those, so an
+ * unattended run could otherwise rewrite .env or push to a remote while every
+ * shell command passed.
+ *
+ * Also rejects when the task's runner is mid-abort (signal fired) so queued
+ * tasks stop promptly on interrupt.
  */
 export function queuedToolPolicy(
   deps: QueueRunnerDeps,
   signal?: AbortSignal,
 ): (name: string, args: Record<string, unknown>) => Promise<boolean> {
   return async (name, args) => {
-    if (deps.autoApproveExceptDestructive !== false && name === "bash") {
-      const command = String(args.command ?? "");
-      const why = bannedReason(command);
-      if (why) {
+    if (deps.autoApproveExceptDestructive !== false) {
+      if (name === "bash") {
+        const why = bannedReason(String(args.command ?? ""));
+        if (why) {
+          log(deps, `  [[auto-run policy]] blocked ${name}: ${why}`);
+          return false;
+        }
+      }
+      // Mutating tools that no human is watching. The bash guard above only
+      // sees shell commands, so without this an unattended run could commit,
+      // push and rewrite .env while auto-approving everything else.
+      const mutating: Record<string, string> = {
+        git_commit: "commits changes",
+        git_checkout_branch: "switches branches",
+        git_push_ff: "pushes to a remote",
+        env_set: "writes to .env",
+        write_file: "writes files",
+        edit_file: "edits files",
+      };
+      const why = mutating[name];
+      if (why && deps.autoApproveMutating === false) {
         log(deps, `  [[auto-run policy]] blocked ${name}: ${why}`);
         return false;
       }
@@ -129,7 +162,17 @@ export async function runQueuedTask(
         systemPrompt: task.systemPrompt,
         model: route.model,
         initialMessages: messages,
-        toolCtx: { cwd: task.cwd, signal },
+        // Unattended runs must honour the same permission model as interactive
+        // ones, and they run unattended, so default to the stricter sandbox
+        // unless the queue explicitly opts out.
+        toolCtx: {
+          cwd: task.cwd,
+          signal,
+          permissions: resolvePermissions(
+            deps.permissions ?? { permissions: { filesystem: "workspace", exposeSecrets: false } },
+            task.cwd,
+          ),
+        },
         signal,
         chatOptions,
         maxInputTokens: route.maxInputTokens,

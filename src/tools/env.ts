@@ -1,52 +1,138 @@
 import { registerTool, type ToolContext } from "./registry";
-import { join as pathJoin, dirname } from "node:path";
+import { join as pathJoin, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { readFile, writeFile, rename } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { registerTool as _registerTool } from "./registry";
 
+/** Plan mode is a read-only investigation phase. env_set writes to disk, so it
+ *  has to be refused there — it previously had no planPhase check at all and
+ *  happily wrote during plan mode. */
+function envPlanBlocked(ctx: { planPhase?: boolean }): string | null {
+  return ctx.planPhase
+    ? "BLOCKED IN PLAN MODE (read-only): env_set is disabled while investigating. Record the intended environment change in your PLAN instead; the human approves before anything is written."
+    : null;
+}
+
+/**
+ * Locate the project root that owns `.env`.
+ *
+ * This walks up from *this module's* file looking for a project marker, which
+ * is wrong in two ways that bit us during testing:
+ *
+ *  1. The walk is unbounded across the filesystem, so a symlinked or junctioned
+ *     parent (e.g. a `node_modules` junction pointing at another checkout)
+ *     can redirect it to a *different* repository's root. A write meant for a
+ *     sandbox then landed on the real `.env`.
+ *  2. It resolves relative to the installed module, not the session. In a
+ *     globally-linked install the package lives somewhere unrelated to the
+ *     project the user is working on.
+ *
+ * Preference order is now: explicit override, then the session cwd, and only
+ * then the module location. The module walk also refuses to cross a symlink and
+ * stops at the filesystem root.
+ */
 const _repoRoot = (() => {
-  try {
-    const file = fileURLToPath(import.meta.url);
-    let dir = dirname(file);
-    for (let i = 0; i < 10; i++) {
-      if (existsSync(pathJoin(dir, "package.json")) || existsSync(pathJoin(dir, ".git"))) {
-        return dir;
+  const from = (start: string): string | null => {
+    try {
+      let dir = resolve(start);
+      for (let i = 0; i < 10; i++) {
+        if (existsSync(pathJoin(dir, "package.json")) || existsSync(pathJoin(dir, ".git"))) {
+          return dir;
+        }
+        const parent = dirname(dir);
+        if (parent === dir) return null;
+        // Do not climb through a link: that is how the walk escaped a sandbox.
+        try {
+          if (realpathSync.native(dir) !== resolve(dir)) return null;
+        } catch {
+          return null;
+        }
+        dir = parent;
       }
-      dir = dirname(dir);
+      return null;
+    } catch {
+      return null;
     }
-    return pathJoin(process.cwd(), "..", "..");
-  } catch {
-    return pathJoin(process.cwd(), "..", "..");
-  }
+  };
+  // A session-scoped install (VIBECODER_SESSION_DIR) or a cwd that is itself a
+  // project wins, so a linked global install still edits the right .env.
+  return from(process.cwd()) ?? from(dirname(fileURLToPath(import.meta.url))) ?? process.cwd();
 })();
 
-const ENV_FILE = (() => {
+/** Path to the .env this tool reads and writes. Evaluated per call rather than
+ *  cached at import time so VIBECODER_ENV_FILE stays overridable (tests, and
+ *  any caller that relocates the file after startup). */
+export function envPath(): string {
   const override = process.env.VIBECODER_ENV_FILE;
   if (override) return override;
   return pathJoin(_repoRoot, ".env");
-})();
+}
+
+/** Parse dotenv text. Tolerates CRLF (Windows-authored files, which previously
+ *  made every key read back as "not set" because the value kept its `\r`) and
+ *  strips surrounding quotes so masking does not expose the quote character. */
+export function parseEnv(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m) continue;
+    let value = m[2].trim();
+    if (value.length > 1 && value.startsWith('"') && value.endsWith('"')) {
+      // Double-quoted values may carry JSON-style escapes, which is what
+      // formatEnv writes. Unescape them so a value round-trips unchanged.
+      try {
+        value = JSON.parse(value) as string;
+      } catch {
+        value = value.slice(1, -1);
+      }
+    } else if (value.length > 1 && value.startsWith("'") && value.endsWith("'")) {
+      // Single quotes are literal in dotenv: no escape processing.
+      value = value.slice(1, -1);
+    }
+    out[m[1]] = value;
+  }
+  return out;
+}
+
+/** Serialise back to dotenv, quoting values that need it. */
+export function formatEnv(dict: Record<string, string>): string {
+  // Only quote when the value actually needs it. Quoting everything would
+  // still round-trip through parseEnv, but it makes the file hostile to
+  // anything else that reads it (docker-compose, CI runners, other tools).
+  const needsQuote = (v: string) => v === "" || /[\s"'#$`\\]/.test(v);
+  return (
+    Object.entries(dict)
+      .map(([k, v]) => `${k}=${needsQuote(v) ? JSON.stringify(v) : v}`)
+      .join("\n") + "\n"
+  );
+}
 
 async function readEnv(): Promise<Record<string, string>> {
   try {
-    const text = await readFile(ENV_FILE, "utf8");
-    const out: Record<string, string> = {};
-    for (const line of text.split("\n")) {
-      const m = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-      if (m) out[m[1]] = m[2];
-    }
-    return out;
+    return parseEnv(await readFile(envPath(), "utf8"));
   } catch {
     return {};
   }
 }
 
-async function writeEnv(dict: Record<string, string>): Promise<void> {
-  const lines = Object.entries(dict)
-    .filter(([, v]) => true)
-    .map(([k, v]) => `${k}=${v}`)
-    .join("\n");
-  await writeFile(ENV_FILE, lines + "\n");
+/**
+ * Merge `updates` into the existing .env.
+ *
+ * This used to serialise only the keys the caller had in hand, so any key that
+ * failed to parse was silently dropped on write — a partial read destroyed
+ * unrelated secrets. Now it re-reads, merges, and writes atomically.
+ */
+async function mergeEnv(updates: Record<string, string>): Promise<void> {
+  const file = envPath();
+  const current = await readEnv();
+  const merged = { ...current, ...updates };
+  const tmp = file + ".tmp";
+  await writeFile(tmp, formatEnv(merged), "utf8");
+  await rename(tmp, file);
 }
 
 function mask(v: string): string {
@@ -119,12 +205,16 @@ registerTool({
     },
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    const blocked = envPlanBlocked(ctx);
+    if (blocked) return blocked;
     const key = String(args.key ?? "").trim();
     const value = String(args.value ?? "");
     if (!key) return "ERROR: key is required";
-    const env = await readEnv();
-    env[key] = value;
-    await writeEnv(env);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      return `ERROR: "${key}" is not a valid environment variable name (letters, digits and underscore only; cannot start with a digit)`;
+    }
+    if (/[\r\n]/.test(value)) return "ERROR: value cannot contain newlines";
+    await mergeEnv({ [key]: value });
     return `Set ${key} in .env (value stored, not echoed for safety). Run env_get("${key}") to confirm.`;
   },
 });

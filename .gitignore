@@ -15,7 +15,12 @@ test_*.py
 build_demo.py
 write_composition.py
 debug_scene4.py
+calc.py
 verify-perms.ts
+scan-*.ts
+
+# Third-party checkouts kept alongside the repo
+brag/
 
 # Generated output dirs
 brag-output/

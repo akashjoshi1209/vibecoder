@@ -49,6 +49,10 @@ export interface RootConfig {
      *  "workspace" = restrict to the current working directory tree.
      *  "full" = allow access to the entire filesystem (default, backward-compatible). */
     filesystem?: "workspace" | "full";
+    /** When false (default), API-key-shaped env vars (*_API_KEY, *_TOKEN,
+     *  *_SECRET, ...) are withheld from spawned child processes so bash cannot
+     *  read them. Set true only when a task needs those vars in a subprocess. */
+    exposeSecrets?: boolean;
   };
 }
 

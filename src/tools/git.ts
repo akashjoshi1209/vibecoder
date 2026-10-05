@@ -177,6 +177,13 @@ registerTool({
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const remote = String(args.remote ?? "origin").trim() || "origin";
+    if (ctx.planPhase) return gitPlanBlocked("push")!;
+    // A push reaches a remote and can publish or overwrite someone else's work.
+    // With destructive=deny the policy layer is only consulted for shell
+    // commands, so a mutating git tool has to ask the gate itself.
+    if (ctx.permissions?.destructive === "deny") {
+      return "BLOCKED (deny): git push publishes to a remote. Set permissions.destructive to \"ask\" or \"allow\" to permit it.";
+    }
     // Determine current branch.
     const branchOut = await runGit(["rev-parse", "--abbrev-ref", "HEAD"], "git rev-parse --abbrev-ref HEAD", ctx);
     const branch = branchOut.trim();
@@ -189,11 +196,30 @@ registerTool({
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/** Git subcommands that change repository state. Plan mode is a read-only
+ *  investigation phase, so these are refused there — git_commit,
+ *  git_checkout_branch and git_push_ff had no planPhase check and could
+ *  commit, switch branches and push while reporting nothing was touched. */
+const PLAN_MODE_BANNED_GIT = new Set([
+  "commit", "add", "rm", "mv", "reset", "restore", "checkout", "switch", "merge",
+  "rebase", "cherry-pick", "revert", "tag", "push", "pull", "fetch", "clone",
+  "init", "stash", "clean", "apply", "am", "worktree", "submodule", "filter-branch",
+]);
+
+function gitPlanBlocked(sub: string): string | null {
+  if (!PLAN_MODE_BANNED_GIT.has(sub)) return null;
+  return `BLOCKED IN PLAN MODE (read-only): git ${sub} changes repository state and is disabled while investigating. Record what you would commit/change in your PLAN instead; the human approves before any git state is touched.`;
+}
+
 async function runGit(args: string[], label: string, ctx: ToolContext): Promise<string> {
   // Every git tool runs in ctx.cwd, so gate that one directory centrally
   // instead of repeating the check in each tool.
   const denied = pathDenied(ctx.cwd, ctx);
   if (denied) return denied;
+  if (ctx.planPhase) {
+    const blocked = gitPlanBlocked(args[0] ?? "");
+    if (blocked) return blocked;
+  }
   const res = await spawnCollect({
     cmd: ["git", ...args],
     cwd: ctx.cwd,
@@ -222,14 +248,14 @@ registerTool({
     function: {
       name: "git_commit",
       description:
-        "Create a commit with the given message. Stages all changes (git add -A) then commits. Use after making file edits. Returns the commit hash and message.",
+        "Create a commit with the given message. Stages the named files then commits. `files` is required — an unscoped `git add -A` would sweep up build artifacts and scratch files. Returns the commit hash and message.",
       parameters: {
         type: "object",
         properties: {
           message: { type: "string", description: "The commit message" },
-          files: { type: "string", description: "Optional: specific files to stage (space-separated). If omitted, stages all changes (git add -A)." },
+          files: { type: "string", description: "Space-separated paths to stage (required). List exactly the files you changed." },
         },
-        required: ["message"],
+        required: ["message", "files"],
       },
     },
   },
@@ -237,14 +263,19 @@ registerTool({
     const message = String(args.message ?? "").trim();
     if (!message) return "ERROR: commit message is required";
     const files = args.files ? String(args.files).trim() : "";
+    if (ctx.planPhase) return gitPlanBlocked("commit")!;
+    // `git add -A` with no explicit file list sweeps up ignored-but-present
+    // artifacts and every scratch file. Require the caller to name the files.
+    if (!files) {
+      return "NOTE: refusing an unscoped `git add -A`. Pass `files` with a space-separated list of the exact paths to stage (e.g. files: \"src/a.ts src/b.ts\").";
+    }
 
     // Stage
-    let stageOut: string;
-    if (files) {
-      stageOut = await runGit(["add", ...files.split(/\s+/).filter(Boolean)], "git add", ctx);
-    } else {
-      stageOut = await runGit(["add", "-A"], "git add -A", ctx);
-    }
+    const stageOut = await runGit(
+      ["add", ...files.split(/\s+/).filter(Boolean)],
+      "git add",
+      ctx,
+    );
 
     // Status after staging
     const status = await runGit(["status", "--short"], "git status --short", ctx);
@@ -270,14 +301,22 @@ registerTool({
         properties: {
           name: { type: "string", description: "The branch name to create/switch to" },
           base: { type: "string", description: "Optional base branch to create from (default: current branch)" },
+          branch: { type: "string", description: "Alias for `name`" },
         },
+        required: ["name"],
       },
     },
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
-    const name = String(args.name ?? "").trim();
-    if (!name) return "ERROR: branch name is required";
+    // `branch` is accepted as an alias: the model reaches for either name.
+    const name = String(args.name ?? args.branch ?? "").trim();
+    if (!name) return 'ERROR: branch name is required (pass `name`)';
     const base = args.base ? String(args.base).trim() : "";
+    if (ctx.planPhase) return gitPlanBlocked("checkout")!;
+    // Guard against a branch name that shell-expands into something else.
+    if (!/^[A-Za-z0-9._\/-]+$/.test(name) || name.includes("..")) {
+      return `ERROR: invalid branch name "${name}". Use letters, digits, . _ / and - only.`;
+    }
 
     let branch: string;
     if (base) {
