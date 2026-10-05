@@ -2,7 +2,7 @@
 // or needing any LLM, so anyone can confirm their install, config, keys, and
 // providers from a terminal before (or after) using vibecoder.
 import { existsSync } from "node:fs";
-import { loadConfigInfo, userConfigFile } from "./config";
+import { loadConfigInfo, userConfigFile, validateConfig } from "./config";
 import { installMode, ledgerPath } from "./self-edit";
 import { readPackageJson } from "./paths";
 import { ollamaBinary, ollamaIsUp, ollamaModels, ollamaBaseUrl } from "./ollama";
@@ -30,10 +30,14 @@ export async function runDoctor(): Promise<number> {
   const version = pkg?.version ?? "dev";
   const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`;
 
+  // Gate on the platform first. existsSync("/data/data/com.termux") is true on
+  // Windows whenever a stray C:\data\data\com.termux happens to exist, because
+  // Node resolves a leading "/" against the current drive there.
   const isTermux =
-    existsSync("/data/data/com.termux") ||
-    process.env.ANDROID_DATA !== undefined ||
-    process.env.EXTERNAL_STORAGE !== undefined;
+    process.platform === "android" &&
+    (existsSync("/data/data/com.termux") ||
+      process.env.ANDROID_DATA !== undefined ||
+      process.env.EXTERNAL_STORAGE !== undefined);
 
   say("vibecoder doctor");
   say(`  version:   ${version}`);
@@ -52,6 +56,16 @@ export async function runDoctor(): Promise<number> {
     out.push("");
     process.stdout.write(out.join("\n") + "\n");
     return 1;
+  }
+  // Validate the merged config explicitly so doctor reports problems even when
+  // loadConfigInfo would throw later (in the agent loop) with the same info.
+  const validationErrors = validateConfig(cfg);
+  if (validationErrors.length) {
+    out.push("");
+    out.push("  config:    INVALID — these problems would crash vibecoder:");
+    for (const e of validationErrors) out.push(`             - ${e}`);
+    out.push("             fix config.json and re-run doctor");
+    out.push("");
   }
 
   out.push("");

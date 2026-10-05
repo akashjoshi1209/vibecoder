@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // src/daemon.ts
 import { mkdirSync as mkdirSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync4, unlinkSync } from "node:fs";
-import { homedir as homedir5 } from "node:os";
-import { join as join8 } from "node:path";
+import { homedir as homedir6 } from "node:os";
+import { join as join9 } from "node:path";
 
 // src/llm/types.ts
 class ContextTooLargeError extends Error {
@@ -515,9 +515,25 @@ function resolvePackageFile(...names) {
 
 // src/config.ts
 var FALLBACK_CONFIG = {
-  provider: "ollama",
-  model: "qwen2.5:1.5b",
+  provider: "groq",
+  model: "qwen/qwen3.8-27b",
   providers: {
+    groq: {
+      type: "openai-compatible",
+      baseURL: "https://api.groq.com/openai/v1",
+      apiKeyEnv: "GROQ_API_KEY",
+      timeoutMs: 240000,
+      timeoutIdleMs: 120000,
+      models: ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    },
+    nvidia: {
+      type: "openai-compatible",
+      baseURL: "https://api.nvidia.com/v1",
+      apiKeyEnv: "NVIDIA_API_KEY",
+      timeoutMs: 240000,
+      timeoutIdleMs: 120000,
+      models: ["nvidia/nemotron-3-ultra-550b-a55b"]
+    },
     ollama: {
       type: "openai-compatible",
       baseURL: "http://127.0.0.1:11434/v1",
@@ -526,7 +542,13 @@ var FALLBACK_CONFIG = {
       timeoutIdleMs: 120000,
       models: ["qwen2.5:1.5b", "llama3.1"]
     }
-  }
+  },
+  permissions: {
+    destructive: "allow",
+    network: "allow",
+    filesystem: "full"
+  },
+  maxCostUsd: undefined
 };
 function userConfigFile() {
   const sessionDir = process.env.VIBECODER_SESSION_DIR;
@@ -551,6 +573,92 @@ function isPlainObject(v) {
     return false;
   const proto = Object.getPrototypeOf(v);
   return proto === Object.prototype || proto === null;
+}
+function validateConfig(cfg) {
+  const errors = [];
+  if (!isPlainObject(cfg)) {
+    errors.push("config must be a JSON object (top-level {})");
+    return errors;
+  }
+  const o = cfg;
+  if (typeof o.provider !== "string" || !o.provider) {
+    errors.push('config.provider must be a non-empty string (e.g. "groq", "ollama")');
+  }
+  if (typeof o.model !== "string" || !o.model) {
+    errors.push("config.model must be a non-empty string");
+  }
+  if (!isPlainObject(o.providers)) {
+    errors.push("config.providers must be an object mapping provider names to config");
+  } else {
+    const providers = o.providers;
+    for (const name of Object.keys(providers)) {
+      const p = providers[name];
+      if (!isPlainObject(p)) {
+        errors.push(`providers."${name}" must be an object`);
+        continue;
+      }
+      const pc = p;
+      if (typeof pc.type !== "string" || !pc.type) {
+        errors.push(`providers."${name}".type must be a non-empty string (e.g. "openai-compatible" or "anthropic")`);
+      }
+      if (typeof pc.baseURL !== "string" || !pc.baseURL) {
+        errors.push(`providers."${name}".baseURL must be a non-empty string`);
+      }
+      if (typeof pc.apiKeyEnv !== "string") {
+        errors.push(`providers."${name}".apiKeyEnv must be a string (can be empty for local providers like ollama)`);
+      }
+      if (!Array.isArray(pc.models) || !pc.models.length) {
+        errors.push(`providers."${name}".models must be a non-empty array of model IDs`);
+      }
+      if (!pc.models.every((m) => typeof m === "string")) {
+        errors.push(`providers."${name}".models must all be strings`);
+      }
+    }
+  }
+  if (o.routing !== undefined) {
+    if (!isPlainObject(o.routing)) {
+      errors.push("config.routing must be an object");
+    } else {
+      const r = o.routing;
+      if (typeof r.strategy !== "string" || !["keyword", "hybrid"].includes(r.strategy)) {
+        errors.push(`config.routing.strategy must be "keyword" or "hybrid"`);
+      }
+      for (const key of ["chatProvider", "chatModel", "heavyProvider", "heavyModel"]) {
+        if (r[key] !== undefined && (typeof r[key] !== "string" || !r[key])) {
+          errors.push(`config.routing.${key} must be a non-empty string when set`);
+        }
+      }
+    }
+  }
+  if (o.temperature !== undefined && (typeof o.temperature !== "number" || !isFinite(o.temperature) || o.temperature < 0 || o.temperature > 2)) {
+    errors.push("config.temperature must be a number between 0 and 2");
+  }
+  if (o.maxInputTokens !== undefined && (typeof o.maxInputTokens !== "number" || !isFinite(o.maxInputTokens) || o.maxInputTokens < 1)) {
+    errors.push("config.maxInputTokens must be a positive number");
+  }
+  if (o.maxInputTokensPerMinute !== undefined && (typeof o.maxInputTokensPerMinute !== "number" || !isFinite(o.maxInputTokensPerMinute) || o.maxInputTokensPerMinute < 1)) {
+    errors.push("config.maxInputTokensPerMinute must be a positive number");
+  }
+  if (o.maxCostUsd !== undefined && (typeof o.maxCostUsd !== "number" || !isFinite(o.maxCostUsd) || o.maxCostUsd < 0)) {
+    errors.push("config.maxCostUsd must be a non-negative number (e.g. 5 for a $5 cap)");
+  }
+  if (o.permissions !== undefined) {
+    if (!isPlainObject(o.permissions)) {
+      errors.push("config.permissions must be an object");
+    } else {
+      const p = o.permissions;
+      if (p.destructive !== undefined && !["allow", "ask", "deny"].includes(p.destructive)) {
+        errors.push('config.permissions.destructive must be "allow", "ask", or "deny"');
+      }
+      if (p.network !== undefined && !["allow", "deny"].includes(p.network)) {
+        errors.push('config.permissions.network must be "allow" or "deny"');
+      }
+      if (p.filesystem !== undefined && !["workspace", "full"].includes(p.filesystem)) {
+        errors.push('config.permissions.filesystem must be "workspace" or "full"');
+      }
+    }
+  }
+  return errors;
 }
 function deepMerge(base, override) {
   if (override === undefined)
@@ -581,8 +689,18 @@ async function loadConfig(path) {
   const { builtin, effectiveFile, merged } = configPaths();
   const base = builtin ? loadJsonFile(builtin) : FALLBACK_CONFIG;
   if (merged) {
-    const user = loadJsonFile(effectiveFile);
-    return deepMerge(base, user);
+    const raw = loadJsonFile(effectiveFile);
+    const mergedCfg = deepMerge(base, raw);
+    const errors = validateConfig(mergedCfg);
+    if (errors.length) {
+      const userFile = configPaths().userFile;
+      const where = userFile ? ` in ${userFile}` : "";
+      throw new Error(`config.json has problems that would crash vibecoder:${where}
+  ${errors.join(`
+  `)}
+  Fix the file above and restart.`);
+    }
+    return mergedCfg;
   }
   return base;
 }
@@ -642,7 +760,7 @@ function loadDotEnv() {
       if (!kv)
         continue;
       const [key, value] = kv;
-      if (!(key in process.env))
+      if (!(key in process.env) || !process.env[key])
         process.env[key] = value;
     }
   }
@@ -1136,6 +1254,7 @@ async function runAgent(options, callbacks = {}) {
       return { finalText: `
 [interrupted]`, toolCalls, steps: step, aborted: true };
     }
+    callbacks.onStepUpdate?.(step + 1, toolCalls, maxSteps);
     let result = null;
     let stepOk = false;
     for (let attempt = 0;attempt <= MAX_STEP_RETRIES && !stepOk; attempt++) {
@@ -1228,17 +1347,22 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
       messages.push(assistantMsg);
     }
     const parsed = parseToolCalls(normalizedCalls);
-    for (const call of parsed) {
+    const PARALLEL_THRESHOLD = 2;
+    const parallelCalls = parsed.filter((c) => c.name);
+    const runOne = async (call) => {
       toolCalls++;
       if (!call.name) {
         const id = call.id || `call_${toolCalls}`;
-        messages.push({
-          role: "tool",
-          tool_call_id: id,
-          content: "ERROR: the model emitted a tool call with no function name. Reissue a valid tool call or finish by responding with plain text.",
-          name: "unknown"
-        });
-        continue;
+        return {
+          call,
+          message: {
+            role: "tool",
+            tool_call_id: id,
+            content: "ERROR: the model emitted a tool call with no function name. Reissue a valid tool call or finish by responding with plain text.",
+            name: "unknown"
+          },
+          output: ""
+        };
       }
       callbacks.onToolStart?.(call.name, call.args);
       let output;
@@ -1256,7 +1380,39 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
         }
       }
       callbacks.onToolEnd?.(call.name, output);
-      messages.push({ role: "tool", tool_call_id: call.id, content: output, name: call.name });
+      return {
+        call,
+        message: { role: "tool", tool_call_id: call.id, content: output, name: call.name },
+        output
+      };
+    };
+    let results;
+    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool) {
+      toolCalls += parallelCalls.length;
+      for (const call of parallelCalls) {
+        callbacks.onToolStart?.(call.name, call.args);
+      }
+      const outputs = await Promise.all(parallelCalls.map(async (call) => {
+        let output;
+        try {
+          output = await executeTool(call.name, call.args, options.toolCtx);
+        } catch (err) {
+          output = `ERROR: ${err?.message ?? String(err)}`;
+        }
+        callbacks.onToolEnd?.(call.name, output);
+        return { call, output };
+      }));
+      results = outputs.map((r) => ({
+        ...r,
+        message: { role: "tool", tool_call_id: r.call.id, content: r.output, name: r.call.name }
+      }));
+      const noNameResults = await Promise.all(parsed.filter((c) => !c.name).map((call) => runOne(call)));
+      results = [...noNameResults, ...results];
+    } else {
+      results = await Promise.all(parsed.map((call) => runOne(call)));
+    }
+    for (const r of results) {
+      messages.push(r.message);
     }
     const stepToolNames = parsed.filter((c) => c.name).map((c) => c.name);
     if (stepToolNames.length) {
@@ -1370,7 +1526,18 @@ function withLock(fn) {
 }
 function nextQueued() {
   const tasks = read();
-  const candidates = tasks.filter((t) => t.status === "queued" || t.status === "running" && t.runnerPid && !processExists(t.runnerPid)).sort((a, b) => a.createdAt - b.createdAt);
+  const now = Date.now();
+  const candidates = tasks.filter((t) => {
+    if (t.status === "queued")
+      return true;
+    if (t.status === "running" && t.runnerPid && !processExists(t.runnerPid))
+      return true;
+    if (t.status === "failed" && t.attempts !== undefined && t.attempts < 5) {
+      if (!t.retryAfter || now >= t.retryAfter)
+        return true;
+    }
+    return false;
+  }).sort((a, b) => a.createdAt - b.createdAt);
   return candidates[0] ?? null;
 }
 function processExists(pid) {
@@ -1408,12 +1575,24 @@ function claimTask(id) {
 function markTaskDone(id, result) {
   return withLock(() => update(id, { status: "done", result, finishedAt: Date.now(), runnerPid: undefined, error: undefined }));
 }
-function markTaskFailed(id, error) {
-  return withLock(() => update(id, { status: "failed", error, finishedAt: Date.now(), runnerPid: undefined }));
+function markTaskFailed(id, error, attempts, retryAfter) {
+  return withLock(() => update(id, { status: "failed", error, finishedAt: Date.now(), runnerPid: undefined, attempts, retryAfter }));
+}
+function markTaskRetry(id, attempts) {
+  const now = Date.now();
+  const backoffMs = Math.min(300000, 30000 * Math.pow(2, attempts - 1));
+  return withLock(() => update(id, {
+    status: "queued",
+    runnerPid: undefined,
+    error: undefined,
+    attempts,
+    retryAfter: now + backoffMs
+  }));
 }
 function resetStale() {
   return withLock(() => {
     const tasks = read();
+    const now = Date.now();
     let n = 0;
     for (const t of tasks) {
       if (t.status === "running") {
@@ -1421,10 +1600,23 @@ function resetStale() {
           n++;
           t.status = "queued";
           t.runnerPid = undefined;
+          t.retryAfter = undefined;
         }
       }
-      if (t.status === "queued" && t.runnerPid)
+      if (t.status === "queued") {
         t.runnerPid = undefined;
+        if (t.attempts !== undefined && t.attempts >= 5) {
+          t.status = "failed";
+          t.retryAfter = undefined;
+        }
+      }
+      if (t.status === "failed" && t.attempts !== undefined && t.attempts < 5) {
+        if (!t.retryAfter || now >= t.retryAfter) {
+          n++;
+          t.status = "queued";
+          t.retryAfter = undefined;
+        }
+      }
     }
     write(tasks);
     return n;
@@ -1432,7 +1624,9 @@ function resetStale() {
 }
 
 // src/tools/proc.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync as existsSync5 } from "node:fs";
+import { platform } from "node:os";
 function killProcessGroup(child, signal = "SIGKILL") {
   if (child.pid === undefined || child.pid <= 0)
     return;
@@ -1444,14 +1638,77 @@ function killProcessGroup(child, signal = "SIGKILL") {
     } catch {}
   }
 }
+function resolveCommand(cmd) {
+  if (cmd.includes("/") || cmd.includes("\\"))
+    return cmd;
+  const pathEnv = process.env.PATH ?? "";
+  const dirs = pathEnv.split(pathSep).filter(Boolean);
+  const exts = [""].concat((process.env.PATHEXT ?? ".EXE;.BAT;.CMD;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC").split(pathSep).map((e) => e.toLowerCase()));
+  for (const dir of dirs) {
+    const base = join22(dir, cmd);
+    for (const ext of exts) {
+      const candidate = ext ? base + ext : base;
+      if (existsSync5(candidate))
+        return candidate;
+    }
+  }
+  if (platform() !== "win32") {
+    const prefixes = ["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/usr/local/sbin"];
+    for (const p of prefixes) {
+      const candidate = join22(p, cmd);
+      if (existsSync5(candidate))
+        return candidate;
+    }
+    try {
+      const lookedUp = spawnSync("which", [cmd], { stdio: ["ignore", "pipe", "ignore"] });
+      if (lookedUp && lookedUp.stdout && existsSync5(lookedUp.stdout.toString().trim())) {
+        return lookedUp.stdout.toString().trim();
+      }
+    } catch {}
+  } else {
+    const winPrefixes = [
+      "C:\\Users\\Administrator\\AppData\\Local\\hermes\\git\\usr\\bin",
+      "C:\\Program Files\\Git\\usr\\bin",
+      "C:\\Program Files (x86)\\Git\\usr\\bin",
+      "C:\\msys64\\usr\\bin",
+      "C:\\msys64\\mingw64\\bin",
+      "C:\\Program Files\\Git\\bin"
+    ];
+    for (const p of winPrefixes) {
+      const candidate = join22(p, cmd);
+      if (existsSync5(candidate))
+        return candidate;
+      const exeCandidate = candidate + ".exe";
+      if (existsSync5(exeCandidate))
+        return exeCandidate;
+    }
+    if (cmd === "bash" || cmd === "sh") {
+      return cmd;
+    }
+  }
+}
+function join22(a, b) {
+  if (a.endsWith("/") || a.endsWith("\\"))
+    return a + b;
+  return a + "/" + b;
+}
+var pathSep = process.platform === "win32" ? ";" : ":";
 function spawnCollect(opts) {
   return new Promise((resolvePromise) => {
-    const child = spawn(opts.cmd[0], opts.cmd.slice(1), {
-      cwd: opts.cwd,
-      env: opts.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: opts.detached ?? true
-    });
+    let child = null;
+    try {
+      const resolvedCmd = resolveCommand(opts.cmd[0]);
+      child = spawn(resolvedCmd, opts.cmd.length > 1 ? opts.cmd.slice(1) : [], {
+        cwd: opts.cwd,
+        env: opts.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: opts.detached ?? true
+      });
+    } catch (err) {
+      const msg = err && typeof err === "object" && "message" in err ? String(err.message) : String(err);
+      resolvePromise({ stdout: "", stderr: `spawn error: ${msg}`, exitCode: -1, timedOut: false, aborted: false });
+      return;
+    }
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (d) => stdout += d.toString());
@@ -1497,6 +1754,76 @@ function spawnCollect(opts) {
   });
 }
 
+// src/permissions.ts
+import { join as join5 } from "node:path";
+import { homedir as homedir4 } from "node:os";
+function isPathAllowed(path, perms) {
+  if (perms.filesystem === "full")
+    return true;
+  const resolved = resolvePath(path);
+  const root = resolvePath(perms.workspaceRoot);
+  return resolved.startsWith(root + "/") || resolved === root;
+}
+function checkDestructiveCommand(command, perms) {
+  if (perms.destructive === "allow")
+    return null;
+  const c = command.trim();
+  const segments = c.split(/([;&|]|&&|\|\|)/).map((s) => s.trim()).filter(Boolean);
+  for (const seg of segments) {
+    const reason = checkSingleSegment(seg);
+    if (reason) {
+      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): ${reason}` : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
+    }
+  }
+  return null;
+}
+function checkSingleSegment(seg) {
+  const destructiveFileOps = [
+    { re: /^(rm|rmdir)\s/, why: "file/directory removal (rm/rmdir)" },
+    { re: /^\s*dd\s/, why: "low-level data copying (dd)" },
+    { re: /^(mkfs|mkswap)\s/, why: "filesystem creation/destruction (mkfs/mkswap)" },
+    { re: /^(truncate|fdisk|parted)\s/, why: "disk/partition manipulation" },
+    { re: /\b(kill|pkill|killall|systemctl|reboot|shutdown|halt|poweroff)\b/, why: "process/system control" },
+    { re: /\b(sudo|doas)\b/, why: "privilege escalation (sudo/doas)" }
+  ];
+  for (const { re, why } of destructiveFileOps) {
+    if (re.test(seg))
+      return why;
+  }
+  if (/\s[>|]\s*\S/.test(seg) || /\s>>\s*\S/.test(seg)) {
+    const redirectTarget = seg.match(/[>|]\s*(\S+)/);
+    if (redirectTarget) {
+      const target = redirectTarget[1];
+      if (target === "/dev/null" || target.startsWith("/tmp/") || target.startsWith("/var/tmp/"))
+        return null;
+    }
+    return "output redirection (may overwrite files)";
+  }
+  return null;
+}
+function checkNetworkCommand(command, perms) {
+  if (perms.network === "allow")
+    return null;
+  const c = command.trim();
+  const networkCommands = [
+    { re: /\b(curl|wget|fetch|nc|ncat|netcat|telnet|scp|ssh|rsync)\b/, why: "network client (curl/wget/ssh/etc.)" },
+    { re: /\b(dig|nslookup|host|ping|traceroute|mtr)\b/, why: "network diagnostic" },
+    { re: /\b(sock|netstat|lsof\s+-i)\b/, why: "network inspection" }
+  ];
+  for (const { re, why } of networkCommands) {
+    if (re.test(c))
+      return `BLOCKED (${perms.network}): ${why}`;
+  }
+  return null;
+}
+function resolvePath(p) {
+  if (p.startsWith("~"))
+    return join5(homedir4(), p.slice(1));
+  if (p.startsWith("/"))
+    return p;
+  return join5(process.cwd(), p);
+}
+
 // src/tools/bash.ts
 var MAX_OUTPUT = 30000;
 var PLAN_MODE_BANNED = [
@@ -1509,7 +1836,7 @@ var PLAN_MODE_BANNED = [
   { re: /\b(kill|pkill|killall|systemctl|service|reboot|shutdown|halt|poweroff|init|swapoff|mkswap)\b/, why: "process/system control" },
   { re: /(^|[;&|]\s*)sudo\b/, why: "sudo" },
   { re: /\s(>|>>|2>)\s*/, why: "output redirection writes a file" },
-  { re: /\btee\s+-?a?\s+/, why: "tee writes to a file" }
+  { re: /\btee\s+-?a?s+\s+/, why: "tee writes to a file" }
 ];
 function bannedReason(command) {
   const c = command.trim();
@@ -1539,21 +1866,47 @@ registerTool({
     }
   },
   async run(args, ctx) {
+    const permissions = ctx.permissions;
     const command = String(args.command ?? "");
     if (ctx.planPhase) {
       const why = bannedReason(command);
       if (why)
         return `BLOCKED IN PLAN MODE (read-only): ${why}. Use read-only commands (ls, grep, cat, git status/diff/log, running tests) to investigate, and describe any changes you would make in your PLAN instead.`;
     }
+    if (permissions) {
+      const destructiveCheck = checkDestructiveCommand(command, permissions);
+      if (destructiveCheck) {
+        if (destructiveCheck.startsWith("BLOCKED")) {
+          return destructiveCheck;
+        }
+        return destructiveCheck;
+      }
+      const networkCheck = checkNetworkCommand(command, permissions);
+      if (networkCheck) {
+        return networkCheck;
+      }
+      if (permissions.filesystem === "workspace" && args.workdir) {
+        const workdir = String(args.workdir);
+        if (!isPathAllowed(workdir, permissions)) {
+          return `BLOCKED: workdir "${workdir}" is outside the allowed workspace (${permissions.workspaceRoot}). Use a path within the workspace.`;
+        }
+      }
+    }
     const cwd = args.workdir ? String(args.workdir) : ctx.cwd;
     const timeout = Math.max(0, Number(args.timeout ?? 120000));
-    const res = await spawnCollect({
-      cmd: ["bash", "-lc", command],
-      cwd,
-      env: { ...process.env, NO_COLOR: "1" },
-      timeoutMs: timeout,
-      signal: ctx.signal
-    });
+    let res;
+    try {
+      res = await spawnCollect({
+        cmd: ["bash", "-lc", command],
+        cwd,
+        env: { ...process.env, NO_COLOR: "1" },
+        timeoutMs: timeout,
+        signal: ctx.signal
+      });
+    } catch (err) {
+      const msg = err && typeof err === "object" && "message" in err ? String(err.message) : String(err);
+      return `ERROR: cannot run command: ${msg}`;
+    }
     let output = "";
     if (res.stdout)
       output += res.stdout;
@@ -1590,15 +1943,15 @@ function resolve2(p, ctx) {
 }
 
 // src/tools/files.ts
-import { dirname as dirname5, join as join6 } from "node:path";
+import { dirname as dirname5, join as join7 } from "node:path";
 import { mkdirSync as mkdirSync4, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
 import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
 
 // src/self-edit.ts
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync5, appendFileSync, readdirSync, writeFileSync as writeFileSync3 } from "node:fs";
-import { homedir as homedir4 } from "node:os";
-import { join as join5, resolve as resolve3, dirname as dirname4 } from "node:path";
+import { copyFileSync, existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync5, appendFileSync, readdirSync, writeFileSync as writeFileSync3 } from "node:fs";
+import { homedir as homedir5 } from "node:os";
+import { join as join6, resolve as resolve3, dirname as dirname4 } from "node:path";
 var LEDGER_NAME = "SELF_EDITS.jsonl";
 function repoRoot() {
   const env = process.env.VIBECODER_REPO_ROOT;
@@ -1610,14 +1963,14 @@ function installMode() {
   if (process.env.VIBECODER_REPO_ROOT)
     return "repo";
   const root = dirname4(packageRoot());
-  if (existsSync5(join5(root, ".git")) || existsSync5(join5(packageRoot(), ".git")))
+  if (existsSync6(join6(root, ".git")) || existsSync6(join6(packageRoot(), ".git")))
     return "repo";
   return "user";
 }
 function userDataRoot() {
   if (process.env.VIBECODER_SESSION_DIR)
     return process.env.VIBECODER_SESSION_DIR;
-  return join5(homedir4(), ".vibecoder");
+  return join6(homedir5(), ".vibecoder");
 }
 function repoConfigFile() {
   return resolvePackageFile("config.json");
@@ -1627,15 +1980,15 @@ function liveConfigFile() {
   if (repo && installMode() === "repo")
     return repo.config;
   const repoCfg = repoConfigFile();
-  if (installMode() === "repo" && repoCfg && !existsSync5(userConfigFile()))
+  if (installMode() === "repo" && repoCfg && !existsSync6(userConfigFile()))
     return repoCfg;
   return userConfigFile();
 }
 function ledgerPath() {
-  return installMode() === "repo" ? join5(repoRoot(), LEDGER_NAME) : join5(userDataRoot(), LEDGER_NAME);
+  return installMode() === "repo" ? join6(repoRoot(), LEDGER_NAME) : join6(userDataRoot(), LEDGER_NAME);
 }
 function backupsDir() {
-  return join5(userDataRoot(), "backups");
+  return join6(userDataRoot(), "backups");
 }
 function isSameFile(a, b) {
   return resolve3(a) === resolve3(b);
@@ -1643,7 +1996,7 @@ function isSameFile(a, b) {
 function reposWhere() {
   if (process.env.VIBECODER_REPO_ROOT) {
     const root = resolve3(process.env.VIBECODER_REPO_ROOT);
-    return { root, config: join5(root, "config.json"), env: join5(root, ".env") };
+    return { root, config: join6(root, "config.json"), env: join6(root, ".env") };
   }
   return null;
 }
@@ -1677,7 +2030,7 @@ function snapshotConfig(content) {
   const dir = backupsDir();
   mkdirSync3(dir, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const file = join5(dir, `config-${ts}.json`);
+  const file = join6(dir, `config-${ts}.json`);
   writeFileSync3(file, content, "utf8");
   return file;
 }
@@ -1762,7 +2115,7 @@ registerTool({
       } else if (e.isFile()) {
         let size = "";
         try {
-          const st = statSync2(join6(p, e.name));
+          const st = statSync2(join7(p, e.name));
           size = formatSize(st.size);
         } catch {
           size = "?";
@@ -1800,11 +2153,18 @@ registerTool({
     const text = await fileText(p);
     const lines = text.split(`
 `);
+    const totalLines = lines.length;
     const offset = Math.max(1, Number(args.offset ?? 1) || 1);
+    if (offset > totalLines)
+      return `(file has ${totalLines} line(s); offset ${offset} is past the end)`;
     const limit = Math.max(0, Number(args.limit ?? 2000) || 2000);
     const slice = lines.slice(offset - 1, offset - 1 + limit);
-    return slice.map((l, i) => `${offset + i}: ${l}`).join(`
+    const shown = slice.length;
+    const note = shown < limit && shown < totalLines - offset + 1 ? "" : "";
+    const out = slice.map((l, i) => `${offset + i}: ${l}`).join(`
 `);
+    return shown < totalLines - offset + 1 && limit > 0 ? out + `
+...(${totalLines - offset + 1 - shown} more line(s) not shown)` : out;
   }
 });
 registerTool({
@@ -1842,13 +2202,14 @@ registerTool({
     type: "function",
     function: {
       name: "edit_file",
-      description: "Perform an exact string replacement in a file. Use to modify part of a file without rewriting the whole thing.",
+      description: "Perform an exact string replacement in a file. Use to modify part of a file without rewriting the whole thing. By default replaces only the first occurrence; set replaceAll to true to replace every occurrence.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "Absolute path to the file" },
           oldString: { type: "string", description: "The exact text to find and replace" },
-          newString: { type: "string", description: "The replacement text" }
+          newString: { type: "string", description: "The replacement text" },
+          replaceAll: { type: "boolean", description: "When true, replace every occurrence (default: false — only first)" }
         },
         required: ["path", "oldString", "newString"]
       }
@@ -1860,6 +2221,7 @@ registerTool({
     const p = resolve2(String(args.path), ctx);
     const oldString = String(args.oldString ?? "");
     const newString = String(args.newString ?? "");
+    const replaceAll = Boolean(args.replaceAll);
     if (!await fileExists(p))
       return `ERROR: file not found: ${p}`;
     if (isProtectedFile(p))
@@ -1870,12 +2232,18 @@ registerTool({
     const count = text.split(oldString).length - 1;
     if (count === 0)
       return `ERROR: oldString not found in file`;
-    if (count > 1)
-      return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique)`;
-    const updated = text.replace(oldString, newString);
+    let updated;
+    if (replaceAll) {
+      updated = text.split(oldString).join(newString);
+    } else {
+      if (count > 1)
+        return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique) or set replaceAll=true to replace all`;
+      updated = text.replace(oldString, newString);
+    }
     await writeFileAsync(p, updated, "utf8");
-    const note = isSelfFile(p) ? auditSelfEdit("edit_file", p, text, updated, "replaced 1 occurrence") : "";
-    return `Edited ${p}: replaced 1 occurrence${note ? `
+    const replaced = replaceAll ? count : 1;
+    const note = isSelfFile(p) ? auditSelfEdit("edit_file", p, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`) : "";
+    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}${note ? `
 ` + note : ""}`;
   }
 });
@@ -1883,7 +2251,7 @@ registerTool({
 // src/tools/glob.ts
 import { opendir } from "node:fs/promises";
 import { access } from "node:fs/promises";
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 var EXCLUDE_DEFAULTS = ["node_modules", ".git"];
 function segmentToRegExp(seg) {
   let re = "^";
@@ -1961,7 +2329,7 @@ async function globScan(pattern, opts) {
           if (exclusions.has(e.name))
             continue;
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          const childAbs = join7(dir, e.name);
+          const childAbs = join8(dir, e.name);
           if (e.isDirectory()) {
             await recurse(remaining, childAbs, childRel);
           } else if (!onlyFiles || e.isFile()) {
@@ -1982,7 +2350,7 @@ async function globScan(pattern, opts) {
           break;
         if (e.isDirectory() && !exclusions.has(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining, join7(dir, e.name), childRel);
+          await recurse(remaining, join8(dir, e.name), childRel);
         }
       }
       return;
@@ -2020,7 +2388,7 @@ async function globScan(pattern, opts) {
           continue;
         if (rx.test(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining.slice(1), join7(dir, e.name), childRel);
+          await recurse(remaining.slice(1), join8(dir, e.name), childRel);
         }
       }
     }
@@ -2278,13 +2646,23 @@ async function runQueuedTask(task, deps, signal) {
       confirmTool: queuedToolPolicy(deps, signal)
     });
     const done = markTaskDone(task.id, result.finalText || "(no final text)");
-    log(deps, `✔ [${task.id}] done in ${result.steps} step(s), ${result.toolCalls} tool call(s)`);
+    log(deps, `✅ [${task.id}] done in ${result.steps} step(s), ${result.toolCalls} tool call(s)`);
     return done;
   } catch (err) {
     const msg = err?.message ?? String(err);
-    const failed = markTaskFailed(task.id, msg);
-    log(deps, `✘ [${task.id}] failed: ${msg}`);
-    return failed ?? claimed;
+    const existingAttempts = claimed.attempts ?? 0;
+    const nextAttempts = existingAttempts + 1;
+    if (nextAttempts >= 5) {
+      const failed = markTaskFailed(task.id, msg, nextAttempts);
+      log(deps, `✘ [${task.id}] failed (attempt ${nextAttempts}/5): ${msg}`);
+      return failed ?? claimed;
+    }
+    const backoffMs = Math.min(300000, 30000 * Math.pow(2, nextAttempts - 1));
+    const retryAfter = Date.now() + backoffMs;
+    const retried = markTaskRetry(task.id, nextAttempts);
+    retried.retryAfter = retryAfter;
+    log(deps, `↻ [${task.id}] failed (attempt ${nextAttempts}/5) — will retry in ${(backoffMs / 1000).toFixed(0)}s`);
+    return retried ?? claimed;
   }
 }
 async function drainQueue(deps, signal) {
@@ -2305,12 +2683,12 @@ async function drainQueue(deps, signal) {
 // src/daemon.ts
 function expandHome2(p) {
   if (p === "~")
-    return homedir5();
+    return homedir6();
   if (p.startsWith("~/"))
-    return join8(homedir5(), p.slice(2));
+    return join9(homedir6(), p.slice(2));
   return p;
 }
-var PID_FILE = join8(homedir5(), ".vibecoder", "queue-daemon.pid");
+var PID_FILE = join9(homedir6(), ".vibecoder", "queue-daemon.pid");
 function readPid() {
   try {
     const s = readFileSync6(PID_FILE, "utf8").trim();
@@ -2321,7 +2699,7 @@ function readPid() {
   }
 }
 function writePid() {
-  mkdirSync5(join8(homedir5(), ".vibecoder"), { recursive: true });
+  mkdirSync5(join9(homedir6(), ".vibecoder"), { recursive: true });
   writeFileSync4(PID_FILE, String(process.pid));
 }
 function removePid() {
@@ -2376,7 +2754,7 @@ async function main() {
     process.exit(1);
   });
   const rawLogFile = cfg.queue?.daemonLog;
-  const logFile = rawLogFile ? expandHome2(rawLogFile) : join8(homedir5(), ".vibecoder", "queue-daemon.log");
+  const logFile = rawLogFile ? expandHome2(rawLogFile) : join9(homedir6(), ".vibecoder", "queue-daemon.log");
   setQueueFileOverride(cfg.queue?.file);
   const onLog = logger(logFile);
   const onLogToConsole = (line) => {

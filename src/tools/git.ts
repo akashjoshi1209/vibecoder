@@ -1,14 +1,9 @@
 import { registerTool, type ToolContext } from "./registry";
 import { spawnCollect } from "./proc";
+import { pathDenied } from "./fs-utils";
 
-/**
- * Read-only Git operations. Use these to inspect repo state without touching it.
- * All commands are read-only: status, log, diff, branch, remote, tag, show.
- * Fast-forward only push and remote URL read included where non-mutating.
- * Destructive git commands (reset --hard, clean -fd, rebase, merge, cherry-pick,
- * push --force, branch -D, stash drop) are NOT exposed here — use bash if you
- * really need them and have been told it is safe.
- */
+// ── read-only git operations ────────────────────────────────────────────────────
+
 registerTool({
   definition: {
     type: "function",
@@ -195,6 +190,10 @@ registerTool({
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 async function runGit(args: string[], label: string, ctx: ToolContext): Promise<string> {
+  // Every git tool runs in ctx.cwd, so gate that one directory centrally
+  // instead of repeating the check in each tool.
+  const denied = pathDenied(ctx.cwd, ctx);
+  if (denied) return denied;
   const res = await spawnCollect({
     cmd: ["git", ...args],
     cwd: ctx.cwd,
@@ -214,3 +213,80 @@ function truncate(s: string, maxLines: number): string {
   if (lines.length <= maxLines) return s;
   return lines.slice(0, maxLines).join("\n") + `\n...[${lines.length - maxLines} more lines truncated]`;
 }
+
+// ── git commit & branch tools (mutating) ───────────────────────────────────────
+
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_commit",
+      description:
+        "Create a commit with the given message. Stages all changes (git add -A) then commits. Use after making file edits. Returns the commit hash and message.",
+      parameters: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "The commit message" },
+          files: { type: "string", description: "Optional: specific files to stage (space-separated). If omitted, stages all changes (git add -A)." },
+        },
+        required: ["message"],
+      },
+    },
+  },
+  async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    const message = String(args.message ?? "").trim();
+    if (!message) return "ERROR: commit message is required";
+    const files = args.files ? String(args.files).trim() : "";
+
+    // Stage
+    let stageOut: string;
+    if (files) {
+      stageOut = await runGit(["add", ...files.split(/\s+/).filter(Boolean)], "git add", ctx);
+    } else {
+      stageOut = await runGit(["add", "-A"], "git add -A", ctx);
+    }
+
+    // Status after staging
+    const status = await runGit(["status", "--short"], "git status --short", ctx);
+
+    // Commit
+    const commit = await runGit(["commit", "-m", message], `git commit -m "${message}"`, ctx);
+    const hashMatch = commit.match(/\[(\w+\s+\d+\s+[a-f0-9]+)\]/);
+    const summary = hashMatch ? hashMatch[1] : commit;
+
+    return `Committed as:\n${summary}\n\nStaged changes:\n${status || "(none)"}`;
+  },
+});
+
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_checkout_branch",
+      description:
+        "Create and switch to a new branch. If the branch exists, just switches to it. Returns the new/current branch name.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The branch name to create/switch to" },
+          base: { type: "string", description: "Optional base branch to create from (default: current branch)" },
+        },
+      },
+    },
+  },
+  async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    const name = String(args.name ?? "").trim();
+    if (!name) return "ERROR: branch name is required";
+    const base = args.base ? String(args.base).trim() : "";
+
+    let branch: string;
+    if (base) {
+      branch = await runGit(["checkout", "-b", name, base], `git checkout -b ${name} ${base}`, ctx);
+    } else {
+      branch = await runGit(["checkout", "-b", name], `git checkout -b ${name}`, ctx);
+    }
+    const hashMatch = branch.match(/Switched to a new branch '([^']+)'/);
+    const result = hashMatch ? hashMatch[1] : branch;
+    return `On branch: ${result}`;
+  },
+});

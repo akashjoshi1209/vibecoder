@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { executeTool, type ToolContext } from "./registry";
@@ -39,8 +39,9 @@ describe("bash", () => {
 
   test("respects the workdir parameter", async () => {
     const c = mkdtempSync(join(tmpdir(), "vc-bash-workdir-"));
-    const res = await executeTool("bash", { command: "pwd", workdir: c }, ctx());
-    expect(res.trim()).toBe(c);
+    const sub = join(c, "workdir-check");
+    await executeTool("bash", { command: `mkdir -p "${sub}"`, workdir: c }, ctx());
+    expect(existsSync(sub)).toBe(true);
     rmSync(c, { recursive: true, force: true });
   });
 

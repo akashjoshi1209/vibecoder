@@ -11,7 +11,8 @@ import "../tools/files";
 import "../tools/search";
 import "../tools/net";
 import "../tools/termux";
-import "../tools/tailscale";
+// tools/tailscale.ts was deleted: it also registered "tailscale_status" and was
+// shadowing network.ts, which is the better implementation.
 import "../tools/network";
 import "../tools/env";
 import "../tools/git";

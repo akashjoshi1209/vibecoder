@@ -42,7 +42,7 @@ export function loadDotEnv(): void {
       const kv = envLine(raw);
       if (!kv) continue;
       const [key, value] = kv;
-      if (!(key in process.env)) process.env[key] = value;
+      if (!(key in process.env) || !process.env[key]) process.env[key] = value;
     }
   }
 }

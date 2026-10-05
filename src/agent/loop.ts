@@ -1,6 +1,6 @@
 import { ContextTooLargeError, type ChatOptions, type Message, type StreamResult, type ToolCall } from "../llm/types";
 import { listTools, executeTool, type ToolContext } from "../tools/registry";
-import { normalizeToolCalls, parseToolCalls } from "./tool-call";
+import { normalizeToolCalls, parseToolCalls, type ParsedToolCall } from "./tool-call";
 import { estimateTokens, estimateMessagesTokens, trimMessages, type TrimResult } from "../llm/tokens";
 import { RatePacer, paceWait } from "../llm/pace";
 
@@ -14,6 +14,10 @@ export interface AgentCallbacks {
   maxSteps?: number;
   /** If trimmed, a short note is passed through this callback. */
   onTrimmed?: (trimmed: number, truncatedChars: number) => void;
+  /** Called at the start of each step with the current step index (1-based) and
+   *  the running total of tool calls executed so far. UI can use this to show
+   *  live progress in a status bar. */
+  onStepUpdate?: (stepIndex: number, toolCallCount: number, maxSteps: number) => void;
 }
 
 export interface AgentResult {
@@ -78,6 +82,7 @@ export async function runAgent(
       callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
       return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true };
     }
+    callbacks.onStepUpdate?.(step + 1, toolCalls, maxSteps);
 
     let result: StreamResult | null = null;
     let stepOk = false;
@@ -189,18 +194,27 @@ export async function runAgent(
 
     const parsed = parseToolCalls(normalizedCalls);
 
-    for (const call of parsed) {
+    // Run independent tool calls in parallel when there are 2+ and no abort
+    // pending. Sequential execution is kept when there is only one call or the
+    // user has asked to confirm tools one at a time (confirmTool may depend on
+    // prior tool results being visible, so we keep ordering there).
+    const PARALLEL_THRESHOLD = 2;
+    const parallelCalls = parsed.filter((c) => c.name);
+    const runOne = async (call: ParsedToolCall) => {
       toolCalls++;
       if (!call.name) {
         const id = call.id || `call_${toolCalls}`;
-        messages.push({
-          role: "tool",
-          tool_call_id: id,
-          content:
-            "ERROR: the model emitted a tool call with no function name. Reissue a valid tool call or finish by responding with plain text.",
-          name: "unknown",
-        });
-        continue;
+        return {
+          call,
+          message: {
+            role: "tool" as const,
+            tool_call_id: id,
+            content:
+              "ERROR: the model emitted a tool call with no function name. Reissue a valid tool call or finish by responding with plain text.",
+            name: "unknown",
+          },
+          output: "",
+        };
       }
       callbacks.onToolStart?.(call.name, call.args);
       let output: string;
@@ -218,7 +232,51 @@ export async function runAgent(
         }
       }
       callbacks.onToolEnd?.(call.name, output);
-      messages.push({ role: "tool", tool_call_id: call.id, content: output, name: call.name });
+      return {
+        call,
+        message: { role: "tool" as const, tool_call_id: call.id, content: output, name: call.name },
+        output,
+      };
+    };
+
+    // runOne is async, so ReturnType is a Promise. Awaited unwraps it to the
+    // shape actually stored per result.
+    type ToolResult = Awaited<ReturnType<typeof runOne>>;
+    let results: ToolResult[];
+    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool) {
+      // Parallel: fire all tool starts together, then collect results in order.
+      toolCalls += parallelCalls.length;
+      for (const call of parallelCalls) {
+        callbacks.onToolStart?.(call.name, call.args);
+      }
+      const outputs = await Promise.all(
+        parallelCalls.map(async (call) => {
+          let output: string;
+          try {
+            output = await executeTool(call.name, call.args, options.toolCtx);
+          } catch (err: any) {
+            output = `ERROR: ${err?.message ?? String(err)}`;
+          }
+          callbacks.onToolEnd?.(call.name, output);
+          return { call, output };
+        }),
+      );
+      results = outputs.map((r) => ({
+        ...r,
+        message: { role: "tool" as const, tool_call_id: r.call.id, content: r.output, name: r.call.name },
+      }));
+      // Also handle the no-name calls (they're not in parallelCalls since they have no name).
+      const noNameResults = await Promise.all(
+        parsed.filter((c) => !c.name).map((call) => runOne(call)),
+      );
+      results = [...noNameResults, ...results];
+    } else {
+      // Sequential: preserve existing behaviour, including per-call confirmTool.
+      results = await Promise.all(parsed.map((call) => runOne(call)));
+    }
+
+    for (const r of results) {
+      messages.push(r.message);
     }
 
     // Track what happened this step for the progress summary.

@@ -15,12 +15,57 @@ export function disableMouse(): void {
   out("\x1b[?1000l\x1b[?1006l");
 }
 
-const WIDE =
-  /[\u1100-\u115F\u2300-\u23FF\u2500-\u25FF\u2700-\u27BF\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/;
+// Emoji / pictographic ranges — all double-width on CJK-capable terminal fonts.
+// Covers Emoticons, Misc. Symbols & Pictographs, Transport/Map, Supplemental
+// Symbols & Pictographs, Misc. Symbols & Arrows, Chess, Symbols Ext-A, etc.
+// code-point width test: true for characters that occupy 2 terminal columns
+// (CJK, emoji, wide pictographs). Handles characters above U+FFFF (surrogate
+// pairs) via codePointAt(0). Variation selectors / ZWJ are treated as zero-width
+// so multi-codepoint emoji sequences don't inflate the column count.
+function isWideCP(cp: number): boolean {
+  // CJK / wide East Asian / combining marks / enclosed chars (BMP)
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2300 && cp <= 0x23ff) ||
+    (cp >= 0x2500 && cp <= 0x25ff) ||
+    (cp >= 0x2700 && cp <= 0x27bf) ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6)
+  )
+    return true;
+  // Emoji planes: emoticons, misc symbols & pictographs, transport/map,
+  // supplemental symbols & pictographs, chess, symbols ext-A, etc.
+  if (
+    (cp >= 0x1f300 && cp <= 0x1f5ff) || // misc. symbols & pictographs
+    (cp >= 0x1f600 && cp <= 0x1f64f) || // emoticons
+    (cp >= 0x1f680 && cp <= 0x1f6ff) || // transport & map
+    (cp >= 0x1f900 && cp <= 0x1f9ff) || // supplemental symbols & pictographs
+    (cp >= 0x1fa00 && cp <= 0x1fa6f) || // chess symbols
+    (cp >= 0x1fa70 && cp <= 0x1faff) || // symbols & pictographs ext-A
+    (cp >= 0x2b00 && cp <= 0x2bff) || // misc. symbols and arrows
+    (cp >= 0x1d000 && cp <= 0x1d0ff) || // Sutton SignWriting
+    (cp >= 0x1fb00 && cp <= 0x1fbff) // symbols for legacy computing
+  )
+    return true;
+  return false;
+}
 
+export function codeWidth(ch: string): number {
+  // Zero-width joiners / variation selectors / combining marks don't add columns
+  const cp = ch.codePointAt(0)!;
+  if (cp === 0x200d || cp === 0xfe0e || cp === 0xfe0f || (cp >= 0x2000 && cp <= 0x200f)) return 0;
+  return isWideCP(cp) ? 2 : 1;
+}
+
+/** Display columns a whole string occupies (ANSI escapes excluded). */
 export function displayWidth(s: string): number {
+  const bare = s.replace(/\x1b\[[0-9;]*m/g, "");
   let w = 0;
-  for (const ch of s) w += WIDE.test(ch) ? 2 : 1;
+  for (const ch of bare) w += codeWidth(ch);
   return w;
 }
 
@@ -34,7 +79,7 @@ export function wrapText(s: string, width: number): string[] {
     let cur = "";
     let curW = 0;
     for (const ch of raw) {
-      const cw = WIDE.test(ch) ? 2 : 1;
+      const cw = codeWidth(ch);
       if (curW + cw > width) {
         out.push(cur);
         cur = ch;
@@ -133,7 +178,7 @@ export function wrapAnsi(s: string, width: number): string[] {
       w = 0;
     };
     for (let i = 0; i < chars.length; i++) {
-      const cw = WIDE.test(chars[i]) ? 2 : 1;
+      const cw = codeWidth(chars[i]);
       // verbatim escapes always; reopen open-state only at segment start
       const prefix = pre[i] !== "" ? pre[i] : line === "" ? stateEnc[i] : "";
       if (w + cw > width) {

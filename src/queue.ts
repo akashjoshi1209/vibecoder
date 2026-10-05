@@ -23,6 +23,10 @@ export interface QueuedTask {
   runnerPid?: number;
   startedAt?: number;
   finishedAt?: number;
+  /** Number of times this task has been attempted (starts at 1, incremented on each retry). */
+  attempts?: number;
+  /** Unix ms timestamp after which the task may be retried (blocks rapid re-queue loops). */
+  retryAfter?: number;
 }
 
 let _root: string | null = null;
@@ -175,8 +179,18 @@ export function loadTask(id: string): QueuedTask | null {
 
 export function nextQueued(): QueuedTask | null {
   const tasks = read();
+  const now = Date.now();
   const candidates = tasks
-    .filter((t) => t.status === "queued" || (t.status === "running" && t.runnerPid && !processExists(t.runnerPid)))
+    .filter((t) => {
+      if (t.status === "queued") return true;
+      if (t.status === "running" && t.runnerPid && !processExists(t.runnerPid)) return true;
+      // Failed tasks become eligible for retry once retryAfter passes and
+      // attempts is under the cap (5 attempts total).
+      if (t.status === "failed" && t.attempts !== undefined && t.attempts < 5) {
+        if (!t.retryAfter || now >= t.retryAfter) return true;
+      }
+      return false;
+    })
     .sort((a, b) => a.createdAt - b.createdAt);
   return candidates[0] ?? null;
 }
@@ -218,22 +232,50 @@ export function claimTask(id: string): QueuedTask | null {
   });
 }
 
+/** Put a task back in the queue immediately, regardless of any retry backoff.
+ *  Used when a runner is killed or a task is re-driven by hand: unlike
+ *  markTaskRetry it clears retryAfter so nextQueued() picks it up right away. */
+export function requeueTask(id: string): QueuedTask | null {
+  return withLock(() =>
+    update(id, {
+      status: "queued",
+      runnerPid: undefined,
+      error: undefined,
+      result: undefined,
+      retryAfter: undefined,
+    }),
+  );
+}
+
 export function markTaskDone(id: string, result: string): QueuedTask | null {
   return withLock(() => update(id, { status: "done", result, finishedAt: Date.now(), runnerPid: undefined, error: undefined }));
 }
 
-export function markTaskFailed(id: string, error: string): QueuedTask | null {
-  return withLock(() => update(id, { status: "failed", error, finishedAt: Date.now(), runnerPid: undefined }));
+export function markTaskFailed(id: string, error: string, attempts?: number, retryAfter?: number): QueuedTask | null {
+  return withLock(() => update(id, { status: "failed", error, finishedAt: Date.now(), runnerPid: undefined, attempts, retryAfter }));
 }
 
-export function requeueTask(id: string): QueuedTask | null {
-  return withLock(() => update(id, { status: "queued", runnerPid: undefined, error: undefined }));
+export function markTaskRetry(id: string, attempts: number): QueuedTask | null {
+  const now = Date.now();
+  const backoffMs = Math.min(300_000, 30_000 * Math.pow(2, attempts - 1)); // 30s base, doubling, cap 5min
+  // Keep status "failed", not "queued": nextQueued() only honours retryAfter for
+  // failed tasks, so a queued task would be picked up again immediately and the
+  // backoff would never take effect.
+  return withLock(() => update(id, {
+    status: "failed",
+    runnerPid: undefined,
+    error: undefined,
+    attempts,
+    retryAfter: now + backoffMs,
+  }));
 }
 
-/** Return queued/running-after-crash tasks back to "queued" (on daemon startup). */
+/** Return queued/running-after-crash tasks back to "queued" (on daemon startup).
+ *  Also resurrect failed tasks whose retry window has passed, up to the attempt cap. */
 export function resetStale(): number {
   return withLock(() => {
     const tasks = read();
+    const now = Date.now();
     let n = 0;
     for (const t of tasks) {
       if (t.status === "running") {
@@ -241,9 +283,23 @@ export function resetStale(): number {
           n++;
           t.status = "queued";
           t.runnerPid = undefined;
+          t.retryAfter = undefined;
         }
       }
-      if (t.status === "queued" && t.runnerPid) t.runnerPid = undefined;
+      if (t.status === "queued") {
+        t.runnerPid = undefined;
+        if (t.attempts !== undefined && t.attempts >= 5) {
+          t.status = "failed"; // exhausted — leave as failed
+          t.retryAfter = undefined;
+        }
+      }
+      if (t.status === "failed" && t.attempts !== undefined && t.attempts < 5) {
+        if (!t.retryAfter || now >= t.retryAfter) {
+          n++;
+          t.status = "queued";
+          t.retryAfter = undefined;
+        }
+      }
     }
     write(tasks);
     return n;

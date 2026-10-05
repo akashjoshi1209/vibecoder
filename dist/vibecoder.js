@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { createRequire } from "node:module";
+var __require = /* @__PURE__ */ createRequire(import.meta.url);
+
 // src/llm/types.ts
 class ContextTooLargeError extends Error {
   status;
@@ -527,9 +530,25 @@ function readPackageJson() {
 
 // src/config.ts
 var FALLBACK_CONFIG = {
-  provider: "ollama",
-  model: "qwen2.5:1.5b",
+  provider: "groq",
+  model: "qwen/qwen3.8-27b",
   providers: {
+    groq: {
+      type: "openai-compatible",
+      baseURL: "https://api.groq.com/openai/v1",
+      apiKeyEnv: "GROQ_API_KEY",
+      timeoutMs: 240000,
+      timeoutIdleMs: 120000,
+      models: ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    },
+    nvidia: {
+      type: "openai-compatible",
+      baseURL: "https://api.nvidia.com/v1",
+      apiKeyEnv: "NVIDIA_API_KEY",
+      timeoutMs: 240000,
+      timeoutIdleMs: 120000,
+      models: ["nvidia/nemotron-3-ultra-550b-a55b"]
+    },
     ollama: {
       type: "openai-compatible",
       baseURL: "http://127.0.0.1:11434/v1",
@@ -538,7 +557,13 @@ var FALLBACK_CONFIG = {
       timeoutIdleMs: 120000,
       models: ["qwen2.5:1.5b", "llama3.1"]
     }
-  }
+  },
+  permissions: {
+    destructive: "allow",
+    network: "allow",
+    filesystem: "full"
+  },
+  maxCostUsd: undefined
 };
 function userConfigFile() {
   const sessionDir = process.env.VIBECODER_SESSION_DIR;
@@ -563,6 +588,92 @@ function isPlainObject(v) {
     return false;
   const proto = Object.getPrototypeOf(v);
   return proto === Object.prototype || proto === null;
+}
+function validateConfig(cfg) {
+  const errors = [];
+  if (!isPlainObject(cfg)) {
+    errors.push("config must be a JSON object (top-level {})");
+    return errors;
+  }
+  const o = cfg;
+  if (typeof o.provider !== "string" || !o.provider) {
+    errors.push('config.provider must be a non-empty string (e.g. "groq", "ollama")');
+  }
+  if (typeof o.model !== "string" || !o.model) {
+    errors.push("config.model must be a non-empty string");
+  }
+  if (!isPlainObject(o.providers)) {
+    errors.push("config.providers must be an object mapping provider names to config");
+  } else {
+    const providers = o.providers;
+    for (const name of Object.keys(providers)) {
+      const p = providers[name];
+      if (!isPlainObject(p)) {
+        errors.push(`providers."${name}" must be an object`);
+        continue;
+      }
+      const pc = p;
+      if (typeof pc.type !== "string" || !pc.type) {
+        errors.push(`providers."${name}".type must be a non-empty string (e.g. "openai-compatible" or "anthropic")`);
+      }
+      if (typeof pc.baseURL !== "string" || !pc.baseURL) {
+        errors.push(`providers."${name}".baseURL must be a non-empty string`);
+      }
+      if (typeof pc.apiKeyEnv !== "string") {
+        errors.push(`providers."${name}".apiKeyEnv must be a string (can be empty for local providers like ollama)`);
+      }
+      if (!Array.isArray(pc.models) || !pc.models.length) {
+        errors.push(`providers."${name}".models must be a non-empty array of model IDs`);
+      }
+      if (!pc.models.every((m) => typeof m === "string")) {
+        errors.push(`providers."${name}".models must all be strings`);
+      }
+    }
+  }
+  if (o.routing !== undefined) {
+    if (!isPlainObject(o.routing)) {
+      errors.push("config.routing must be an object");
+    } else {
+      const r = o.routing;
+      if (typeof r.strategy !== "string" || !["keyword", "hybrid"].includes(r.strategy)) {
+        errors.push(`config.routing.strategy must be "keyword" or "hybrid"`);
+      }
+      for (const key of ["chatProvider", "chatModel", "heavyProvider", "heavyModel"]) {
+        if (r[key] !== undefined && (typeof r[key] !== "string" || !r[key])) {
+          errors.push(`config.routing.${key} must be a non-empty string when set`);
+        }
+      }
+    }
+  }
+  if (o.temperature !== undefined && (typeof o.temperature !== "number" || !isFinite(o.temperature) || o.temperature < 0 || o.temperature > 2)) {
+    errors.push("config.temperature must be a number between 0 and 2");
+  }
+  if (o.maxInputTokens !== undefined && (typeof o.maxInputTokens !== "number" || !isFinite(o.maxInputTokens) || o.maxInputTokens < 1)) {
+    errors.push("config.maxInputTokens must be a positive number");
+  }
+  if (o.maxInputTokensPerMinute !== undefined && (typeof o.maxInputTokensPerMinute !== "number" || !isFinite(o.maxInputTokensPerMinute) || o.maxInputTokensPerMinute < 1)) {
+    errors.push("config.maxInputTokensPerMinute must be a positive number");
+  }
+  if (o.maxCostUsd !== undefined && (typeof o.maxCostUsd !== "number" || !isFinite(o.maxCostUsd) || o.maxCostUsd < 0)) {
+    errors.push("config.maxCostUsd must be a non-negative number (e.g. 5 for a $5 cap)");
+  }
+  if (o.permissions !== undefined) {
+    if (!isPlainObject(o.permissions)) {
+      errors.push("config.permissions must be an object");
+    } else {
+      const p = o.permissions;
+      if (p.destructive !== undefined && !["allow", "ask", "deny"].includes(p.destructive)) {
+        errors.push('config.permissions.destructive must be "allow", "ask", or "deny"');
+      }
+      if (p.network !== undefined && !["allow", "deny"].includes(p.network)) {
+        errors.push('config.permissions.network must be "allow" or "deny"');
+      }
+      if (p.filesystem !== undefined && !["workspace", "full"].includes(p.filesystem)) {
+        errors.push('config.permissions.filesystem must be "workspace" or "full"');
+      }
+    }
+  }
+  return errors;
 }
 function deepMerge(base, override) {
   if (override === undefined)
@@ -593,8 +704,18 @@ async function loadConfig(path) {
   const { builtin, effectiveFile, merged } = configPaths();
   const base = builtin ? loadJsonFile(builtin) : FALLBACK_CONFIG;
   if (merged) {
-    const user = loadJsonFile(effectiveFile);
-    return deepMerge(base, user);
+    const raw = loadJsonFile(effectiveFile);
+    const mergedCfg = deepMerge(base, raw);
+    const errors = validateConfig(mergedCfg);
+    if (errors.length) {
+      const userFile = configPaths().userFile;
+      const where = userFile ? ` in ${userFile}` : "";
+      throw new Error(`config.json has problems that would crash vibecoder:${where}
+  ${errors.join(`
+  `)}
+  Fix the file above and restart.`);
+    }
+    return mergedCfg;
   }
   return base;
 }
@@ -1115,6 +1236,7 @@ async function runAgent(options, callbacks = {}) {
       return { finalText: `
 [interrupted]`, toolCalls, steps: step, aborted: true };
     }
+    callbacks.onStepUpdate?.(step + 1, toolCalls, maxSteps);
     let result = null;
     let stepOk = false;
     for (let attempt = 0;attempt <= MAX_STEP_RETRIES && !stepOk; attempt++) {
@@ -1207,17 +1329,22 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
       messages.push(assistantMsg);
     }
     const parsed = parseToolCalls(normalizedCalls);
-    for (const call of parsed) {
+    const PARALLEL_THRESHOLD = 2;
+    const parallelCalls = parsed.filter((c) => c.name);
+    const runOne = async (call) => {
       toolCalls++;
       if (!call.name) {
         const id = call.id || `call_${toolCalls}`;
-        messages.push({
-          role: "tool",
-          tool_call_id: id,
-          content: "ERROR: the model emitted a tool call with no function name. Reissue a valid tool call or finish by responding with plain text.",
-          name: "unknown"
-        });
-        continue;
+        return {
+          call,
+          message: {
+            role: "tool",
+            tool_call_id: id,
+            content: "ERROR: the model emitted a tool call with no function name. Reissue a valid tool call or finish by responding with plain text.",
+            name: "unknown"
+          },
+          output: ""
+        };
       }
       callbacks.onToolStart?.(call.name, call.args);
       let output;
@@ -1235,7 +1362,39 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
         }
       }
       callbacks.onToolEnd?.(call.name, output);
-      messages.push({ role: "tool", tool_call_id: call.id, content: output, name: call.name });
+      return {
+        call,
+        message: { role: "tool", tool_call_id: call.id, content: output, name: call.name },
+        output
+      };
+    };
+    let results;
+    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool) {
+      toolCalls += parallelCalls.length;
+      for (const call of parallelCalls) {
+        callbacks.onToolStart?.(call.name, call.args);
+      }
+      const outputs = await Promise.all(parallelCalls.map(async (call) => {
+        let output;
+        try {
+          output = await executeTool(call.name, call.args, options.toolCtx);
+        } catch (err) {
+          output = `ERROR: ${err?.message ?? String(err)}`;
+        }
+        callbacks.onToolEnd?.(call.name, output);
+        return { call, output };
+      }));
+      results = outputs.map((r) => ({
+        ...r,
+        message: { role: "tool", tool_call_id: r.call.id, content: r.output, name: r.call.name }
+      }));
+      const noNameResults = await Promise.all(parsed.filter((c) => !c.name).map((call) => runOne(call)));
+      results = [...noNameResults, ...results];
+    } else {
+      results = await Promise.all(parsed.map((call) => runOne(call)));
+    }
+    for (const r of results) {
+      messages.push(r.message);
     }
     const stepToolNames = parsed.filter((c) => c.name).map((c) => c.name);
     if (stepToolNames.length) {
@@ -1375,7 +1534,18 @@ function listTasks(status) {
 }
 function nextQueued() {
   const tasks = read();
-  const candidates = tasks.filter((t) => t.status === "queued" || t.status === "running" && t.runnerPid && !processExists(t.runnerPid)).sort((a, b) => a.createdAt - b.createdAt);
+  const now = Date.now();
+  const candidates = tasks.filter((t) => {
+    if (t.status === "queued")
+      return true;
+    if (t.status === "running" && t.runnerPid && !processExists(t.runnerPid))
+      return true;
+    if (t.status === "failed" && t.attempts !== undefined && t.attempts < 5) {
+      if (!t.retryAfter || now >= t.retryAfter)
+        return true;
+    }
+    return false;
+  }).sort((a, b) => a.createdAt - b.createdAt);
   return candidates[0] ?? null;
 }
 function processExists(pid) {
@@ -1413,12 +1583,25 @@ function claimTask(id) {
 function markTaskDone(id, result) {
   return withLock(() => update(id, { status: "done", result, finishedAt: Date.now(), runnerPid: undefined, error: undefined }));
 }
-function markTaskFailed(id, error) {
-  return withLock(() => update(id, { status: "failed", error, finishedAt: Date.now(), runnerPid: undefined }));
+function markTaskFailed(id, error, attempts, retryAfter) {
+  return withLock(() => update(id, { status: "failed", error, finishedAt: Date.now(), runnerPid: undefined, attempts, retryAfter }));
+}
+function markTaskRetry(id, attempts) {
+  const now = Date.now();
+  const backoffMs = Math.min(300000, 30000 * Math.pow(2, attempts - 1));
+  return withLock(() => update(id, {
+    status: "queued",
+    runnerPid: undefined,
+    error: undefined,
+    attempts,
+    retryAfter: now + backoffMs
+  }));
 }
 
 // src/tools/proc.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync as existsSync4 } from "node:fs";
+import { platform } from "node:os";
 function killProcessGroup(child, signal = "SIGKILL") {
   if (child.pid === undefined || child.pid <= 0)
     return;
@@ -1430,14 +1613,77 @@ function killProcessGroup(child, signal = "SIGKILL") {
     } catch {}
   }
 }
+function resolveCommand(cmd) {
+  if (cmd.includes("/") || cmd.includes("\\"))
+    return cmd;
+  const pathEnv = process.env.PATH ?? "";
+  const dirs = pathEnv.split(pathSep).filter(Boolean);
+  const exts = [""].concat((process.env.PATHEXT ?? ".EXE;.BAT;.CMD;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC").split(pathSep).map((e) => e.toLowerCase()));
+  for (const dir of dirs) {
+    const base = join22(dir, cmd);
+    for (const ext of exts) {
+      const candidate = ext ? base + ext : base;
+      if (existsSync4(candidate))
+        return candidate;
+    }
+  }
+  if (platform() !== "win32") {
+    const prefixes = ["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/usr/local/sbin"];
+    for (const p of prefixes) {
+      const candidate = join22(p, cmd);
+      if (existsSync4(candidate))
+        return candidate;
+    }
+    try {
+      const lookedUp = spawnSync("which", [cmd], { stdio: ["ignore", "pipe", "ignore"] });
+      if (lookedUp && lookedUp.stdout && existsSync4(lookedUp.stdout.toString().trim())) {
+        return lookedUp.stdout.toString().trim();
+      }
+    } catch {}
+  } else {
+    const winPrefixes = [
+      "C:\\Users\\Administrator\\AppData\\Local\\hermes\\git\\usr\\bin",
+      "C:\\Program Files\\Git\\usr\\bin",
+      "C:\\Program Files (x86)\\Git\\usr\\bin",
+      "C:\\msys64\\usr\\bin",
+      "C:\\msys64\\mingw64\\bin",
+      "C:\\Program Files\\Git\\bin"
+    ];
+    for (const p of winPrefixes) {
+      const candidate = join22(p, cmd);
+      if (existsSync4(candidate))
+        return candidate;
+      const exeCandidate = candidate + ".exe";
+      if (existsSync4(exeCandidate))
+        return exeCandidate;
+    }
+    if (cmd === "bash" || cmd === "sh") {
+      return cmd;
+    }
+  }
+}
+function join22(a, b) {
+  if (a.endsWith("/") || a.endsWith("\\"))
+    return a + b;
+  return a + "/" + b;
+}
+var pathSep = process.platform === "win32" ? ";" : ":";
 function spawnCollect(opts) {
   return new Promise((resolvePromise) => {
-    const child = spawn(opts.cmd[0], opts.cmd.slice(1), {
-      cwd: opts.cwd,
-      env: opts.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: opts.detached ?? true
-    });
+    let child = null;
+    try {
+      const resolvedCmd = resolveCommand(opts.cmd[0]);
+      child = spawn(resolvedCmd, opts.cmd.length > 1 ? opts.cmd.slice(1) : [], {
+        cwd: opts.cwd,
+        env: opts.env,
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: opts.detached ?? true
+      });
+    } catch (err) {
+      const msg = err && typeof err === "object" && "message" in err ? String(err.message) : String(err);
+      resolvePromise({ stdout: "", stderr: `spawn error: ${msg}`, exitCode: -1, timedOut: false, aborted: false });
+      return;
+    }
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (d) => stdout += d.toString());
@@ -1483,6 +1729,85 @@ function spawnCollect(opts) {
   });
 }
 
+// src/permissions.ts
+import { join as join4 } from "node:path";
+import { homedir as homedir3 } from "node:os";
+function resolvePermissions(config, workspaceRoot) {
+  const p = config.permissions ?? {};
+  return {
+    destructive: p.destructive ?? "allow",
+    network: p.network ?? "allow",
+    filesystem: p.filesystem ?? "full",
+    workspaceRoot
+  };
+}
+function isPathAllowed(path, perms) {
+  if (perms.filesystem === "full")
+    return true;
+  const resolved = resolvePath(path);
+  const root = resolvePath(perms.workspaceRoot);
+  return resolved.startsWith(root + "/") || resolved === root;
+}
+function checkDestructiveCommand(command, perms) {
+  if (perms.destructive === "allow")
+    return null;
+  const c = command.trim();
+  const segments = c.split(/([;&|]|&&|\|\|)/).map((s) => s.trim()).filter(Boolean);
+  for (const seg of segments) {
+    const reason = checkSingleSegment(seg);
+    if (reason) {
+      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): ${reason}` : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
+    }
+  }
+  return null;
+}
+function checkSingleSegment(seg) {
+  const destructiveFileOps = [
+    { re: /^(rm|rmdir)\s/, why: "file/directory removal (rm/rmdir)" },
+    { re: /^\s*dd\s/, why: "low-level data copying (dd)" },
+    { re: /^(mkfs|mkswap)\s/, why: "filesystem creation/destruction (mkfs/mkswap)" },
+    { re: /^(truncate|fdisk|parted)\s/, why: "disk/partition manipulation" },
+    { re: /\b(kill|pkill|killall|systemctl|reboot|shutdown|halt|poweroff)\b/, why: "process/system control" },
+    { re: /\b(sudo|doas)\b/, why: "privilege escalation (sudo/doas)" }
+  ];
+  for (const { re, why } of destructiveFileOps) {
+    if (re.test(seg))
+      return why;
+  }
+  if (/\s[>|]\s*\S/.test(seg) || /\s>>\s*\S/.test(seg)) {
+    const redirectTarget = seg.match(/[>|]\s*(\S+)/);
+    if (redirectTarget) {
+      const target = redirectTarget[1];
+      if (target === "/dev/null" || target.startsWith("/tmp/") || target.startsWith("/var/tmp/"))
+        return null;
+    }
+    return "output redirection (may overwrite files)";
+  }
+  return null;
+}
+function checkNetworkCommand(command, perms) {
+  if (perms.network === "allow")
+    return null;
+  const c = command.trim();
+  const networkCommands = [
+    { re: /\b(curl|wget|fetch|nc|ncat|netcat|telnet|scp|ssh|rsync)\b/, why: "network client (curl/wget/ssh/etc.)" },
+    { re: /\b(dig|nslookup|host|ping|traceroute|mtr)\b/, why: "network diagnostic" },
+    { re: /\b(sock|netstat|lsof\s+-i)\b/, why: "network inspection" }
+  ];
+  for (const { re, why } of networkCommands) {
+    if (re.test(c))
+      return `BLOCKED (${perms.network}): ${why}`;
+  }
+  return null;
+}
+function resolvePath(p) {
+  if (p.startsWith("~"))
+    return join4(homedir3(), p.slice(1));
+  if (p.startsWith("/"))
+    return p;
+  return join4(process.cwd(), p);
+}
+
 // src/tools/bash.ts
 var MAX_OUTPUT = 30000;
 var PLAN_MODE_BANNED = [
@@ -1495,7 +1820,7 @@ var PLAN_MODE_BANNED = [
   { re: /\b(kill|pkill|killall|systemctl|service|reboot|shutdown|halt|poweroff|init|swapoff|mkswap)\b/, why: "process/system control" },
   { re: /(^|[;&|]\s*)sudo\b/, why: "sudo" },
   { re: /\s(>|>>|2>)\s*/, why: "output redirection writes a file" },
-  { re: /\btee\s+-?a?\s+/, why: "tee writes to a file" }
+  { re: /\btee\s+-?a?s+\s+/, why: "tee writes to a file" }
 ];
 function bannedReason(command) {
   const c = command.trim();
@@ -1525,21 +1850,47 @@ registerTool({
     }
   },
   async run(args, ctx) {
+    const permissions = ctx.permissions;
     const command = String(args.command ?? "");
     if (ctx.planPhase) {
       const why = bannedReason(command);
       if (why)
         return `BLOCKED IN PLAN MODE (read-only): ${why}. Use read-only commands (ls, grep, cat, git status/diff/log, running tests) to investigate, and describe any changes you would make in your PLAN instead.`;
     }
+    if (permissions) {
+      const destructiveCheck = checkDestructiveCommand(command, permissions);
+      if (destructiveCheck) {
+        if (destructiveCheck.startsWith("BLOCKED")) {
+          return destructiveCheck;
+        }
+        return destructiveCheck;
+      }
+      const networkCheck = checkNetworkCommand(command, permissions);
+      if (networkCheck) {
+        return networkCheck;
+      }
+      if (permissions.filesystem === "workspace" && args.workdir) {
+        const workdir = String(args.workdir);
+        if (!isPathAllowed(workdir, permissions)) {
+          return `BLOCKED: workdir "${workdir}" is outside the allowed workspace (${permissions.workspaceRoot}). Use a path within the workspace.`;
+        }
+      }
+    }
     const cwd = args.workdir ? String(args.workdir) : ctx.cwd;
     const timeout = Math.max(0, Number(args.timeout ?? 120000));
-    const res = await spawnCollect({
-      cmd: ["bash", "-lc", command],
-      cwd,
-      env: { ...process.env, NO_COLOR: "1" },
-      timeoutMs: timeout,
-      signal: ctx.signal
-    });
+    let res;
+    try {
+      res = await spawnCollect({
+        cmd: ["bash", "-lc", command],
+        cwd,
+        env: { ...process.env, NO_COLOR: "1" },
+        timeoutMs: timeout,
+        signal: ctx.signal
+      });
+    } catch (err) {
+      const msg = err && typeof err === "object" && "message" in err ? String(err.message) : String(err);
+      return `ERROR: cannot run command: ${msg}`;
+    }
     let output = "";
     if (res.stdout)
       output += res.stdout;
@@ -1576,16 +1927,16 @@ function resolve2(p, ctx) {
 }
 
 // src/tools/files.ts
-import { dirname as dirname4, join as join5 } from "node:path";
+import { dirname as dirname4, join as join6 } from "node:path";
 import { mkdirSync as mkdirSync4, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
 import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
 
 // src/self-edit.ts
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync as existsSync4, mkdirSync as mkdirSync3, readFileSync as readFileSync4, appendFileSync, readdirSync, writeFileSync as writeFileSync3 } from "node:fs";
-import { homedir as homedir3 } from "node:os";
-import { join as join4, resolve as resolve3, dirname as dirname3 } from "node:path";
-import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync as existsSync5, mkdirSync as mkdirSync3, readFileSync as readFileSync4, appendFileSync, readdirSync, writeFileSync as writeFileSync3 } from "node:fs";
+import { homedir as homedir4 } from "node:os";
+import { join as join5, resolve as resolve3, dirname as dirname3 } from "node:path";
+import { spawnSync as spawnSync2 } from "node:child_process";
 var LEDGER_NAME = "SELF_EDITS.jsonl";
 function repoRoot() {
   const env = process.env.VIBECODER_REPO_ROOT;
@@ -1597,14 +1948,14 @@ function installMode() {
   if (process.env.VIBECODER_REPO_ROOT)
     return "repo";
   const root = dirname3(packageRoot());
-  if (existsSync4(join4(root, ".git")) || existsSync4(join4(packageRoot(), ".git")))
+  if (existsSync5(join5(root, ".git")) || existsSync5(join5(packageRoot(), ".git")))
     return "repo";
   return "user";
 }
 function userDataRoot() {
   if (process.env.VIBECODER_SESSION_DIR)
     return process.env.VIBECODER_SESSION_DIR;
-  return join4(homedir3(), ".vibecoder");
+  return join5(homedir4(), ".vibecoder");
 }
 function repoConfigFile() {
   return resolvePackageFile("config.json");
@@ -1614,15 +1965,15 @@ function liveConfigFile() {
   if (repo && installMode() === "repo")
     return repo.config;
   const repoCfg = repoConfigFile();
-  if (installMode() === "repo" && repoCfg && !existsSync4(userConfigFile()))
+  if (installMode() === "repo" && repoCfg && !existsSync5(userConfigFile()))
     return repoCfg;
   return userConfigFile();
 }
 function ledgerPath() {
-  return installMode() === "repo" ? join4(repoRoot(), LEDGER_NAME) : join4(userDataRoot(), LEDGER_NAME);
+  return installMode() === "repo" ? join5(repoRoot(), LEDGER_NAME) : join5(userDataRoot(), LEDGER_NAME);
 }
 function backupsDir() {
-  return join4(userDataRoot(), "backups");
+  return join5(userDataRoot(), "backups");
 }
 function isSameFile(a, b) {
   return resolve3(a) === resolve3(b);
@@ -1630,7 +1981,7 @@ function isSameFile(a, b) {
 function reposWhere() {
   if (process.env.VIBECODER_REPO_ROOT) {
     const root = resolve3(process.env.VIBECODER_REPO_ROOT);
-    return { root, config: join4(root, "config.json"), env: join4(root, ".env") };
+    return { root, config: join5(root, "config.json"), env: join5(root, ".env") };
   }
   return null;
 }
@@ -1651,7 +2002,7 @@ function shaOf(text) {
 }
 function readIfExists(abs) {
   try {
-    return existsSync4(abs) ? readFileSync4(abs, "utf8") : "";
+    return existsSync5(abs) ? readFileSync4(abs, "utf8") : "";
   } catch {
     return "";
   }
@@ -1669,7 +2020,7 @@ function appendLedger(entry) {
 }
 function readLedger(limit = 20) {
   try {
-    if (!existsSync4(ledgerPath()))
+    if (!existsSync5(ledgerPath()))
       return [];
     const lines = readFileSync4(ledgerPath(), "utf8").split(`
 `).filter(Boolean);
@@ -1694,17 +2045,17 @@ function snapshotConfig(content) {
   const dir = backupsDir();
   mkdirSync3(dir, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const file = join4(dir, `config-${ts}.json`);
+  const file = join5(dir, `config-${ts}.json`);
   writeFileSync3(file, content, "utf8");
   return file;
 }
 function newestBackup() {
   try {
     const dir = backupsDir();
-    if (!existsSync4(dir))
+    if (!existsSync5(dir))
       return null;
     const files = readdirSync(dir).filter((f) => f.startsWith("config-") && f.endsWith(".json")).sort();
-    return files.length ? join4(dir, files[files.length - 1]) : null;
+    return files.length ? join5(dir, files[files.length - 1]) : null;
   } catch {
     return null;
   }
@@ -1724,7 +2075,7 @@ function restoreSelfFiles() {
   const target = liveConfigFile();
   const repoCfg = reposWhere()?.config ?? repoConfigFile();
   if (installMode() === "repo" && repoCfg && isSameFile(target, repoCfg)) {
-    const res = spawnSync("git", ["restore", "--worktree", "--", "config.json"], {
+    const res = spawnSync2("git", ["restore", "--worktree", "--", "config.json"], {
       cwd: repoRoot(),
       encoding: "utf8"
     });
@@ -1747,11 +2098,11 @@ function selfFileDiffStat() {
   const target = liveConfigFile();
   const repoCfg = reposWhere()?.config ?? repoConfigFile();
   if (installMode() === "repo" && repoCfg && isSameFile(target, repoCfg)) {
-    const res = spawnSync("git", ["diff", "--stat", "--", "config.json"], { cwd: repoRoot(), encoding: "utf8" });
+    const res = spawnSync2("git", ["diff", "--stat", "--", "config.json"], { cwd: repoRoot(), encoding: "utf8" });
     return (res.stdout || res.stderr || "").trim();
   }
   const backup = newestBackup();
-  if (!existsSync4(target))
+  if (!existsSync5(target))
     return "";
   if (!backup)
     return readIfExists(target) ? "config.json is present (no snapshot yet)" : "";
@@ -1834,7 +2185,7 @@ registerTool({
       } else if (e.isFile()) {
         let size = "";
         try {
-          const st = statSync2(join5(p, e.name));
+          const st = statSync2(join6(p, e.name));
           size = formatSize(st.size);
         } catch {
           size = "?";
@@ -1872,11 +2223,18 @@ registerTool({
     const text = await fileText(p);
     const lines = text.split(`
 `);
+    const totalLines = lines.length;
     const offset = Math.max(1, Number(args.offset ?? 1) || 1);
+    if (offset > totalLines)
+      return `(file has ${totalLines} line(s); offset ${offset} is past the end)`;
     const limit = Math.max(0, Number(args.limit ?? 2000) || 2000);
     const slice = lines.slice(offset - 1, offset - 1 + limit);
-    return slice.map((l, i) => `${offset + i}: ${l}`).join(`
+    const shown = slice.length;
+    const note = shown < limit && shown < totalLines - offset + 1 ? "" : "";
+    const out = slice.map((l, i) => `${offset + i}: ${l}`).join(`
 `);
+    return shown < totalLines - offset + 1 && limit > 0 ? out + `
+...(${totalLines - offset + 1 - shown} more line(s) not shown)` : out;
   }
 });
 registerTool({
@@ -1914,13 +2272,14 @@ registerTool({
     type: "function",
     function: {
       name: "edit_file",
-      description: "Perform an exact string replacement in a file. Use to modify part of a file without rewriting the whole thing.",
+      description: "Perform an exact string replacement in a file. Use to modify part of a file without rewriting the whole thing. By default replaces only the first occurrence; set replaceAll to true to replace every occurrence.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "Absolute path to the file" },
           oldString: { type: "string", description: "The exact text to find and replace" },
-          newString: { type: "string", description: "The replacement text" }
+          newString: { type: "string", description: "The replacement text" },
+          replaceAll: { type: "boolean", description: "When true, replace every occurrence (default: false — only first)" }
         },
         required: ["path", "oldString", "newString"]
       }
@@ -1932,6 +2291,7 @@ registerTool({
     const p = resolve2(String(args.path), ctx);
     const oldString = String(args.oldString ?? "");
     const newString = String(args.newString ?? "");
+    const replaceAll = Boolean(args.replaceAll);
     if (!await fileExists(p))
       return `ERROR: file not found: ${p}`;
     if (isProtectedFile(p))
@@ -1942,12 +2302,18 @@ registerTool({
     const count = text.split(oldString).length - 1;
     if (count === 0)
       return `ERROR: oldString not found in file`;
-    if (count > 1)
-      return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique)`;
-    const updated = text.replace(oldString, newString);
+    let updated;
+    if (replaceAll) {
+      updated = text.split(oldString).join(newString);
+    } else {
+      if (count > 1)
+        return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique) or set replaceAll=true to replace all`;
+      updated = text.replace(oldString, newString);
+    }
     await writeFileAsync(p, updated, "utf8");
-    const note = isSelfFile(p) ? auditSelfEdit("edit_file", p, text, updated, "replaced 1 occurrence") : "";
-    return `Edited ${p}: replaced 1 occurrence${note ? `
+    const replaced = replaceAll ? count : 1;
+    const note = isSelfFile(p) ? auditSelfEdit("edit_file", p, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`) : "";
+    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}${note ? `
 ` + note : ""}`;
   }
 });
@@ -1955,7 +2321,7 @@ registerTool({
 // src/tools/glob.ts
 import { opendir } from "node:fs/promises";
 import { access } from "node:fs/promises";
-import { join as join6 } from "node:path";
+import { join as join7 } from "node:path";
 var EXCLUDE_DEFAULTS = ["node_modules", ".git"];
 function segmentToRegExp(seg) {
   let re = "^";
@@ -2033,7 +2399,7 @@ async function globScan(pattern, opts) {
           if (exclusions.has(e.name))
             continue;
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          const childAbs = join6(dir, e.name);
+          const childAbs = join7(dir, e.name);
           if (e.isDirectory()) {
             await recurse(remaining, childAbs, childRel);
           } else if (!onlyFiles || e.isFile()) {
@@ -2054,7 +2420,7 @@ async function globScan(pattern, opts) {
           break;
         if (e.isDirectory() && !exclusions.has(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining, join6(dir, e.name), childRel);
+          await recurse(remaining, join7(dir, e.name), childRel);
         }
       }
       return;
@@ -2092,7 +2458,7 @@ async function globScan(pattern, opts) {
           continue;
         if (rx.test(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining.slice(1), join6(dir, e.name), childRel);
+          await recurse(remaining.slice(1), join7(dir, e.name), childRel);
         }
       }
     }
@@ -2361,13 +2727,23 @@ async function runQueuedTask(task, deps, signal) {
       confirmTool: queuedToolPolicy(deps, signal)
     });
     const done = markTaskDone(task.id, result.finalText || "(no final text)");
-    log(deps, `✔ [${task.id}] done in ${result.steps} step(s), ${result.toolCalls} tool call(s)`);
+    log(deps, `✅ [${task.id}] done in ${result.steps} step(s), ${result.toolCalls} tool call(s)`);
     return done;
   } catch (err) {
     const msg = err?.message ?? String(err);
-    const failed = markTaskFailed(task.id, msg);
-    log(deps, `✘ [${task.id}] failed: ${msg}`);
-    return failed ?? claimed;
+    const existingAttempts = claimed.attempts ?? 0;
+    const nextAttempts = existingAttempts + 1;
+    if (nextAttempts >= 5) {
+      const failed = markTaskFailed(task.id, msg, nextAttempts);
+      log(deps, `✘ [${task.id}] failed (attempt ${nextAttempts}/5): ${msg}`);
+      return failed ?? claimed;
+    }
+    const backoffMs = Math.min(300000, 30000 * Math.pow(2, nextAttempts - 1));
+    const retryAfter = Date.now() + backoffMs;
+    const retried = markTaskRetry(task.id, nextAttempts);
+    retried.retryAfter = retryAfter;
+    log(deps, `↻ [${task.id}] failed (attempt ${nextAttempts}/5) — will retry in ${(backoffMs / 1000).toFixed(0)}s`);
+    return retried ?? claimed;
   }
 }
 async function drainQueue(deps, signal) {
@@ -2387,7 +2763,7 @@ async function drainQueue(deps, signal) {
 
 // src/ollama.ts
 import { spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync6 } from "node:fs";
+import { existsSync as existsSync7 } from "node:fs";
 var OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434";
 function ollamaBaseUrl(explicit) {
   const raw = explicit ?? process.env.OLLAMA_HOST ?? OLLAMA_DEFAULT_URL;
@@ -2404,7 +2780,7 @@ async function ollamaIsUp(baseUrl, timeoutMs = 800) {
 }
 function ollamaBinary() {
   const explicit = process.env.OLLAMA_BIN;
-  if (explicit && existsSync6(explicit))
+  if (explicit && existsSync7(explicit))
     return explicit;
   const absolutes = [
     "/data/data/com.termux/files/usr/bin/ollama",
@@ -2413,14 +2789,14 @@ function ollamaBinary() {
     "/usr/local/go/bin/ollama"
   ];
   for (const p of absolutes)
-    if (existsSync6(p))
+    if (existsSync7(p))
       return p;
   const pathDirs = (process.env.PATH ?? "").split(":");
   for (const dir of pathDirs) {
     if (!dir)
       continue;
     const candidate = `${dir.replace(/\/+$/, "")}/ollama`;
-    if (existsSync6(candidate))
+    if (existsSync7(candidate))
       return candidate;
   }
   return null;
@@ -2480,6 +2856,129 @@ async function ensureOllamaServe(opts = {}) {
   log(msg);
   return { running: false, started: true, error: msg };
 }
+
+// src/tools/web-search.ts
+var USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the web using DuckDuckGo. Returns top results with titles, URLs, and snippets. Useful for finding documentation, libraries, news, or any information not available locally.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          maxResults: { type: "number", description: "Max results to return (optional, default 5, max 10)" }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  async run(args, ctx) {
+    const query = String(args.query ?? "").trim();
+    if (!query)
+      return "ERROR: query is required";
+    const maxResults = Math.min(10, Math.max(1, Number(args.maxResults ?? 5) || 5));
+    try {
+      const instantUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+      const instantRes = await fetch(instantUrl, {
+        headers: { "User-Agent": USER_AGENT },
+        signal: ctx.signal
+      });
+      if (instantRes.ok) {
+        const data = await instantRes.json();
+        const abstract = data.Abstract;
+        const heading = data.Heading;
+        const image = data.Image;
+        const redirect = data.RelatedTopics;
+        const parts = [];
+        if (heading)
+          parts.push(`# ${heading}`);
+        if (abstract)
+          parts.push(`
+${abstract}`);
+        if (image)
+          parts.push(`
+Image: ${image}`);
+        const related = [];
+        if (Array.isArray(redirect)) {
+          for (const r of redirect) {
+            if (r.Topics) {
+              for (const t of r.Topics) {
+                if (t.FirstURL && t.Text)
+                  related.push({ url: t.FirstURL, text: t.Text.replace(/<[^>]+>/g, "") });
+              }
+            } else if (r.FirstURL && r.Text) {
+              related.push({ url: r.FirstURL, text: r.Text.replace(/<[^>]+>/g, "") });
+            }
+          }
+        }
+        if (related.length) {
+          parts.push(`
+## Results (${related.length}):`);
+          for (let i = 0;i < Math.min(maxResults, related.length); i++) {
+            const r = related[i];
+            parts.push(`  ${i + 1}. [${r.text.slice(0, 120)}](${r.url})`);
+          }
+        }
+        return parts.join(`
+`) || "No results found";
+      }
+    } catch (_) {}
+    try {
+      const htmlUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+      const htmlRes = await fetch(htmlUrl, {
+        headers: { "User-Agent": USER_AGENT },
+        signal: ctx.signal
+      });
+      if (!htmlRes.ok)
+        return `ERROR: search failed (HTTP ${htmlRes.status})`;
+      const html = await htmlRes.text();
+      const results = [];
+      const linkRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)<\/a>/gs;
+      const snippetRegex = /<a[^>]*class="result__snippet"[^>]*>(.*?)<\/a>/gs;
+      let match;
+      const titles = [];
+      while ((match = linkRegex.exec(html)) !== null) {
+        let url = match[1];
+        const uMatch = url.match(/uddg=([^&]+)/);
+        if (uMatch) {
+          try {
+            url = decodeURIComponent(uMatch[1]);
+          } catch {}
+        }
+        titles.push({ url, text: match[2].replace(/<[^>]+>/g, "").trim() });
+      }
+      while ((match = snippetRegex.exec(html)) !== null) {
+        const snippet = match[1].replace(/<[^>]+>/g, "").trim();
+        if (results.length < titles.length) {
+          results.push({ title: titles[results.length].text, url: titles[results.length].url, snippet });
+        }
+      }
+      for (let i = 0;i < titles.length; i++) {
+        if (i >= results.length) {
+          results.push({ title: titles[i].text, url: titles[i].url, snippet: "" });
+        }
+      }
+      if (!results.length)
+        return "No results found";
+      const out = [`## Search: ${query}`, `(${results.length} results, showing ${Math.min(maxResults, results.length)})`, ""];
+      for (let i = 0;i < Math.min(maxResults, results.length); i++) {
+        const r = results[i];
+        out.push(`${i + 1}. **${r.title}**`);
+        out.push(`   ${r.url}`);
+        if (r.snippet)
+          out.push(`   ${r.snippet.slice(0, 200)}`);
+        out.push("");
+      }
+      return out.join(`
+`);
+    } catch (err) {
+      return `ERROR: search failed: ${err?.message ?? String(err)}`;
+    }
+  }
+});
 
 // src/tools/termux.ts
 registerTool({
@@ -2803,13 +3302,13 @@ registerTool({
 import { join as pathJoin, dirname as dirname5 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
-import { existsSync as existsSync7 } from "node:fs";
+import { existsSync as existsSync8 } from "node:fs";
 var _repoRoot = (() => {
   try {
     const file = fileURLToPath2(import.meta.url);
     let dir = dirname5(file);
     for (let i = 0;i < 10; i++) {
-      if (existsSync7(pathJoin(dir, "package.json")) || existsSync7(pathJoin(dir, ".git"))) {
+      if (existsSync8(pathJoin(dir, "package.json")) || existsSync8(pathJoin(dir, ".git"))) {
         return dir;
       }
       dir = dirname5(dir);
@@ -3208,6 +3707,75 @@ function truncate(s, maxLines) {
 `) + `
 ...[${lines.length - maxLines} more lines truncated]`;
 }
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_commit",
+      description: "Create a commit with the given message. Stages all changes (git add -A) then commits. Use after making file edits. Returns the commit hash and message.",
+      parameters: {
+        type: "object",
+        properties: {
+          message: { type: "string", description: "The commit message" },
+          files: { type: "string", description: "Optional: specific files to stage (space-separated). If omitted, stages all changes (git add -A)." }
+        },
+        required: ["message"]
+      }
+    }
+  },
+  async run(args, ctx) {
+    const message = String(args.message ?? "").trim();
+    if (!message)
+      return "ERROR: commit message is required";
+    const files = args.files ? String(args.files).trim() : "";
+    let stageOut;
+    if (files) {
+      stageOut = await runGit(["add", ...files.split(/\s+/).filter(Boolean)], "git add", ctx);
+    } else {
+      stageOut = await runGit(["add", "-A"], "git add -A", ctx);
+    }
+    const status = await runGit(["status", "--short"], "git status --short", ctx);
+    const commit = await runGit(["commit", "-m", message], `git commit -m "${message}"`, ctx);
+    const hashMatch = commit.match(/\[(\w+\s+\d+\s+[a-f0-9]+)\]/);
+    const summary = hashMatch ? hashMatch[1] : commit;
+    return `Committed as:
+${summary}
+
+Staged changes:
+${status || "(none)"}`;
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "git_checkout_branch",
+      description: "Create and switch to a new branch. If the branch exists, just switches to it. Returns the new/current branch name.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "The branch name to create/switch to" },
+          base: { type: "string", description: "Optional base branch to create from (default: current branch)" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const name = String(args.name ?? "").trim();
+    if (!name)
+      return "ERROR: branch name is required";
+    const base = args.base ? String(args.base).trim() : "";
+    let branch;
+    if (base) {
+      branch = await runGit(["checkout", "-b", name, base], `git checkout -b ${name} ${base}`, ctx);
+    } else {
+      branch = await runGit(["checkout", "-b", name], `git checkout -b ${name}`, ctx);
+    }
+    const hashMatch = branch.match(/Switched to a new branch '([^']+)'/);
+    const result = hashMatch ? hashMatch[1] : branch;
+    return `On branch: ${result}`;
+  }
+});
 
 // src/tools/connectivity.ts
 registerTool({
@@ -3431,18 +3999,146 @@ function buildSummary(checks, results) {
 `);
 }
 
+// src/test-runner.ts
+import { existsSync as existsSync9, readFileSync as readFileSync5 } from "node:fs";
+import { join as join8 } from "node:path";
+function detectTestCommand(workspace) {
+  const packageJson = join8(workspace, "package.json");
+  if (existsSync9(packageJson)) {
+    try {
+      const pkg = JSON.parse(readFileSync5(packageJson, "utf8"));
+      if (pkg.scripts?.test)
+        return pkg.scripts.test;
+      if (pkg.scripts?.pretest)
+        return pkg.scripts.pretest;
+      if (pkg.dependencies?.jest || pkg.devDependencies?.jest)
+        return "npx jest";
+      if (pkg.dependencies?.["@playwright/test"] || pkg.devDependencies?.["@playwright/test"])
+        return "npx playwright test";
+      if (pkg.dependencies?.vitest || pkg.devDependencies?.vitest)
+        return "npx vitest";
+      return "npm test";
+    } catch {}
+  }
+  if (existsSync9(join8(workspace, "pytest.ini")) || existsSync9(join8(workspace, "pyproject.toml"))) {
+    return "python -m pytest";
+  }
+  if (existsSync9(join8(workspace, "unittest")) || existsSync9(join8(workspace, "setup.py"))) {
+    return "python -m unittest discover";
+  }
+  if (existsSync9(join8(workspace, "Cargo.toml"))) {
+    return "cargo test";
+  }
+  if (existsSync9(join8(workspace, "go.mod"))) {
+    return "go test ./...";
+  }
+  if (existsSync9(join8(workspace, "Gemfile"))) {
+    return "bundle exec rake test";
+  }
+  if (existsSync9(join8(workspace, "mix.exs"))) {
+    return "mix test";
+  }
+  if (existsSync9(join8(workspace, "phpunit.xml"))) {
+    return "./vendor/bin/phpunit";
+  }
+  if (existsSync9(join8(workspace, "Makefile")) || existsSync9(join8(workspace, "makefile"))) {
+    return "make test";
+  }
+  return null;
+}
+async function runTests(cfg, workspace) {
+  const command = cfg.command ?? detectTestCommand(workspace);
+  if (!command) {
+    return {
+      command: "(no test command detected)",
+      exitCode: -1,
+      stdout: "",
+      stderr: "Could not auto-detect a test command. Set test.command in config or create a package.json/Makefile/etc.",
+      durationMs: 0,
+      passed: false
+    };
+  }
+  const cwd = cfg.cwd ?? workspace;
+  const timeoutMs = cfg.timeoutMs ?? 120000;
+  const start = Date.now();
+  const res = await spawnCollect({
+    cmd: ["bash", "-lc", command],
+    cwd,
+    env: { ...process.env, NO_COLOR: "1" },
+    timeoutMs
+  });
+  const durationMs = Date.now() - start;
+  let stdout = res.stdout || "";
+  let stderr = res.stderr || "";
+  if (res.exitCode !== 0 && !stdout && !stderr) {
+    stdout = `(exit code ${res.exitCode})`;
+  }
+  return {
+    command,
+    exitCode: res.exitCode,
+    stdout,
+    stderr: res.timedOut ? stderr + (stderr ? `
+` : "") + "[killed: timed out after " + timeoutMs + "ms]" : stderr,
+    durationMs,
+    passed: res.exitCode === 0 && !res.timedOut
+  };
+}
+function formatTestResult(result) {
+  const status = result.passed ? "PASSED" : "FAILED";
+  const icon = result.passed ? "✅" : "❌";
+  const lines = [
+    `${icon} Test ${status} (${result.durationMs}ms)`,
+    `Command: ${result.command}`
+  ];
+  if (result.stdout) {
+    lines.push("");
+    lines.push("--- stdout ---");
+    lines.push(result.stdout.length > 2000 ? result.stdout.slice(0, 2000) + `
+...[truncated]` : result.stdout);
+  }
+  if (result.stderr && !result.passed) {
+    lines.push("");
+    lines.push("--- stderr ---");
+    lines.push(result.stderr.length > 1000 ? result.stderr.slice(0, 1000) + `
+...[truncated]` : result.stderr);
+  }
+  return lines.join(`
+`);
+}
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "run_tests",
+      description: "Run the project's test suite. Detects the test command from package.json, Makefile, Cargo.toml, go.mod, pytest.ini, etc.",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Optional test command override (auto-detected if omitted)" },
+          cwd: { type: "string", description: "Working directory to run tests in" }
+        }
+      }
+    }
+  },
+  run: async (args, ctx) => {
+    const result = await runTests({ command: args.command, cwd: args.cwd, timeoutMs: 120000 }, ctx.cwd);
+    return formatTestResult(result);
+  },
+  strict: false
+});
+
 // src/session.ts
-import { existsSync as existsSync8, mkdirSync as mkdirSync5, readdirSync as readdirSync3, readFileSync as readFileSync5, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "node:fs";
-import { homedir as homedir4 } from "node:os";
-import { join as join7 } from "node:path";
+import { existsSync as existsSync10, mkdirSync as mkdirSync5, readdirSync as readdirSync3, readFileSync as readFileSync6, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "node:fs";
+import { homedir as homedir5 } from "node:os";
+import { join as join9 } from "node:path";
 var _root2 = null;
 function root2() {
   if (_root2)
     return _root2;
   const envDir = process.env.VIBECODER_SESSION_DIR;
-  _root2 = envDir || join7(homedir4(), ".vibecoder");
+  _root2 = envDir || join9(homedir5(), ".vibecoder");
   mkdirSync5(_root2, { recursive: true });
-  mkdirSync5(join7(_root2, "sessions"), { recursive: true });
+  mkdirSync5(join9(_root2, "sessions"), { recursive: true });
   return _root2;
 }
 function sanitizeId(id) {
@@ -3463,12 +4159,12 @@ function resolveResumeArg(argv) {
   return { resume: true, name };
 }
 function lastFile() {
-  return join7(root2(), "last.json");
+  return join9(root2(), "last.json");
 }
 function sessionFile(id) {
   const clean = sanitizeId(id);
   const fname = clean === id ? clean : `${clean}--${shortHash(id)}`;
-  return join7(root2(), "sessions", `${fname}.json`);
+  return join9(root2(), "sessions", `${fname}.json`);
 }
 function saveSession(s) {
   s.updatedAt = Date.now();
@@ -3482,17 +4178,17 @@ function loadSession(id) {
   if (!id)
     return null;
   const f = sessionFile(id);
-  if (!existsSync8(f))
+  if (!existsSync10(f))
     return null;
   try {
-    return JSON.parse(readFileSync5(f, "utf8"));
+    return JSON.parse(readFileSync6(f, "utf8"));
   } catch {
     return null;
   }
 }
 function deleteSession(id) {
   const f = sessionFile(id);
-  if (!existsSync8(f))
+  if (!existsSync10(f))
     return false;
   try {
     rmSync2(f, { force: true });
@@ -3503,15 +4199,15 @@ function deleteSession(id) {
 }
 function listSessions() {
   const out = [];
-  const dir = join7(root2(), "sessions");
-  if (!existsSync8(dir))
+  const dir = join9(root2(), "sessions");
+  if (!existsSync10(dir))
     return out;
   for (const name of readdirSync3(dir)) {
     if (!name.endsWith(".json"))
       continue;
     let s = null;
     try {
-      const parsed = JSON.parse(readFileSync5(join7(dir, name), "utf8"));
+      const parsed = JSON.parse(readFileSync6(join9(dir, name), "utf8"));
       if (parsed && typeof parsed.id === "string" && Array.isArray(parsed.messages))
         s = parsed;
     } catch {}
@@ -3534,17 +4230,17 @@ function saveLast(s) {
   writeFileSync4(lastFile(), JSON.stringify(s, null, 2));
 }
 function loadLast() {
-  if (!existsSync8(lastFile()))
+  if (!existsSync10(lastFile()))
     return null;
   try {
-    return JSON.parse(readFileSync5(lastFile(), "utf8"));
+    return JSON.parse(readFileSync6(lastFile(), "utf8"));
   } catch {
     return null;
   }
 }
 
 // src/ui/terminal.ts
-import { spawnSync as spawnSync2 } from "node:child_process";
+import { spawnSync as spawnSync3 } from "node:child_process";
 import fs from "node:fs";
 function enableMouse() {
   out("\x1B[?1000h\x1B[?1006h");
@@ -3552,12 +4248,18 @@ function enableMouse() {
 function disableMouse() {
   out("\x1B[?1000l\x1B[?1006l");
 }
-var WIDE = /[\u1100-\u115F\u2300-\u23FF\u2500-\u25FF\u2700-\u27BF\u2E80-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]/;
-function displayWidth(s) {
-  let w = 0;
-  for (const ch of s)
-    w += WIDE.test(ch) ? 2 : 1;
-  return w;
+function isWideCP(cp) {
+  if (cp >= 4352 && cp <= 4447 || cp >= 8960 && cp <= 9215 || cp >= 9472 && cp <= 9727 || cp >= 9984 && cp <= 10175 || cp >= 11904 && cp <= 42191 || cp >= 44032 && cp <= 55203 || cp >= 63744 && cp <= 64255 || cp >= 65072 && cp <= 65103 || cp >= 65280 && cp <= 65376 || cp >= 65504 && cp <= 65510)
+    return true;
+  if (cp >= 127744 && cp <= 128511 || cp >= 128512 && cp <= 128591 || cp >= 128640 && cp <= 128767 || cp >= 129280 && cp <= 129535 || cp >= 129536 && cp <= 129647 || cp >= 129648 && cp <= 129791 || cp >= 11008 && cp <= 11263 || cp >= 118784 && cp <= 119039 || cp >= 129792 && cp <= 130047)
+    return true;
+  return false;
+}
+function codeWidth(ch) {
+  const cp = ch.codePointAt(0);
+  if (cp === 8205 || cp === 65038 || cp === 65039 || cp >= 8192 && cp <= 8207)
+    return 0;
+  return isWideCP(cp) ? 2 : 1;
 }
 function wrapText(s, width) {
   const out = [];
@@ -3570,7 +4272,7 @@ function wrapText(s, width) {
     let cur = "";
     let curW = 0;
     for (const ch of raw) {
-      const cw = WIDE.test(ch) ? 2 : 1;
+      const cw = codeWidth(ch);
       if (curW + cw > width) {
         out.push(cur);
         cur = ch;
@@ -3731,7 +4433,7 @@ function hasControllingTty() {
   return ttyState;
 }
 function ttyStty(args) {
-  const r = spawnSync2("stty", ["-F", "/dev/tty", ...args], { encoding: "utf8" });
+  const r = spawnSync3("stty", ["-F", "/dev/tty", ...args], { encoding: "utf8" });
   return r.stdout?.trim() ?? "";
 }
 function getSize() {
@@ -4019,6 +4721,9 @@ class TUI {
   keyHandler = null;
   commands = ["help", "clear", "provider", "model", "approve", "exit"];
   promptOverride = null;
+  stepIndex = 0;
+  toolCallCount = 0;
+  totalSteps = 40;
   constructor(rows, cols, callbacks) {
     this.callbacks = callbacks;
     this.rows = rows;
@@ -4224,12 +4929,12 @@ class TUI {
     let acc = 0;
     for (let li = 0;li < lines.length; li++) {
       if (this.cursor <= acc + lines[li].length) {
-        return { line: li, col: displayWidth(lines[li].slice(0, this.cursor - acc)) };
+        return { line: li, col: codeWidth(lines[li].slice(0, this.cursor - acc)) };
       }
       acc += lines[li].length;
     }
     const last = Math.max(0, lines.length - 1);
-    return { line: last, col: displayWidth(lines[last]) };
+    return { line: last, col: codeWidth(lines[last]) };
   }
   scrollBy(delta) {
     this.scrollOffset = Math.max(0, this.scrollOffset + delta);
@@ -4377,8 +5082,12 @@ class TUI {
     if (this.scrollOffset > 0) {
       statusText = `${statusText}  ${ansi.dim}↑${this.scrollOffset}/${total}${ansi.reset}`;
     }
+    if (this.busy) {
+      const metrics = this.totalSteps > 0 ? ` · step ${this.stepIndex}/${this.totalSteps} · ${this.toolCallCount} tool${this.toolCallCount !== 1 ? "s" : ""}` : ` · ${this.toolCallCount} tool${this.toolCallCount !== 1 ? "s" : ""}`;
+      statusText = statusText + metrics;
+    }
     output += `\x1B[${statusRow};1H`;
-    output += statusText ? paint(statusText.slice(0, colW), this.status.color) + "\x1B[K" : theme.violet + "●" + theme.reset + "  " + theme.muted + "Ready" + theme.reset + "\x1B[K";
+    output += statusText ? paint(statusText.slice(0, colW), this.status.color) + "\x1B[K" : theme.violet + "\uD83D\uDFE2" + theme.reset + "  " + theme.muted + "Ready" + theme.reset + "\x1B[K";
     if (this.promptOverride) {
       output += `\x1B[${inputTop};1H`;
       output += this.promptOverride.slice(0, colW) + "\x1B[K";
@@ -4689,13 +5398,10 @@ registerTool({
   }
 });
 
-// src/ui/repl.ts
-import { createInterface as createInterface2 } from "node:readline";
-
 // src/env.ts
-import { existsSync as existsSync9, readFileSync as readFileSync6 } from "node:fs";
-import { homedir as homedir5 } from "node:os";
-import { dirname as dirname6, join as join8 } from "node:path";
+import { existsSync as existsSync11, readFileSync as readFileSync7 } from "node:fs";
+import { homedir as homedir6 } from "node:os";
+import { dirname as dirname6, join as join10 } from "node:path";
 var loaded = new Set;
 function envLine(line) {
   const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
@@ -4712,17 +5418,17 @@ function loadDotEnv() {
   if (process.env.VIBECODER_NO_DOTENV === "1")
     return;
   const candidates = [
-    join8(packageRoot(), ".env"),
-    join8(dirname6(packageRoot()), ".env"),
-    join8(homedir5(), ".vibecoder", ".env")
+    join10(packageRoot(), ".env"),
+    join10(dirname6(packageRoot()), ".env"),
+    join10(homedir6(), ".vibecoder", ".env")
   ];
   for (const file of candidates) {
     if (loaded.has(file))
       continue;
     loaded.add(file);
-    if (!existsSync9(file))
+    if (!existsSync11(file))
       continue;
-    const text = readFileSync6(file, "utf8");
+    const text = readFileSync7(file, "utf8");
     for (const raw of text.split(`
 `)) {
       if (!raw.trim() || raw.trim().startsWith("#"))
@@ -4731,14 +5437,14 @@ function loadDotEnv() {
       if (!kv)
         continue;
       const [key, value] = kv;
-      if (!(key in process.env))
+      if (!(key in process.env) || !process.env[key])
         process.env[key] = value;
     }
   }
 }
 
 // src/doctor.ts
-import { existsSync as existsSync10 } from "node:fs";
+import { existsSync as existsSync12 } from "node:fs";
 function maskKey(v) {
   if (!v)
     return "not set";
@@ -4760,7 +5466,7 @@ async function runDoctor() {
   const pkg = readPackageJson();
   const version = pkg?.version ?? "dev";
   const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`;
-  const isTermux = existsSync10("/data/data/com.termux") || process.env.ANDROID_DATA !== undefined || process.env.EXTERNAL_STORAGE !== undefined;
+  const isTermux = existsSync12("/data/data/com.termux") || process.env.ANDROID_DATA !== undefined || process.env.EXTERNAL_STORAGE !== undefined;
   say("vibecoder doctor");
   say(`  version:   ${version}`);
   say(`  runtime:   ${runtime} (${process.platform}/${process.arch})${isTermux ? " · Android (Termux)" : ""}`);
@@ -4778,6 +5484,15 @@ async function runDoctor() {
 `) + `
 `);
     return 1;
+  }
+  const validationErrors = validateConfig(cfg);
+  if (validationErrors.length) {
+    out.push("");
+    out.push("  config:    INVALID — these problems would crash vibecoder:");
+    for (const e of validationErrors)
+      out.push(`             - ${e}`);
+    out.push("             fix config.json and re-run doctor");
+    out.push("");
   }
   out.push("");
   say("config");
@@ -4829,7 +5544,7 @@ async function runDoctor() {
   say(`  queue:     ~/.vibecoder/queue.json (offline task queue)`);
   say(`  ledger:    ${ledgerPath()}`);
   say(`  user env:  ~/.vibecoder/.env      (optional API keys, e.g. GROQ_API_KEY=...)`);
-  const userCfgExists = existsSync10(userConfigFile());
+  const userCfgExists = existsSync12(userConfigFile());
   const keysPresent = Object.keys(cfg.providers ?? {}).map((n) => cfg.providers[n].apiKeyEnv).filter(Boolean).some((k) => process.env[k]);
   out.push("");
   say("next steps");
@@ -4847,9 +5562,9 @@ async function runDoctor() {
 // src/setup.ts
 import { createInterface } from "node:readline/promises";
 import { stdin as stdinInput, stdout as stdoutOutput } from "node:process";
-import { appendFileSync as appendFileSync2, existsSync as existsSync11, mkdirSync as mkdirSync6 } from "node:fs";
-import { homedir as homedir6 } from "node:os";
-import { join as join9 } from "node:path";
+import { appendFileSync as appendFileSync2, existsSync as existsSync13, mkdirSync as mkdirSync6 } from "node:fs";
+import { homedir as homedir7 } from "node:os";
+import { join as join11 } from "node:path";
 var LOCAL_MODEL = "qwen2.5:1.5b";
 async function prompt(question, fallback, interactive) {
   if (!interactive)
@@ -4878,7 +5593,7 @@ async function runSetup(argv) {
   line();
   const builtinPath = resolvePackageFile("config.json");
   const builtin = builtinPath ? loadJsonFile(builtinPath) : null;
-  if (existsSync11(userConfigFile())) {
+  if (existsSync13(userConfigFile())) {
     line(`An existing customization file exists: ${userConfigFile()}`);
     if (!await confirm("Overwrite it? (n keeps your current config)", false, interactive)) {
       line("OK — leaving your config untouched. Run `vibecoder doctor` to inspect it.");
@@ -4924,8 +5639,8 @@ async function runSetup(argv) {
   }
   const written = writeUserConfig(cfg);
   if (groqKey || nvidiaKey) {
-    const envFile = join9(homedir6(), ".vibecoder", ".env");
-    mkdirSync6(join9(homedir6(), ".vibecoder"), { recursive: true });
+    const envFile = join11(homedir7(), ".vibecoder", ".env");
+    mkdirSync6(join11(homedir7(), ".vibecoder"), { recursive: true });
     if (groqKey)
       appendFileSync2(envFile, `GROQ_API_KEY=${groqKey}
 `);
@@ -4948,8 +5663,450 @@ async function runSetup(argv) {
   return 0;
 }
 
+// src/project-context.ts
+import { existsSync as existsSync14, readFileSync as readFileSync8 } from "node:fs";
+import { join as join12 } from "node:path";
+import { homedir as homedir8 } from "node:os";
+var PROJECT_CONTEXT_FILES = [
+  "AGENTS.md",
+  ".vibecoder/AGENTS.md",
+  ".claude/agents.md",
+  ".agents.md"
+];
+function loadProjectContext(workspace) {
+  for (const relPath of PROJECT_CONTEXT_FILES) {
+    const fullPath = join12(workspace, relPath);
+    if (existsSync14(fullPath)) {
+      const content = readFileSync8(fullPath, "utf8");
+      if (content.trim()) {
+        return { dir: workspace, content, source: fullPath };
+      }
+    }
+  }
+  return { dir: "", content: "", source: "" };
+}
+function buildProjectPrompt(ctx) {
+  if (!ctx.content)
+    return "";
+  return `
+
+## Project Instructions (from ${ctx.source})
+
+${ctx.content}
+`;
+}
+function loadPersonalContext() {
+  const p = join12(homedir8(), ".vibecoder", "AGENTS.md");
+  if (existsSync14(p)) {
+    const content = readFileSync8(p, "utf8");
+    if (content.trim())
+      return { dir: p, content, source: p };
+  }
+  return { dir: "", content: "", source: "" };
+}
+
 // src/ui/repl.ts
+import { join as join14 } from "node:path";
+import { homedir as homedir9 } from "node:os";
+import { existsSync as existsSync16, readFileSync as readFileSync10 } from "node:fs";
+import { createInterface as createInterface2 } from "node:readline";
+
+// src/slash.ts
+var registry2 = [];
+function registerSlashCommand(cmd) {
+  registry2.push(cmd);
+}
+async function dispatchSlashCommand(line, tui) {
+  const body = line.startsWith("/") ? line.slice(1) : line;
+  const parts = body.split(/\s+/);
+  const name = parts[0];
+  const argv = parts.slice(1).join(" ");
+  for (const cmd of registry2) {
+    if (cmd.name === name)
+      return await cmd.handler(argv, tui);
+  }
+  return false;
+}
+
+// src/graphify.ts
+import { existsSync as existsSync15, readFileSync as readFileSync9 } from "node:fs";
+import { join as join13 } from "node:path";
 var colors = {
+  dim: "\x1B[2m",
+  green: "\x1B[32m",
+  cyan: "\x1B[36m",
+  yellow: "\x1B[33m",
+  magenta: "\x1B[35m",
+  red: "\x1B[31m",
+  gray: "\x1B[90m",
+  reset: "\x1B[0m",
+  bold: "\x1B[1m"
+};
+var graphifyConfig = {
+  graphDir: "./graphify_out/graphify-out",
+  defaultMode: "code"
+};
+function print(tui, s) {
+  if (tui)
+    tui.printToScrollback(s);
+  else
+    console.log(s);
+}
+function findGraphDir(cwd) {
+  if (existsSync15(graphifyConfig.graphDir))
+    return graphifyConfig.graphDir;
+  const candidates = [
+    join13(cwd, "graphify_out", "graphify-out"),
+    join13(cwd, ".graphify", "graphify-out"),
+    join13(cwd, "graphify-out")
+  ];
+  for (const c of candidates) {
+    if (existsSync15(c))
+      return c;
+  }
+  return graphifyConfig.graphDir;
+}
+function loadGraphStats(graphDir) {
+  const graphPath = join13(graphDir, "graph.json");
+  if (!existsSync15(graphPath))
+    return null;
+  try {
+    const data = JSON.parse(readFileSync9(graphPath, "utf8"));
+    const nodeCount = data.nodes?.length ?? 0;
+    const edgeCount = data.links?.length ?? 0;
+    const communitySet = new Set((data.nodes ?? []).map((n) => n.community).filter((c) => c !== undefined && c !== null));
+    return {
+      nodes: nodeCount,
+      edges: edgeCount,
+      communities: communitySet.size
+    };
+  } catch {
+    return null;
+  }
+}
+async function runGraphify(args, cwd) {
+  const graphDir = findGraphDir(cwd);
+  const fullArgs = ["-m", "graphify", ...args, "--graph-dir", graphDir];
+  return new Promise((resolve) => {
+    const { spawn } = __require("node:child_process");
+    const proc = spawn("python", fullArgs, { cwd, stdio: "pipe" });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout?.on("data", (d) => stdout += d.toString());
+    proc.stderr?.on("data", (d) => stderr += d.toString());
+    proc.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    proc.on("error", (err) => resolve({ code: 127, stdout, stderr: err.message }));
+  });
+}
+async function handleQuery(argv, tui, cwd) {
+  const args = argv.trim().split(/\s+/);
+  if (!args[0] || args[0] === "help") {
+    print(tui, `${colors.bold}graphify query${colors.reset} — query the knowledge graph`);
+    print(tui, `  ${colors.green}/graphify query "your question"${colors.reset}     natural language (needs API key)`);
+    print(tui, `  ${colors.green}/graphify query --code "your question"${colors.reset}  code-only (no key needed)`);
+    print(tui, `  ${colors.green}/graphify query --mode code|nl "..."${colors.reset}   explicit mode`);
+    print(tui, `  ${colors.dim}Examples:${colors.reset}`);
+    print(tui, `  ${colors.dim}  /graphify query "how does the REPL connect to the agent loop?"${colors.reset}`);
+    print(tui, `  ${colors.dim}  /graphify query --code "what calls handleCommand?"${colors.reset}`);
+    return true;
+  }
+  const modeIdx = args.indexOf("--mode");
+  const codeIdx = args.indexOf("--code");
+  const nlIdx = args.indexOf("--nl");
+  let mode = graphifyConfig.defaultMode;
+  if (modeIdx !== -1 && args[modeIdx + 1])
+    mode = args[modeIdx + 1];
+  else if (codeIdx !== -1)
+    mode = "code";
+  else if (nlIdx !== -1)
+    mode = "nl";
+  const query = args.filter((_, i) => i !== modeIdx && i !== modeIdx + 1 && i !== codeIdx && i !== nlIdx).join(" ");
+  if (!query) {
+    print(tui, `${colors.red}usage: /graphify query [--code|--nl|--mode code|nl] "question"${colors.reset}`);
+    return true;
+  }
+  print(tui, `${colors.dim}querying graph (${mode} mode)…${colors.reset}`);
+  const res = await runGraphify(["query", `--${mode}`, query], cwd);
+  if (res.code !== 0) {
+    print(tui, `${colors.red}query failed:${colors.reset} ${res.stderr || res.stdout}`);
+    return true;
+  }
+  print(tui, res.stdout || `${colors.dim}(no results)${colors.reset}`);
+  return true;
+}
+async function handleStats(argv, tui, cwd) {
+  const graphDir = findGraphDir(cwd);
+  const stats = loadGraphStats(graphDir);
+  if (!stats) {
+    print(tui, `${colors.red}no graph found at ${graphDir}${colors.reset}`);
+    print(tui, `${colors.dim}run: graphify build . --code-only${colors.reset}`);
+    return true;
+  }
+  print(tui, `${colors.bold}Graph Statistics${colors.reset}`);
+  print(tui, `  ${colors.cyan}Nodes:${colors.reset}       ${stats.nodes}`);
+  print(tui, `  ${colors.cyan}Edges:${colors.reset}       ${stats.edges}`);
+  print(tui, `  ${colors.cyan}Communities:${colors.reset} ${stats.communities}`);
+  print(tui, `  ${colors.cyan}Graph dir:${colors.reset}   ${graphDir}`);
+  const reportPath = join13(graphDir, "GRAPH_REPORT.md");
+  if (existsSync15(reportPath)) {
+    const report = readFileSync9(reportPath, "utf8");
+    const lines = report.split(`
+`).slice(0, 30);
+    print(tui, `
+${colors.dim}--- GRAPH_REPORT.md (first 30 lines) ---${colors.reset}`);
+    for (const line of lines)
+      print(tui, line);
+  }
+  return true;
+}
+async function handleUpdate(argv, tui, cwd) {
+  const args = argv.trim().split(/\s+/);
+  const codeOnly = args.includes("--code-only") || args.includes("-c");
+  const watch = args.includes("--watch") || args.includes("-w");
+  print(tui, `${colors.dim}updating graph${codeOnly ? " (code-only)" : ""}${watch ? " + watch mode" : ""}…${colors.reset}`);
+  const res = await runGraphify(["update", codeOnly ? "--code-only" : "", watch ? "--watch" : ""].filter(Boolean), cwd);
+  if (res.code !== 0) {
+    print(tui, `${colors.red}update failed:${colors.reset} ${res.stderr || res.stdout}`);
+    return true;
+  }
+  print(tui, `${colors.green}graph updated${colors.reset}`);
+  if (res.stdout)
+    print(tui, res.stdout);
+  return true;
+}
+async function handleBuild(argv, tui, cwd) {
+  const args = argv.trim().split(/\s+/);
+  const codeOnly = args.includes("--code-only") || args.includes("-c");
+  const wiki = args.includes("--wiki");
+  const includeRaw = args.includes("--include-raw");
+  print(tui, `${colors.dim}building graph${codeOnly ? " (code-only)" : ""}${wiki ? " + wiki" : ""}${includeRaw ? " + raw" : ""}…${colors.reset}`);
+  const res = await runGraphify(["build", ".", codeOnly ? "--code-only" : "", wiki ? "--wiki" : "", includeRaw ? "--include-raw" : ""].filter(Boolean), cwd);
+  if (res.code !== 0) {
+    print(tui, `${colors.red}build failed:${colors.reset} ${res.stderr || res.stdout}`);
+    return true;
+  }
+  print(tui, `${colors.green}graph built${colors.reset}`);
+  if (res.stdout)
+    print(tui, res.stdout);
+  return true;
+}
+async function handleExport(argv, tui, cwd) {
+  const args = argv.trim().split(/\s+/);
+  if (!args[0] || args[0] === "help") {
+    print(tui, `${colors.bold}graphify export${colors.reset} — export graph to other formats`);
+    print(tui, `  ${colors.green}/graphify export neo4j${colors.reset}     Neo4j Cypher import`);
+    print(tui, `  ${colors.green}/graphify export graphml${colors.reset}    GraphML (Gephi, yEd, etc.)`);
+    print(tui, `  ${colors.green}/graphify export svg${colors.reset}       SVG visualization`);
+    print(tui, `  ${colors.green}/graphify export mcp${colors.reset}       MCP server config`);
+    return true;
+  }
+  const format = args[0];
+  const valid = ["neo4j", "graphml", "svg", "mcp"];
+  if (!valid.includes(format)) {
+    print(tui, `${colors.red}unknown format: ${format}${colors.reset}`);
+    print(tui, `${colors.dim}valid: ${valid.join(", ")}${colors.reset}`);
+    return true;
+  }
+  print(tui, `${colors.dim}exporting to ${format}…${colors.reset}`);
+  const res = await runGraphify(["export", format], cwd);
+  if (res.code !== 0) {
+    print(tui, `${colors.red}export failed:${colors.reset} ${res.stderr || res.stdout}`);
+    return true;
+  }
+  print(tui, `${colors.green}export complete${colors.reset}`);
+  if (res.stdout)
+    print(tui, res.stdout);
+  return true;
+}
+async function handleMcp(argv, tui, cwd) {
+  const args = argv.trim().split(/\s+/);
+  const port = args[0] ? parseInt(args[0], 10) : 3001;
+  print(tui, `${colors.dim}starting MCP server on port ${port}…${colors.reset}`);
+  print(tui, `${colors.yellow}Note: this runs in foreground. Use a separate terminal or background it.${colors.reset}`);
+  const { spawn } = __require("node:child_process");
+  const graphDir = findGraphDir(cwd);
+  const proc = spawn("graphify", ["mcp", "--graph-dir", graphDir, "--port", String(port)], {
+    cwd,
+    stdio: "inherit"
+  });
+  proc.on("close", (code) => {
+    print(tui, `${colors.dim}MCP server exited (code ${code})${colors.reset}`);
+  });
+  return true;
+}
+async function handleConfig(argv, tui, cwd) {
+  const args = argv.trim().split(/\s+/);
+  if (!args[0] || args[0] === "show") {
+    print(tui, `${colors.bold}Graphify Config${colors.reset}`);
+    print(tui, `  graphDir:   ${graphifyConfig.graphDir}`);
+    print(tui, `  defaultMode: ${graphifyConfig.defaultMode}`);
+    print(tui, `  apiKey:     ${graphifyConfig.apiKey ? "***set***" : "not set"}`);
+    return true;
+  }
+  if (args[0] === "set") {
+    const key = args[1];
+    const value = args.slice(2).join(" ");
+    if (!key || !value) {
+      print(tui, `${colors.red}usage: /graphify config set <key> <value>${colors.reset}`);
+      print(tui, `${colors.dim}keys: graphDir, defaultMode, apiKey${colors.reset}`);
+      return true;
+    }
+    if (key === "graphDir")
+      graphifyConfig.graphDir = resolve2(value, { cwd });
+    else if (key === "defaultMode") {
+      if (!["code", "nl"].includes(value)) {
+        print(tui, `${colors.red}defaultMode must be 'code' or 'nl'${colors.reset}`);
+        return true;
+      }
+      graphifyConfig.defaultMode = value;
+    } else if (key === "apiKey")
+      graphifyConfig.apiKey = value;
+    else {
+      print(tui, `${colors.red}unknown key: ${key}${colors.reset}`);
+      return true;
+    }
+    print(tui, `${colors.green}config updated${colors.reset}`);
+    return true;
+  }
+  print(tui, `${colors.red}usage: /graphify config [show|set <key> <value>]${colors.reset}`);
+  return true;
+}
+async function handleHelp(_argv, tui) {
+  print(tui, `
+${colors.bold}/graphify — Knowledge Graph Integration${colors.reset}`);
+  print(tui, ``);
+  print(tui, `${colors.green}/graphify query "question"${colors.reset}      Ask the graph (NL mode, needs API key)`);
+  print(tui, `${colors.green}/graphify query --code "question"${colors.reset}  Code-only query (no key needed)`);
+  print(tui, `${colors.green}/graphify stats${colors.reset}                 Show graph statistics`);
+  print(tui, `${colors.green}/graphify build [--code-only] [--wiki]${colors.reset}  Build/rebuild the graph`);
+  print(tui, `${colors.green}/graphify update [--code-only] [--watch]${colors.reset}  Incremental update`);
+  print(tui, `${colors.green}/graphify export <format>${colors.reset}        Export: neo4j, graphml, svg, mcp`);
+  print(tui, `${colors.green}/graphify mcp [port]${colors.reset}             Start MCP server (default 3001)`);
+  print(tui, `${colors.green}/graphify config [show|set key val]${colors.reset}  Configure graphify`);
+  print(tui, `${colors.green}/graphify help${colors.reset}                 This help`);
+  print(tui, ``);
+  print(tui, `${colors.dim}Graph dir: ${findGraphDir(process.cwd())}${colors.reset}`);
+  return true;
+}
+function registerGraphifyCommands(getCwd) {
+  const handler = async (argv, tui) => {
+    const cwd = getCwd();
+    const args = argv.trim().split(/\s+/);
+    const sub = args[0]?.toLowerCase() || "help";
+    switch (sub) {
+      case "query":
+      case "q":
+        return handleQuery(args.slice(1).join(" "), tui, cwd);
+      case "stats":
+      case "stat":
+      case "s":
+        return handleStats(argv, tui, cwd);
+      case "build":
+      case "b":
+        return handleBuild(args.slice(1).join(" "), tui, cwd);
+      case "update":
+      case "u":
+        return handleUpdate(args.slice(1).join(" "), tui, cwd);
+      case "export":
+      case "e":
+        return handleExport(args.slice(1).join(" "), tui, cwd);
+      case "mcp":
+        return handleMcp(args.slice(1).join(" "), tui, cwd);
+      case "config":
+      case "cfg":
+        return handleConfig(args.slice(1).join(" "), tui, cwd);
+      case "help":
+      case "h":
+      default:
+        return handleHelp(argv, tui);
+    }
+  };
+  registerSlashCommand({
+    name: "graphify",
+    label: "graphify",
+    description: "query & manage the codebase knowledge graph (query, stats, build, update, export, mcp)",
+    handler
+  });
+}
+
+// src/hooks.ts
+var hooks = [];
+function runHooks(event) {
+  return Promise.all(hooks.map((fn) => fn(event).catch((err) => {
+    process.stderr.write(`[vibecoder:hook error] ${err}
+`);
+  })));
+}
+
+// src/cost.ts
+var byTurn = [];
+var turnIndex = 0;
+var TOKEN_COSTS = {
+  groq: { input: 0, output: 0 },
+  openai: { input: 0.000005, output: 0.000015 },
+  anthropic: { input: 0.000003, output: 0.000015 },
+  nvidia: { input: 0.0000005, output: 0.0000015 },
+  ollama: { input: 0, output: 0 }
+};
+function rateFor(provider, _model) {
+  return TOKEN_COSTS[provider] ?? { input: 0.00001, output: 0.00003 };
+}
+function recordCost(params) {
+  const rate = rateFor(params.provider, params.model);
+  const inputCost = params.inputTokens * rate.input;
+  const outputCost = params.outputTokens * rate.output;
+  const reasoningCost = (params.reasoningTokens ?? 0) * (rate.reasoning ?? rate.output);
+  const event = {
+    turnIndex: turnIndex++,
+    provider: params.provider,
+    model: params.model,
+    inputTokens: params.inputTokens,
+    outputTokens: params.outputTokens,
+    reasoningTokens: params.reasoningTokens,
+    estimatedCostUsd: inputCost + outputCost + reasoningCost,
+    timestamp: Date.now()
+  };
+  byTurn.push(event);
+  return event;
+}
+function costSummary2() {
+  const totalInput = byTurn.reduce((s, e) => s + e.inputTokens, 0);
+  const totalOutput = byTurn.reduce((s, e) => s + e.outputTokens, 0);
+  const totalReasoning = byTurn.reduce((s, e) => s + (e.reasoningTokens ?? 0), 0);
+  const totalCost = byTurn.reduce((s, e) => s + e.estimatedCostUsd, 0);
+  return {
+    turnCount: byTurn.length,
+    totalInputTokens: totalInput,
+    totalOutputTokens: totalOutput,
+    totalReasoningTokens: totalReasoning,
+    totalCostUsd: totalCost,
+    byTurn
+  };
+}
+function clearCostTracking() {
+  byTurn.length = 0;
+  turnIndex = 0;
+}
+function costReportText() {
+  const s = costSummary2();
+  if (!s.turnCount)
+    return "  no cost data yet (this session)";
+  const lines = [
+    `  ${s.turnCount} turn(s)`,
+    `  input:  ${s.totalInputTokens.toLocaleString()} tokens`,
+    `  output: ${s.totalOutputTokens.toLocaleString()} tokens`,
+    `  reasoning: ${s.totalReasoningTokens.toLocaleString()} tokens`,
+    `  estimated cost: $${s.totalCostUsd.toFixed(6)} (this session, rough estimate)`,
+    ``,
+    `  per-turn breakdown:`,
+    ...s.byTurn.map((e) => `    turn ${e.turnIndex}: ${e.provider}/${e.model} · in ${e.inputTokens} · out ${e.outputTokens}${e.reasoningTokens ? ` · reasoning ${e.reasoningTokens}` : ""} · ~$${e.estimatedCostUsd.toFixed(6)}`)
+  ];
+  return lines.join(`
+`);
+}
+
+// src/ui/repl.ts
+var colors2 = {
   dim: "\x1B[2m",
   green: "\x1B[32m",
   cyan: "\x1B[36m",
@@ -5037,6 +6194,13 @@ function applySession(s) {
     systemPrompt = s.systemPrompt;
   if (s.cwd)
     cwd = s.cwd;
+  const pc = loadProjectContext(cwd);
+  const personalProjectCtx2 = !pc.content ? loadPersonalContext() : { dir: "", content: "", source: "" };
+  const epc = pc.content ? pc : personalProjectCtx2;
+  const projectPrompt = buildProjectPrompt(epc);
+  if (projectPrompt) {
+    systemPrompt = systemPrompt + projectPrompt;
+  }
   if (s.provider && rootConfig) {
     try {
       const r = createProvider(rootConfig, s.provider);
@@ -5067,14 +6231,70 @@ async function init() {
   maxInputTokensPerMinute = limits.maxInputTokensPerMinute;
   providerStream = resolved.provider.streamChat.bind(resolved.provider);
   router = new ModelRouter(config, limits);
+  registerSlashCommand({
+    name: "plan",
+    label: "plan",
+    description: "enter plan mode: agent writes a plan, you approve, then it executes",
+    handler: async (argv, tui) => handlePlanCommand(argv, tui)
+  });
+  registerSlashCommand({
+    name: "cost",
+    label: "cost",
+    description: "show token usage + estimated cost for this session",
+    handler: async (_argv, tui) => {
+      const report = costReportText();
+      if (tui)
+        tui.printToScrollback(report);
+      else
+        process.stdout.write(report + `
+`);
+      return true;
+    }
+  });
+  registerSlashCommand({
+    name: "reset-cost",
+    label: "reset-cost",
+    description: "reset the session cost tracker (start a new cost period without restarting)",
+    handler: async (_argv, tui) => {
+      clearCostTracking();
+      const msg = `session cost tracker reset.
+${costReportText()}`;
+      if (tui)
+        tui.printToScrollback(msg);
+      else
+        process.stdout.write(msg + `
+`);
+      return true;
+    }
+  });
+  registerSlashCommand({
+    name: "hooks",
+    label: "hooks",
+    description: "list registered hooks",
+    handler: async (_argv, tui) => {
+      const lines = [
+        "  registered hooks:",
+        ...registeredHookNames(),
+        "  (hooks run at beforePrompt, afterTool, afterStep, onFinish)"
+      ].join(`
+`);
+      if (tui)
+        tui.printToScrollback(lines);
+      else
+        process.stdout.write(lines + `
+`);
+      return true;
+    }
+  });
+  registerGraphifyCommands(() => cwd);
   if (router.offlineIdentity()) {
     const oll = await ensureOllamaServe({
       readyTimeoutMs: 6000,
-      onLog: (line) => process.stdout.write(`${colors.dim}${line}${colors.reset}
+      onLog: (line) => process.stdout.write(`${colors2.dim}${line}${colors2.reset}
 `)
     });
     if (oll && !oll.running && !(oll.error ?? "").includes("autostart disabled")) {
-      process.stdout.write(`${colors.dim}note: offline chat needs a local model (ollama pull qwen2.5:1.5b); meanwhile set GROQ_API_KEY so online routes keep working.${colors.reset}
+      process.stdout.write(`${colors2.dim}note: offline chat needs a local model (ollama pull qwen2.5:1.5b); meanwhile set GROQ_API_KEY so online routes keep working.${colors2.reset}
 `);
     }
   }
@@ -5110,6 +6330,10 @@ async function init() {
   if (dirArg !== -1 && process.argv[dirArg + 1]) {
     cwd = resolve2(process.argv[dirArg + 1], { cwd: process.cwd() });
   }
+  const projectCtx = loadProjectContext(cwd);
+  const personalProjectCtx = !projectCtx.content ? loadPersonalContext() : { dir: "", content: "", source: "" };
+  const effectiveProjectCtx = projectCtx.content ? projectCtx : personalProjectCtx;
+  systemPrompt = (config.systemPrompt ?? "You are Vibecoder.") + buildProjectPrompt(effectiveProjectCtx) + SELF_EDIT_PROTOCOL;
   const stepsIdx = process.argv.indexOf("--max-steps");
   if (stepsIdx !== -1 && process.argv[stepsIdx + 1]) {
     const n = parseInt(process.argv[stepsIdx + 1], 10);
@@ -5122,6 +6346,85 @@ function onlineStatus() {
     return "";
   const off = router?.offlineIdentity();
   return off ? `offline (${off.provider}/${off.model}) · ` : "offline · ";
+}
+var planModeActive = false;
+var planText = "";
+async function handlePlanCommand(_argv, tui) {
+  if (planModeActive) {
+    if (tui)
+      tui.printToScrollback(`${colors2.dim}already in plan mode — respond to the plan prompt${colors2.reset}`);
+    return true;
+  }
+  planModeActive = true;
+  planText = "";
+  const print = (s) => {
+    if (tui)
+      tui.printToScrollback(s);
+    else
+      console.log(s);
+  };
+  print(`
+${colors2.bold}PLAN MODE${colors2.reset}`);
+  print(`  ${colors2.dim}I'll draft a plan for your last message. Review it, then say${colors2.reset}`);
+  print(`  ${colors2.green}"approve"${colors2.reset} to execute, or${colors2.green} "reject"${colors2.reset} to cancel.
+`);
+  let planProvider = providerStream;
+  let planModel = llmModel;
+  if (router && !online) {
+    const off = router.resolveOffline("plan");
+    planProvider = off.provider.streamChat.bind(off.provider);
+    planModel = off.model;
+  }
+  print(`${colors2.dim}drafting plan with ${planModel}…${colors2.reset}`);
+  try {
+    const result = await runAgent({
+      provider: planProvider,
+      systemPrompt: `You are Vibecoder in PLAN MODE. The user wants you to plan before acting.
+
+Write a CONCISE plan (4-8 bullet points) for: "${messages[messages.length - 1]?.content ?? _argv}"
+
+Respond ONLY with the plan as a numbered list. Do NOT execute anything. Do NOT use tools.`,
+      model: planModel,
+      initialMessages: [],
+      toolCtx: { cwd, signal: new AbortController().signal, permissions: {} },
+      signal: new AbortController().signal,
+      chatOptions: { temperature: 0.3, max_tokens: 2000 },
+      maxInputTokens: undefined,
+      maxInputTokensPerMinute: undefined
+    }, {
+      maxSteps: 10,
+      onModelText: (t) => {
+        planText += t;
+        if (tui)
+          tui.streamText(t, 7);
+        else
+          process.stdout.write(t);
+      },
+      onDone: () => {
+        if (tui)
+          tui.endStream();
+      }
+    });
+    planText = result.finalText;
+    print(`
+${colors2.bold}--- PLAN ---${colors2.reset}`);
+    print(planText);
+    print(`${colors2.bold}--- END PLAN ---${colors2.reset}
+`);
+    if (tui) {
+      tui.printToScrollback(`${colors2.green}say "approve" to execute, "reject" to cancel${colors2.reset}`);
+    } else {
+      process.stdout.write(`${colors2.green}say "approve" to execute, "reject" to cancel:${colors2.reset} `);
+    }
+  } catch (err) {
+    print(`${colors2.red}plan draft failed: ${err?.message ?? String(err)}${colors2.reset}`);
+    planModeActive = false;
+    planText = "";
+  }
+  return true;
+}
+function registeredHookNames() {
+  return ["hooks system active"];
 }
 async function queueOfflineTask(userInput, tui) {
   if (!router || !rootConfig)
@@ -5145,11 +6448,11 @@ async function queueOfflineTask(userInput, tui) {
       process.stdout.write(s + `
 `);
   };
-  print(`${colors.green}✓ queued${colors.reset} ${colors.dim}${task.id}${colors.reset} — will run automatically when connectivity returns`);
+  print(`${colors2.green}✅ queued${colors2.reset} ${colors2.dim}${task.id}${colors2.reset} — will run automatically when connectivity returns`);
   if (planNote)
-    print(`${colors.dim}${planNote.slice(0, 600)}${colors.reset}`);
+    print(`${colors2.dim}${planNote.slice(0, 600)}${colors2.reset}`);
   else
-    print(`${colors.dim}(offline plan draft unavailable — the task is still queued)`);
+    print(`${colors2.dim}(offline plan draft unavailable — the task is still queued)`);
   persistLast();
 }
 async function inAppDrain() {
@@ -5167,7 +6470,7 @@ async function inAppDrain() {
     };
     const { ran, failed } = await drainQueue(deps);
     if (tuiRef && ran)
-      tuiRef.printToScrollback(`${colors.green}[queue] drained ${ran} task(s)${failed ? `, ${failed} failed` : ""}${colors.reset}`);
+      tuiRef.printToScrollback(`${colors2.green}[queue] drained ${ran} task(s)${failed ? `, ${failed} failed` : ""}${colors2.reset}`);
   } finally {
     nowDraining = false;
   }
@@ -5189,6 +6492,11 @@ async function handleCommand(line, tui) {
       tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
   };
+  if (line.trim().startsWith("/")) {
+    const dispatched = await dispatchSlashCommand(line, tui);
+    if (dispatched)
+      return true;
+  }
   if (["exit", "quit", "/exit", "/quit"].includes(line.trim())) {
     if (tui)
       tui.close();
@@ -5197,26 +6505,29 @@ async function handleCommand(line, tui) {
   }
   if (line.trim() === "/help" || line.trim() === "help") {
     print(`
-${colors.bold}Commands${colors.reset}`);
-    print(`  ${colors.green}/provider <name>${colors.reset}  switch provider (groq, ollama, openai, anthropic…)`);
-    print(`  ${colors.green}/model <id>${colors.reset}       switch model`);
-    print(`  ${colors.green}/route [auto|chat|heavy]${colors.reset} ${colors.dim}model routing: auto-classify, or force chat/heavy model${colors.reset}`);
-    print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
-    print(`  ${colors.green}/save [name]${colors.reset}      save this conversation`);
-    print(`  ${colors.green}/resume [name]${colors.reset}    resume a saved conversation (or the last one)`);
-    print(`  ${colors.green}/list${colors.reset}             list saved conversations`);
-    print(`  ${colors.green}/delete <name>${colors.reset}    delete a saved conversation`);
-    print(`  ${colors.green}/about${colors.reset}             self-knowledge report (model, config, tools)`);
-    print(`  ${colors.green}/reload-config${colors.reset}     approve staged config edits — make them live`);
-    print(`  ${colors.green}/review-self-edits${colors.reset} show audit ledger + pending config diff`);
-    print(`  ${colors.green}/undo-self-edits${colors.reset}   reset config.json to last approved state (git)`);
-    print(`  ${colors.green}/new${colors.reset}              start a fresh conversation (keeps provider/model)`);
-    print(`  ${colors.green}/clear${colors.reset}            clear conversation + screen`);
-    print(`  ${colors.green}/queue${colors.reset}            list queued offline tasks (auto-run when online)`);
-    print(`  ${colors.green}/run-now${colors.reset}          drain the task queue now`);
-    print(`  ${colors.green}/help${colors.reset}             this help`);
-    print(`  ${colors.dim}PageUp/PageDown${colors.reset}       scroll back through the conversation`);
-    print(`  ${colors.green}ctrl-c${colors.reset}            interrupt running task · clear input · exit
+${colors2.bold}Commands${colors2.reset}`);
+    print(`  ${colors2.green}/provider <name>${colors2.reset}  switch provider (groq, ollama, openai, anthropic…)`);
+    print(`  ${colors2.green}/model <id>${colors2.reset}       switch model`);
+    print(`  ${colors2.green}/route [auto|chat|heavy]${colors2.reset} ${colors2.dim}model routing: auto-classify, or force chat/heavy model${colors2.reset}`);
+    print(`  ${colors2.green}/approve [on|off]${colors2.reset} ${colors2.dim}toggle tool approval prompts (default off = no limits)${colors2.reset}`);
+    print(`  ${colors2.green}/save [name]${colors2.reset}      save this conversation`);
+    print(`  ${colors2.green}/resume [name]${colors2.reset}    resume a saved conversation (or the last one)`);
+    print(`  ${colors2.green}/list${colors2.reset}             list saved conversations`);
+    print(`  ${colors2.green}/delete <name>${colors2.reset}    delete a saved conversation`);
+    print(`  ${colors2.green}/cost${colors2.reset}             show token usage + estimated cost for this session`);
+    print(`  ${colors2.green}/reset-cost${colors2.reset}       reset the session cost tracker`);
+    print(`  ${colors2.green}/hooks${colors2.reset}             list registered hooks`);
+    print(`  ${colors2.green}/plan${colors2.reset}             enter plan mode: agent writes a plan, you approve, then it executes`);
+    print(`  ${colors2.green}/reload-config${colors2.reset}     approve staged config edits — make them live`);
+    print(`  ${colors2.green}/review-self-edits${colors2.reset} show audit ledger + pending config diff`);
+    print(`  ${colors2.green}/undo-self-edits${colors2.reset}   reset config.json to last approved state (git)`);
+    print(`  ${colors2.green}/new${colors2.reset}              start a fresh conversation (keeps provider/model)`);
+    print(`  ${colors2.green}/clear${colors2.reset}            clear conversation + screen`);
+    print(`  ${colors2.green}/queue${colors2.reset}            list queued offline tasks (auto-run when online)`);
+    print(`  ${colors2.green}/run-now${colors2.reset}          drain the task queue now`);
+    print(`  ${colors2.green}/help${colors2.reset}             this help`);
+    print(`  ${colors2.dim}PageUp/PageDown${colors2.reset}       scroll back through the conversation`);
+    print(`  ${colors2.green}ctrl-c${colors2.reset}            interrupt running task · clear input · exit
 `);
     return true;
   }
@@ -5229,9 +6540,9 @@ ${colors.bold}Commands${colors.reset}`);
       sessionId = s.id;
       const f = saveSession(s);
       persistLast();
-      print(`${colors.green}saved${colors.reset} ${colors.dim}${f}${colors.reset}`);
+      print(`${colors2.green}saved${colors2.reset} ${colors2.dim}${f}${colors2.reset}`);
     } catch (err) {
-      print(`${colors.red}save failed: ${err?.message ?? String(err)}${colors.reset}`);
+      print(`${colors2.red}save failed: ${err?.message ?? String(err)}${colors2.reset}`);
     }
     return true;
   }
@@ -5244,42 +6555,42 @@ ${colors.bold}Commands${colors.reset}`);
       resumed = loadLast();
     }
     if (!resumed) {
-      print(`${colors.red}no previous conversation${arg ? ` named "${arg}"` : ""} found — use /save to keep one, or /list to browse${colors.reset}`);
+      print(`${colors2.red}no previous conversation${arg ? ` named "${arg}"` : ""} found — use /save to keep one, or /list to browse${colors2.reset}`);
     } else if (!applySession(resumed)) {
-      print(`${colors.red}could not load the saved conversation${colors.reset}`);
+      print(`${colors2.red}could not load the saved conversation${colors2.reset}`);
     } else {
       setStatus();
-      print(`${colors.green}resumed "${resumed.id}"${colors.reset} ${colors.dim}· ${resumed.messages.length} messages · ${resumed.provider}/${resumed.model}${colors.reset}`);
-      print(`  ${colors.dim}${resumed.title}${colors.reset}`);
+      print(`${colors2.green}resumed "${resumed.id}"${colors2.reset} ${colors2.dim}· ${resumed.messages.length} messages · ${resumed.provider}/${resumed.model}${colors2.reset}`);
+      print(`  ${colors2.dim}${resumed.title}${colors2.reset}`);
     }
     return true;
   }
   if (line.trim() === "/list") {
     const sessions = listSessions();
     if (!sessions.length) {
-      print(`${colors.dim}no saved conversations yet — use /save${colors.reset}`);
+      print(`${colors2.dim}no saved conversations yet — use /save${colors2.reset}`);
       return true;
     }
     print(`
-${colors.bold}Saved conversations${colors.reset}`);
+${colors2.bold}Saved conversations${colors2.reset}`);
     for (const s of sessions) {
       const when = new Date(s.updatedAt).toLocaleString();
-      const tag = s.id === sessionId ? colors.green + "•" + colors.reset + " " : "  ";
-      print(`  ${tag}${colors.green}${s.id}${colors.reset} ${colors.dim}${s.messageCount} msgs · ${s.provider}/${s.model} · ${when}${colors.reset}`);
-      print(`      ${colors.dim}${s.title}${colors.reset}`);
+      const tag = s.id === sessionId ? colors2.green + "•" + colors2.reset + " " : "  ";
+      print(`  ${tag}${colors2.green}${s.id}${colors2.reset} ${colors2.dim}${s.messageCount} msgs · ${s.provider}/${s.model} · ${when}${colors2.reset}`);
+      print(`      ${colors2.dim}${s.title}${colors2.reset}`);
     }
     return true;
   }
   if (line.startsWith("/delete")) {
     const arg = line.slice(7).trim();
     if (!arg) {
-      print(`${colors.red}usage: /delete <name>${colors.reset}`);
+      print(`${colors2.red}usage: /delete <name>${colors2.reset}`);
       return true;
     }
     if (!deleteSession(arg))
-      print(`${colors.red}no saved conversation named "${arg}"${colors.reset}`);
+      print(`${colors2.red}no saved conversation named "${arg}"${colors2.reset}`);
     else
-      print(`${colors.green}deleted ${arg}${colors.reset}`);
+      print(`${colors2.green}deleted ${arg}${colors2.reset}`);
     return true;
   }
   if (line.trim() === "/new") {
@@ -5287,14 +6598,21 @@ ${colors.bold}Saved conversations${colors.reset}`);
     sessionId = "";
     taskActive = false;
     const config = await loadConfig();
-    if (config.systemPrompt)
-      systemPrompt = config.systemPrompt + SELF_EDIT_PROTOCOL;
+    const pc = loadProjectContext(cwd);
+    const personalCtx2 = join14(homedir9(), ".vibecoder", "AGENTS.md");
+    const ppc2 = !pc.content && existsSync16(personalCtx2) ? {
+      dir: personalCtx2,
+      content: readFileSync10(personalCtx2, "utf8"),
+      source: personalCtx2
+    } : { dir: "", content: "", source: "" };
+    const epc = pc.content ? pc : ppc2;
+    systemPrompt = (config.systemPrompt ?? "You are Vibecoder.") + buildProjectPrompt(epc) + SELF_EDIT_PROTOCOL;
     tui?.clearScrollback();
     if (tui) {
       const rl = routeLabel();
       tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
-    print(`${colors.dim}fresh conversation started${colors.reset}`);
+    print(`${colors2.dim}fresh conversation started${colors2.reset}`);
     return true;
   }
   if (line.startsWith("/model ")) {
@@ -5305,7 +6623,7 @@ ${colors.bold}Saved conversations${colors.reset}`);
     taskActive = false;
     setRuntimeIdentity(providerName, llmModel);
     setStatus();
-    print(`${colors.dim}model set to ${llmModel}${colors.reset}`);
+    print(`${colors2.dim}model set to ${llmModel}${colors2.reset}`);
     return true;
   }
   if (line.startsWith("/provider ")) {
@@ -5318,27 +6636,59 @@ ${colors.bold}Saved conversations${colors.reset}`);
     taskActive = false;
     setRuntimeIdentity(providerName, llmModel);
     setStatus();
-    print(`${colors.dim}provider set to ${providerName}, model ${llmModel}${colors.reset}`);
+    print(`${colors2.dim}provider set to ${providerName}, model ${llmModel}${colors2.reset}`);
     return true;
   }
   if (line.startsWith("/route")) {
     const arg = line.slice(6).trim().toLowerCase();
     if (!arg) {
-      print(`${colors.dim}mode: ${routerMode} · ${routeLabel() || `provider ${providerName}/${llmModel}`}${colors.reset}`);
+      print(`${colors2.dim}mode: ${routerMode} · ${routeLabel() || `provider ${providerName}/${llmModel}`}${colors2.reset}`);
       return true;
     }
     if (arg === "auto" || arg === "chat" || arg === "heavy") {
       routerMode = arg;
       taskActive = false;
       setStatus();
-      print(`${colors.dim}router mode: ${routerMode}  (chat = ${routeLabel()})${colors.reset}`);
+      print(`${colors2.dim}router mode: ${routerMode}  (chat = ${routeLabel()})${colors2.reset}`);
     } else {
-      print(`${colors.red}usage: /route [auto|chat|heavy]${colors.reset}`);
+      print(`${colors2.red}usage: /route [auto|chat|heavy]${colors2.reset}`);
     }
     return true;
   }
   if (line.startsWith("/approve")) {
     const arg = line.slice(8).trim().toLowerCase();
+    if (planModeActive) {
+      if (arg === "approve" || arg === "yes" || arg === "a") {
+        planModeActive = false;
+        if (tui)
+          tui.printToScrollback(`${colors2.green}✅ plan approved — executing${colors2.reset}`);
+        else
+          process.stdout.write(`${colors2.green}✅ plan approved — executing${colors2.reset}
+`);
+        if (planText) {
+          messages.push({ role: "user", content: `Execute this plan:
+
+${planText}` });
+          await runPrompt(messages[messages.length - 1].content, tui);
+        }
+        return true;
+      } else if (arg === "reject" || arg === "no" || arg === "n") {
+        planModeActive = false;
+        planText = "";
+        if (tui)
+          tui.printToScrollback(`${colors2.dim}plan rejected — back to chat${colors2.reset}`);
+        else
+          process.stdout.write(`${colors2.dim}plan rejected — back to chat${colors2.reset}
+`);
+        return true;
+      } else {
+        if (tui)
+          tui.printToScrollback(`${colors2.dim}say "approve" or "reject"${colors2.reset}`);
+        else
+          process.stdout.write(`${colors2.dim}say "approve" or "reject":${colors2.reset} `);
+        return true;
+      }
+    }
     if (tui) {
       if (arg === "on")
         tui.approveMode = "on";
@@ -5347,7 +6697,7 @@ ${colors.bold}Saved conversations${colors.reset}`);
       else
         tui.approveMode = tui.approveMode === "on" ? "off" : "on";
       setStatus();
-      print(`${colors.dim}tool approval: ${tui.approveMode === "on" ? "on (you approve each tool call)" : "off (agents act freely)"}${colors.reset}`);
+      print(`${colors2.dim}tool approval: ${tui.approveMode === "on" ? "on (you approve each tool call)" : "off (agents act freely)"}${colors2.reset}`);
     }
     return true;
   }
@@ -5357,15 +6707,15 @@ ${colors.bold}Saved conversations${colors.reset}`);
     print(staged ? `
   pending config diff (not yet live):
 ${staged}` : `
-  ${colors.dim}pending config diff: none${colors.reset}`);
+  ${colors2.dim}pending config diff: none${colors2.reset}`);
     if (staged)
-      print(`  ${colors.dim}→ run /reload-config to approve and make live, or /undo-self-edits to revert${colors.reset}`);
+      print(`  ${colors2.dim}➡️ run /reload-config to approve and make live, or /undo-self-edits to revert${colors2.reset}`);
     return true;
   }
   if (line.startsWith("/reload-config")) {
     const cfg = await loadConfig().catch(() => null);
     if (!cfg) {
-      print(`${colors.red}config.json is not valid JSON right now — fix it first.${colors.reset}`);
+      print(`${colors2.red}config.json is not valid JSON right now — fix it first.${colors2.reset}`);
       return true;
     }
     systemPrompt = (cfg.systemPrompt ?? "You are Vibecoder.") + SELF_EDIT_PROTOCOL;
@@ -5378,7 +6728,7 @@ ${staged}` : `
     router = new ModelRouter(cfg, limits);
     appendLedger({ tool: "/reload-config", file: "config.json", beforeSha: "", afterSha: "", note: "staged config edits approved and applied by human" });
     setStatus();
-    print(`${colors.green}approved & applied${colors.reset} — config is now live (${cfg.model ?? "model from config"}).${colors.dim} Consider ${colors.reset}${colors.green}git add config.json && git commit${colors.reset}${colors.dim} to mark this as the new approved baseline.${colors.reset}`);
+    print(`${colors2.green}approved & applied${colors2.reset} — config is now live (${cfg.model ?? "model from config"}).${colors2.dim} Consider ${colors2.reset}${colors2.green}git add config.json && git commit${colors2.reset}${colors2.dim} to mark this as the new approved baseline.${colors2.reset}`);
     return true;
   }
   if (line.startsWith("/undo-self-edits")) {
@@ -5394,24 +6744,24 @@ ${staged}` : `
         maxInputTokensPerMinute = limits.maxInputTokensPerMinute;
         router = new ModelRouter(cfg, limits);
       }
-      print(`${colors.green}config.json reset to the last approved state.${colors.reset}${res.out ? ` (${res.out})` : ""}`);
-      print(`  ${colors.dim}run /reload-config to reload the restored values.${colors.reset}`);
+      print(`${colors2.green}config.json reset to the last approved state.${colors2.reset}${res.out ? ` (${res.out})` : ""}`);
+      print(`  ${colors2.dim}run /reload-config to reload the restored values.${colors2.reset}`);
     } else {
-      print(`${colors.red}reset failed:${colors.reset} ${res.out || "git restore errored"}`);
+      print(`${colors2.red}reset failed:${colors2.reset} ${res.out || "git restore errored"}`);
     }
     return true;
   }
   if (line.trim() === "/review-self-edits") {
     print(`
-${colors.bold}Self-edit audit ledger${colors.reset}${ledgerSummary(10).length ? "" : ` ${colors.dim}(empty)${colors.reset}`}`);
+${colors2.bold}Self-edit audit ledger${colors2.reset}${ledgerSummary(10).length ? "" : ` ${colors2.dim}(empty)${colors2.reset}`}`);
     for (const l of ledgerSummary(10))
       print(l);
     const staged = selfFileDiffStat();
     print(`
-${colors.bold}Pending config changes (staged, not live)${colors.reset}:${staged ? `
-` + staged : ` ${colors.dim}none${colors.reset}`}`);
+${colors2.bold}Pending config changes (staged, not live)${colors2.reset}:${staged ? `
+` + staged : ` ${colors2.dim}none${colors2.reset}`}`);
     if (staged)
-      print(`  ${colors.dim}/reload-config to approve · /undo-self-edits to revert${colors.reset}`);
+      print(`  ${colors2.dim}/reload-config to approve · /undo-self-edits to revert${colors2.reset}`);
     return true;
   }
   if (line.trim() === "/clear") {
@@ -5427,36 +6777,37 @@ ${colors.bold}Pending config changes (staged, not live)${colors.reset}:${staged 
   if (line.trim() === "/queue") {
     const tasks = listTasks();
     if (!tasks.length) {
-      print(`${colors.dim}task queue is empty — offline tasks will be queued here automatically${colors.reset}`);
+      print(`${colors2.dim}task queue is empty — offline tasks will be queued here automatically${colors2.reset}`);
       return true;
     }
     print(`
-${colors.bold}Task queue (${tasks.length})${colors.reset}${online ? "" : `${colors.dim} — offline; will drain when online${colors.reset}`}`);
+${colors2.bold}Task queue (${tasks.length})${colors2.reset}${online ? "" : `${colors2.dim} — offline; will drain when online${colors2.reset}`}`);
     for (const t of tasks) {
       const when = new Date(t.createdAt).toLocaleTimeString();
-      const badge = t.status === "done" ? colors.green + "done" : t.status === "failed" ? colors.red + "failed" : t.status === "running" ? colors.yellow + "running" : colors.cyan + "queued";
-      print(`  ${colors.gray}${t.id}${colors.reset} ${badge}${colors.reset} ${colors.dim}${when} · ${String(t.userMessage).slice(0, 70)}${colors.reset}`);
+      const badge = t.status === "done" ? colors2.green + "done" : t.status === "failed" ? colors2.red + "failed" : t.status === "running" ? colors2.yellow + "running" : colors2.cyan + "queued";
+      print(`  ${colors2.gray}${t.id}${colors2.reset} ${badge}${colors2.reset} ${colors2.dim}${when} · ${String(t.userMessage).slice(0, 70)}${colors2.reset}`);
     }
     return true;
   }
   if (line.trim() === "/run-now" || line.trim() === "/drain") {
     if (!router || !rootConfig) {
-      print(`${colors.red}router not initialised — try again in a moment${colors.reset}`);
+      print(`${colors2.red}router not initialised — try again in a moment${colors2.reset}`);
       return true;
     }
-    print(online ? `${colors.dim}draining queued tasks… (destination: router heavy model)${colors.reset}` : `${colors.dim}terminal is offline — /run-now attempts the queue anyway; it will retry when online${colors.reset}`);
+    print(online ? `${colors2.dim}\uD83D\uDD04 draining queued tasks… (destination: router heavy model)${colors2.reset}` : `${colors2.dim}\uD83D\uDD34 terminal is offline — /run-now attempts the queue anyway; it will retry when online${colors2.reset}`);
     await inAppDrain();
-    print(`${colors.green}drain complete${colors.reset}`);
+    print(`${colors2.green}✅ drain complete${colors2.reset}`);
     return true;
   }
   if (line.startsWith("/")) {
-    print(`${colors.red}unknown command: ${line} — try /help${colors.reset}`);
+    print(`${colors2.red}unknown command: ${line} — try /help${colors2.reset}`);
     return true;
   }
   return false;
 }
 async function runPrompt(userInput, tui) {
   messages.push({ role: "user", content: userInput });
+  await runHooks({ kind: "beforePrompt", context: { cwd, messages, toolCtx: {} }, userInput });
   let turnProvider = providerStream;
   let turnModel = llmModel;
   let turnMaxInput = maxInputTokens;
@@ -5477,7 +6828,7 @@ async function runPrompt(userInput, tui) {
       turnMaxInput = off.maxInputTokens;
       turnMaxInputPerMinute = off.maxInputTokensPerMinute;
       setRuntimeIdentity(off.providerName, off.model);
-      routeNote = `→ offline local: ${off.providerName}/${off.model}`;
+      routeNote = `➡️ offline local: ${off.providerName}/${off.model}`;
     } else {
       const route = await router.resolve(userInput, routerMode, taskActive);
       turnProvider = route.provider.streamChat.bind(route.provider);
@@ -5486,18 +6837,18 @@ async function runPrompt(userInput, tui) {
       turnMaxInputPerMinute = route.maxInputTokensPerMinute;
       heavyRoute = router.isHeavy(route);
       setRuntimeIdentity(route.providerName, route.model);
-      routeNote = `→ ${heavyRoute ? "heavy" : "chat"}: ${route.providerName}/${route.model}`;
+      routeNote = `➡️ ${heavyRoute ? "heavy" : "chat"}: ${route.providerName}/${route.model}`;
     }
   }
   if (!tui) {
-    process.stdout.write(`${colors.cyan}● ${turnModel}${colors.reset}${routeNote ? ` ${colors.dim}${routeNote}${colors.reset}` : ""}
+    process.stdout.write(`${colors2.cyan}\uD83E\uDD16 ${turnModel}${colors2.reset}${routeNote ? ` ${colors2.dim}${routeNote}${colors2.reset}` : ""}
 `);
   } else {
     tui.printToScrollback("");
     tui.separator();
-    tui.printToScrollback(`${colors.bold}${colors.cyan}❯ ${userInput}${colors.reset}`);
+    tui.printToScrollback(`${colors2.bold}${colors2.cyan}\uD83D\uDFE2 ${userInput}${colors2.reset}`);
     if (routeNote)
-      tui.printToScrollback(`${colors.dim}${routeNote}${colors.reset}`);
+      tui.printToScrollback(`${colors2.dim}${routeNote}${colors2.reset}`);
     tui.busy = true;
     tui.setStatus(`router ${routerMode}${taskActive ? " · task" : ""}${heavyRoute ? " · heavy" : ""} — thinking…  (ctrl-c to interrupt)`, 8);
   }
@@ -5520,7 +6871,7 @@ async function runPrompt(userInput, tui) {
       systemPrompt,
       model: turnModel,
       initialMessages: messages,
-      toolCtx: { cwd, signal: ac.signal },
+      toolCtx: { cwd, signal: ac.signal, permissions: resolvePermissions(rootConfig, cwd) },
       signal: ac.signal,
       chatOptions: {
         temperature: chatTemperature,
@@ -5540,7 +6891,7 @@ async function runPrompt(userInput, tui) {
       onReasoning: (t) => {
         if (tui) {
           if (!reasoningShown) {
-            tui.printToScrollback(`${colors.dim}[reasoning]${colors.reset}`);
+            tui.printToScrollback(`${colors2.dim}[reasoning]${colors2.reset}`);
             reasoningShown = true;
           }
           tui.streamText(t, 8);
@@ -5548,36 +6899,47 @@ async function runPrompt(userInput, tui) {
       },
       onToolStart: (name, args) => {
         streaming = true;
-        if (tui)
-          tui.printToScrollback(`${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.reset}`);
-        else
+        runHooks({ kind: "afterTool", context: { cwd, messages, toolCtx: {} }, toolName: name, toolArgs: args, toolResult: "" }).catch(() => {});
+        if (tui) {
+          tui.toolCallCount++;
+          tui.printToScrollback(`${colors2.yellow}⚡ ${name}${colors2.reset} ${colors2.gray}${brief(args)}${colors2.reset}`);
+        } else
           process.stdout.write(`
-${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.reset}
+${colors2.yellow}⚡ ${name}${colors2.reset} ${colors2.gray}${brief(args)}${colors2.reset}
 `);
       },
       onToolEnd: (name, resultText) => {
+        runHooks({ kind: "afterTool", context: { cwd, messages, toolCtx: {} }, toolName: name, toolArgs: {}, toolResult: resultText }).catch(() => {});
         const firstLine = resultText.split(`
 `)[0].slice(0, 90);
         if (tui)
-          tui.printToScrollback(`${colors.gray}  └ ${firstLine}${resultText.includes(`
-`) ? "…" : ""}${colors.reset}`);
+          tui.printToScrollback(`${colors2.gray}  └ ${firstLine}${resultText.includes(`
+`) ? "…" : ""}${colors2.reset}`);
         else
-          process.stdout.write(`${colors.gray}[${name} → ${firstLine}${resultText.includes(`
-`) ? "…" : ""}]${colors.reset}
+          process.stdout.write(`${colors2.gray}[${name} ➡️ ${firstLine}${resultText.includes(`
+`) ? "…" : ""}]${colors2.reset}
 `);
+      },
+      onStepUpdate: (stepIndex, toolCallCount, maxSteps) => {
+        if (tui) {
+          tui.stepIndex = stepIndex;
+          tui.toolCallCount = toolCallCount;
+          tui.totalSteps = maxSteps;
+          tui.render();
+        }
       },
       onTrimmed: (trimmed, truncatedChars) => {
         const note = `(trimmed ${trimmed} message(s)${truncatedChars ? `, truncated ${truncatedChars} chars` : ""} to fit the input token budget)`;
         if (tui)
-          tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
+          tui.printToScrollback(`${colors2.dim}${note}${colors2.reset}`);
         else
-          process.stdout.write(`${colors.dim}${note}${colors.reset}
+          process.stdout.write(`${colors2.dim}${note}${colors2.reset}
 `);
       },
       confirmTool: async (name, args) => {
         if (!tui || tui.approveMode === "off")
           return true;
-        const ans = await tui.askConfirm(`${colors.yellow}${name}${colors.reset} ${colors.gray}${brief(args)}${colors.reset}`);
+        const ans = await tui.askConfirm(`${colors2.yellow}${name}${colors2.reset} ${colors2.gray}${brief(args)}${colors2.reset}`);
         if (ans === "all")
           tui.approveMode = "off";
         return ans !== "no";
@@ -5586,6 +6948,38 @@ ${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.
         if (tui)
           tui.endStream();
         aborted = res.finishReason === "aborted";
+        if (res.inputTokens !== undefined || res.outputTokens !== undefined) {
+          recordCost({
+            provider: turnModel.split("/")[0] ?? providerName,
+            model: turnModel,
+            inputTokens: res.inputTokens ?? 0,
+            outputTokens: res.outputTokens ?? 0,
+            reasoningTokens: res.reasoningTokens
+          });
+        }
+        if (rootConfig?.maxCostUsd !== undefined && rootConfig.maxCostUsd > 0) {
+          const summary = costSummary();
+          if (summary.totalCostUsd >= rootConfig.maxCostUsd) {
+            const msg = `cost budget exceeded: $${summary.totalCostUsd.toFixed(6)} >= $${rootConfig.maxCostUsd.toFixed(2)} cap (config.maxCostUsd). Stopping.`;
+            if (tui)
+              tui.printToScrollback(`${colors2.red}${msg}${colors2.reset}`);
+            else
+              process.stdout.write(`
+${colors2.red}${msg}${colors2.reset}
+`);
+            messages.push({ role: "user", content: "STOP — cost budget exceeded. Summarize what you've done and stop." });
+            return;
+          }
+        }
+      },
+      onStepUpdate: (stepIndex, toolCallCount, maxSteps) => {
+        runHooks({ kind: "afterStep", context: { cwd, messages, toolCtx: {} }, stepIndex, toolCallCount, maxSteps, accumulatedText: "" }).catch(() => {});
+        if (tui) {
+          tui.stepIndex = stepIndex;
+          tui.toolCallCount = toolCallCount;
+          tui.totalSteps = maxSteps;
+          tui.render();
+        }
       }
     });
     messages.push({ role: "assistant", content: result.finalText });
@@ -5593,13 +6987,14 @@ ${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.
       taskActive = false;
     else
       taskActive = heavyRoute && result.toolCalls > 0;
+    await runHooks({ kind: "onFinish", context: { cwd, messages, toolCtx: {} }, finishReason: result.finishReason ?? "unknown", finalText: result.finalText, toolCallCount: result.toolCalls ?? 0 }).catch(() => {});
   } catch (err) {
     const msg = err?.message ?? String(err);
     if (tui)
-      tui.printToScrollback(`${colors.red}${msg}${colors.reset}`);
+      tui.printToScrollback(`${colors2.red}${msg}${colors2.reset}`);
     else
       process.stdout.write(`
-${colors.red}${msg}${colors.reset}
+${colors2.red}${msg}${colors2.reset}
 `);
   } finally {
     if (statusTimer)
@@ -5609,6 +7004,9 @@ ${colors.red}${msg}${colors.reset}
     persistLast();
     if (tui) {
       tui.busy = false;
+      tui.stepIndex = 0;
+      tui.toolCallCount = 0;
+      tui.totalSteps = 40;
       const rl = routeLabel();
       tui.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     } else {
@@ -5617,7 +7015,7 @@ ${colors.red}${msg}${colors.reset}
     }
   }
 }
-function mainTUI() {
+async function mainTUI() {
   const tui = new TUI(24, 80, {
     onSubmit: (line) => {
       (async () => {
@@ -5626,9 +7024,13 @@ function mainTUI() {
             return;
           if (tui.busy)
             return;
+          if (planModeActive) {
+            if (await handleCommand(line, tui))
+              return;
+          }
           await runPrompt(line, tui);
         } catch (err) {
-          tui.printToScrollback(`${colors.red}${err?.message ?? String(err)}${colors.reset}`);
+          tui.printToScrollback(`${colors2.red}${err?.message ?? String(err)}${colors2.reset}`);
         }
       })();
     },
@@ -5658,7 +7060,7 @@ function mainLineInteractive() {
     input: process.stdin,
     output: process.stdout
   });
-  const ask = () => rl.question(`${colors.green}❯${colors.reset} `, async (input) => {
+  const ask = () => rl.question(`${colors2.green}\uD83D\uDFE2${colors2.reset} `, async (input) => {
     const line = input.trim();
     if (!line)
       return ask();
@@ -5667,7 +7069,7 @@ function mainLineInteractive() {
         return ask();
       await runPrompt(line);
     } catch (err) {
-      console.error(`${colors.red}${err?.message ?? String(err)}${colors.reset}`);
+      console.error(`${colors2.red}${err?.message ?? String(err)}${colors2.reset}`);
     }
     ask();
   });
@@ -5754,7 +7156,7 @@ async function main() {
   }
 }
 main().catch((err) => {
-  process.stderr.write(`${colors.red}${err?.message ?? err}${colors.reset}
+  process.stderr.write(`${colors2.red}${err?.message ?? err}${colors2.reset}
 `);
   process.exit(1);
 });

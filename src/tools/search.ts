@@ -1,6 +1,7 @@
 import { registerTool, type ToolContext } from "./registry";
 import { spawnCollect } from "./proc";
 import { globScan } from "./glob";
+import { pathDenied } from "./fs-utils";
 
 const MAX_RESULTS = 50;
 const MAX_SCANNED = 2000;
@@ -26,6 +27,9 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const pattern = String(args.pattern ?? "");
     const dir = args.cwd ? String(args.cwd) : ctx.cwd;
+    // Scanning an arbitrary directory is a read outside the workspace.
+    const denied = pathDenied(dir, ctx);
+    if (denied) return denied;
     const matches: string[] = [];
     try {
       const found = await globScan(pattern, { cwd: dir, onlyFiles: true, maxResults: MAX_SCANNED });
@@ -63,6 +67,8 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const pattern = String(args.pattern ?? "");
     const dir = args.path ? String(args.path) : ctx.cwd;
+    const denied = pathDenied(dir, ctx);
+    if (denied) return denied;
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
 

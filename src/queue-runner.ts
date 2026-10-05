@@ -7,6 +7,7 @@ import {
   claimTask,
   markTaskDone,
   markTaskFailed,
+  markTaskRetry,
   nextQueued,
   type QueuedTask,
 } from "./queue";
@@ -145,13 +146,25 @@ export async function runQueuedTask(
     );
 
     const done = markTaskDone(task.id, result.finalText || "(no final text)");
-    log(deps, `✔ [${task.id}] done in ${result.steps} step(s), ${result.toolCalls} tool call(s)`);
+    log(deps, `✅ [${task.id}] done in ${result.steps} step(s), ${result.toolCalls} tool call(s)`);
     return done;
   } catch (err: any) {
     const msg = err?.message ?? String(err);
-    const failed = markTaskFailed(task.id, msg);
-    log(deps, `✘ [${task.id}] failed: ${msg}`);
-    return failed ?? claimed;
+    const existingAttempts = claimed.attempts ?? 0;
+    const nextAttempts = existingAttempts + 1;
+    if (nextAttempts >= 5) {
+      // Exhausted the retry cap — mark permanently failed.
+      const failed = markTaskFailed(task.id, msg, nextAttempts);
+      log(deps, `✘ [${task.id}] failed (attempt ${nextAttempts}/5): ${msg}`);
+      return failed ?? claimed;
+    }
+    // Retry: requeue with backoff. 30s base, doubling each attempt, cap 5min.
+    const backoffMs = Math.min(300_000, 30_000 * Math.pow(2, nextAttempts - 1));
+    // markTaskRetry applies the backoff itself; mutating the returned object
+    // afterwards was writing to a detached copy (and crashed when null).
+    const retried = markTaskRetry(task.id, nextAttempts);
+    log(deps, `↻ [${task.id}] failed (attempt ${nextAttempts}/5) — will retry in ${(backoffMs / 1000).toFixed(0)}s`);
+    return retried ?? claimed;
   }
 }
 

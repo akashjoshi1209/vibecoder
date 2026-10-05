@@ -1,5 +1,11 @@
 import { registerTool, type ToolContext } from "./registry";
 import { spawnCollect } from "./proc";
+import {
+  checkDestructiveCommand,
+  checkNetworkCommand,
+  isPathAllowed,
+  type Permissions,
+} from "../permissions";
 
 const MAX_OUTPUT = 30000;
 
@@ -13,7 +19,7 @@ const PLAN_MODE_BANNED: { re: RegExp; why: string }[] = [
   { re: /\b(kill|pkill|killall|systemctl|service|reboot|shutdown|halt|poweroff|init|swapoff|mkswap)\b/, why: "process/system control" },
   { re: /(^|[;&|]\s*)sudo\b/, why: "sudo" },
   { re: /\s(>|>>|2>)\s*/, why: "output redirection writes a file" },
-  { re: /\btee\s+-?a?\s+/, why: "tee writes to a file" },
+  { re: /\btee\s+-?a?s+\s+/, why: "tee writes to a file" },
 ];
 
 function bannedReason(command: string): string | null {
@@ -44,22 +50,59 @@ registerTool({
     },
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
+    const permissions = ctx.permissions;
     const command = String(args.command ?? "");
     if (ctx.planPhase) {
       const why = bannedReason(command);
       if (why)
         return `BLOCKED IN PLAN MODE (read-only): ${why}. Use read-only commands (ls, grep, cat, git status/diff/log, running tests) to investigate, and describe any changes you would make in your PLAN instead.`;
     }
+
+    // ── permission checks ──────────────────────────────────────────────────────
+    if (permissions) {
+      // 1. Destructive command check
+      const destructiveCheck = checkDestructiveCommand(command, permissions);
+      if (destructiveCheck) {
+        if (destructiveCheck.startsWith("BLOCKED")) {
+          return destructiveCheck;
+        }
+        // "PENDING" — in ask mode, we can't prompt from a tool call.
+        // Treat as blocked unless the caller handles it (the loop can re-prompt).
+        return destructiveCheck;
+      }
+
+      // 2. Network command check
+      const networkCheck = checkNetworkCommand(command, permissions);
+      if (networkCheck) {
+        return networkCheck;
+      }
+
+      // 3. Filesystem scope check (when workdir is set, check it's within workspace)
+      if (permissions.filesystem === "workspace" && args.workdir) {
+        const workdir = String(args.workdir);
+        if (!isPathAllowed(workdir, permissions)) {
+          return `BLOCKED: workdir "${workdir}" is outside the allowed workspace (${permissions.workspaceRoot}). Use a path within the workspace.`;
+        }
+      }
+    }
+    // ──────────────────────────────────────────────────────────────────────────────
+
     const cwd = args.workdir ? String(args.workdir) : ctx.cwd;
     const timeout = Math.max(0, Number(args.timeout ?? 120000));
 
-    const res = await spawnCollect({
-      cmd: ["bash", "-lc", command],
-      cwd,
-      env: { ...process.env, NO_COLOR: "1" } as Record<string, string>,
-      timeoutMs: timeout,
-      signal: ctx.signal,
-    });
+    let res;
+    try {
+      res = await spawnCollect({
+        cmd: ["bash", "-lc", command],
+        cwd,
+        env: { ...process.env, NO_COLOR: "1" } as Record<string, string>,
+        timeoutMs: timeout,
+        signal: ctx.signal,
+      });
+    } catch (err: unknown) {
+      const msg = err && typeof err === "object" && "message" in err ? String((err as Record<string, unknown>).message) : String(err);
+      return `ERROR: cannot run command: ${msg}`;
+    }
 
     let output = "";
     if (res.stdout) output += res.stdout;

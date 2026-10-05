@@ -1,5 +1,5 @@
 import { registerTool, type ToolContext } from "./registry";
-import { resolve } from "./fs-utils";
+import { resolve, pathDenied } from "./fs-utils";
 import { dirname, join } from "node:path";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
@@ -59,6 +59,8 @@ registerTool({
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const p = args.path ? resolve(String(args.path), ctx) : ctx.cwd;
+    const denied = pathDenied(p, ctx);
+    if (denied) return denied;
     let entries;
     try {
       entries = readdirSync(p, { withFileTypes: true });
@@ -109,15 +111,24 @@ registerTool({
   },
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const p = resolve(String(args.path), ctx);
+    const denied = pathDenied(p, ctx);
+    if (denied) return denied;
     if (!(await fileExists(p))) return `ERROR: file not found: ${p}`;
     const text = await fileText(p);
     const lines = text.split("\n");
+    const totalLines = lines.length;
     // Offset 0 (or a negative/NaN value) then `lines.slice(-1)` would read the
     // LAST line; clamp so indexes always mean "1-based line number".
     const offset = Math.max(1, Number(args.offset ?? 1) || 1);
+    if (offset > totalLines) return `(file has ${totalLines} line(s); offset ${offset} is past the end)`;
     const limit = Math.max(0, Number(args.limit ?? 2000) || 2000);
     const slice = lines.slice(offset - 1, offset - 1 + limit);
-    return slice.map((l, i) => `${offset + i}: ${l}`).join("\n");
+    const shown = slice.length;
+    const note = shown < limit && shown < totalLines - offset + 1 ? "" : "";
+    const out = slice.map((l, i) => `${offset + i}: ${l}`).join("\n");
+    return shown < totalLines - offset + 1 && limit > 0
+      ? out + `\n...(${totalLines - offset + 1 - shown} more line(s) not shown)`
+      : out;
   },
 });
 
@@ -142,6 +153,8 @@ registerTool({
     if (ctx.planPhase)
       return `BLOCKED IN PLAN MODE: write_file is disabled while investigating. Record what you would write in your PLAN (FILES: ...) instead; the human approves before any file is touched.`;
     const p = resolve(String(args.path), ctx);
+    const denied = pathDenied(p, ctx);
+    if (denied) return denied;
     const content = String(args.content ?? "");
     const guard = await preWriteNote(p, content);
     if (!guard.ok) return guard.note;
@@ -157,13 +170,14 @@ registerTool({
     function: {
       name: "edit_file",
       description:
-        "Perform an exact string replacement in a file. Use to modify part of a file without rewriting the whole thing.",
+        "Perform an exact string replacement in a file. Use to modify part of a file without rewriting the whole thing. By default replaces only the first occurrence; set replaceAll to true to replace every occurrence.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "Absolute path to the file" },
           oldString: { type: "string", description: "The exact text to find and replace" },
           newString: { type: "string", description: "The replacement text" },
+          replaceAll: { type: "boolean", description: "When true, replace every occurrence (default: false — only first)" },
         },
         required: ["path", "oldString", "newString"],
       },
@@ -173,20 +187,29 @@ registerTool({
     if (ctx.planPhase)
       return `BLOCKED IN PLAN MODE: edit_file is disabled while investigating. Describe the exact change in your PLAN instead; the human approves before any file is touched.`;
     const p = resolve(String(args.path), ctx);
+    const denied = pathDenied(p, ctx);
+    if (denied) return denied;
     const oldString = String(args.oldString ?? "");
     const newString = String(args.newString ?? "");
+    const replaceAll = Boolean(args.replaceAll);
     if (!(await fileExists(p))) return `ERROR: file not found: ${p}`;
     if (isProtectedFile(p)) return protectedError(p);
     const text = await fileText(p);
     if (!oldString) return `ERROR: oldString cannot be empty`;
     const count = text.split(oldString).length - 1;
     if (count === 0) return `ERROR: oldString not found in file`;
-    if (count > 1) return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique)`;
-    const updated = text.replace(oldString, newString);
+    let updated: string;
+    if (replaceAll) {
+      updated = text.split(oldString).join(newString);
+    } else {
+      if (count > 1) return `ERROR: found ${count} matches; provide more surrounding context (oldString must be unique) or set replaceAll=true to replace all`;
+      updated = text.replace(oldString, newString);
+    }
     await writeFileAsync(p, updated, "utf8");
+    const replaced = replaceAll ? count : 1;
     const note = isSelfFile(p)
-      ? auditSelfEdit("edit_file", p, text, updated, "replaced 1 occurrence")
+      ? auditSelfEdit("edit_file", p, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`)
       : "";
-    return `Edited ${p}: replaced 1 occurrence${note ? "\n" + note : ""}`;
+    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}${note ? "\n" + note : ""}`;
   },
 });

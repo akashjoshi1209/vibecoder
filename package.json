@@ -45,7 +45,10 @@
     "test": "bun test --timeout=30000",
     "daemon": "bun src/daemon.ts"
   },
-  "dependencies": {},
+  "dependencies": {
+    "gsap": "^3.15.0",
+    "playwright": "^1.63.0"
+  },
   "devDependencies": {
     "@types/bun": "^1.2.0",
     "@types/node": "^22.0.0",

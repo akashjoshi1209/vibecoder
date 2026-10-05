@@ -1,7 +1,7 @@
 import type { ToolCall } from "../llm/types";
 import { parseToolArguments } from "../llm/args";
 
-interface ParsedToolCall {
+export interface ParsedToolCall {
   id: string;
   name: string;
   args: Record<string, unknown>;

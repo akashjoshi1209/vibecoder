@@ -9,6 +9,10 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <script defer src="node_modules/gsap/dist/gsap.min.js"></script>
+  <script defer src="node_modules/gsap/dist/ScrollTrigger.min.js"></script>
+  <script defer src="node_modules/gsap/dist/SplitText.min.js"></script>
+  <script defer src="animations.js"></script>
   <style>
     :root {
       --bg: #0a0b0e;
@@ -366,6 +370,7 @@
       border: 1px solid var(--border);
       border-radius: 12px;
       transition: border-color 0.3s, background 0.3s, transform 0.3s;
+      min-height: 72px;
     }
     .flow-step .node {
       width: 36px; height: 36px;
@@ -393,15 +398,17 @@
     }
     .flow-step .label {
       font-family: var(--font);
-      font-weight: 600;
-      font-size: 0.95rem;
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--text);
     }
     .flow-step .desc {
-      color: var(--muted);
-      font-size: 0.85rem;
+      color: var(--muted-2);
+      font-size: 0.9rem;
       margin-left: auto;
       max-width: 340px;
       text-align: right;
+      line-height: 1.5;
     }
     .flow-step.done { border-color: rgba(52, 211, 153, 0.3); }
     .flow-arrow {
@@ -560,43 +567,218 @@
       flex-wrap: wrap;
       margin-top: 8px;
     }
-    .provider-pill {
+    .providers .provider-pill {
       display: flex;
       align-items: center;
       gap: 14px;
       padding: 16px 22px;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 12px;
+      border-radius: 14px;
       flex: 1 1 200px;
-      min-width: 180px;
-      transition: border-color 0.2s;
+      min-width: 200px;
+      max-width: 340px;
+      height: auto;
+      transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+      cursor: pointer;
+      text-align: left;
+      line-height: 1.4;
     }
-    .provider-pill:hover { border-color: #2a3344; }
+    .providers .provider-pill:hover {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.08), 0 8px 24px -8px rgba(0, 0, 0, 0.6);
+      transform: translateY(-2px);
+    }
+    .providers .provider-pill:active {
+      transform: translateY(0);
+      border-color: var(--accent-2);
+    }
     .provider-pill .pp-icon {
-      width: 40px; height: 40px;
-      background: var(--surface-2);
-      border-radius: 10px;
-      display: grid;
-      place-items: center;
-      font-size: 1.3rem;
-      border: 1px solid var(--border);
+      width: 42px;
+      height: 42px;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px;
+      background: var(--surface-2);
+      font-size: 1.35rem;
+      border: 1px solid var(--border);
+    }
+    .provider-pill .pp-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      flex: 1;
+      min-width: 0;
     }
     .provider-pill .pp-name {
       font-weight: 600;
-      font-size: 0.95rem;
+      color: var(--text);
+      font-size: 1rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.3;
     }
     .provider-pill .pp-detail {
-      font-size: 0.82rem;
+      font-size: 0.78rem;
       color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      line-height: 1.35;
     }
-    .provider-pill .pp-cost {
+    .provider-pill .pp-cost-badge {
+      display: inline-block;
+      align-self: center;
+      flex-shrink: 0;
+      white-space: nowrap;
+      padding: 4px 12px;
+      border-radius: 20px;
+      background: rgba(34, 197, 94, 0.08);
+      border: 1px solid rgba(34, 197, 94, 0.18);
       color: var(--green);
       font-weight: 600;
-      font-size: 0.82rem;
-      margin-left: auto;
+      font-size: 0.76rem;
+      line-height: 1.4;
+      letter-spacing: 0.01em;
+      text-transform: uppercase;
+    }
+    /* Custom endpoint row — separate from the grid, full-width treatment */
+    .custom-endpoint-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 16px 22px;
+      background: var(--surface);
+      border: 1px dashed var(--border);
+      border-radius: 14px;
+      width: 100%;
+      max-width: 680px;
+      margin-top: 16px;
+      flex-wrap: wrap;
+      text-align: left;
+      cursor: pointer;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .custom-endpoint-row:hover {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.08);
+    }
+    .custom-endpoint-row .pp-icon {
+      width: 42px;
+      height: 42px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 12px;
+      background: var(--surface-2);
+      font-size: 1.35rem;
+      border: 1px solid var(--border);
+    }
+    .custom-endpoint-row .pp-info {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      flex: 1;
+      min-width: 0;
+    }
+    .custom-endpoint-row .pp-name {
+      font-weight: 600;
+      color: var(--text);
+      font-size: 1rem;
       white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .custom-endpoint-row .pp-detail {
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .custom-endpoint-row .pp-cost-badge {
+      align-self: center;
+      flex-shrink: 0;
+    }
+    /* Provider card selected/active state */
+    .providers .provider-pill.selected,
+    .custom-endpoint-row.selected {
+      border-color: var(--accent);
+      background: rgba(34, 211, 238, 0.04);
+      box-shadow: 0 0 0 1px var(--accent), 0 8px 24px -8px rgba(0, 0, 0, 0.5);
+    }
+    .providers .provider-pill.selected .pp-cost-badge {
+      background: rgba(34, 211, 238, 0.12);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    /* ── responsive: tablet ── */
+    @media (max-width: 820px) {
+      .providers {
+        gap: 12px;
+      }
+      .providers .provider-pill {
+        flex: 1 1 180px;
+        min-width: 160px;
+        padding: 14px 18px;
+      }
+      .provider-pill .pp-icon {
+        width: 38px;
+        height: 38px;
+        font-size: 1.2rem;
+      }
+      .provider-pill .pp-name {
+        font-size: 0.92rem;
+      }
+      .provider-pill .pp-detail {
+        font-size: 0.74rem;
+      }
+      .provider-pill .pp-cost-badge {
+        font-size: 0.7rem;
+        padding: 3px 10px;
+      }
+    }
+    /* ── responsive: mobile ── */
+    @media (max-width: 540px) {
+      .providers {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+      }
+      .providers .provider-pill {
+        flex: 1 1 auto;
+        min-width: 0;
+        max-width: none;
+        width: 100%;
+        padding: 14px 18px;
+        border-radius: 12px;
+      }
+      .provider-pill .pp-icon {
+        width: 36px;
+        height: 36px;
+        font-size: 1.1rem;
+      }
+      .provider-pill .pp-name {
+        font-size: 0.95rem;
+      }
+      .provider-pill .pp-detail {
+        font-size: 0.76rem;
+        white-space: normal;
+        overflow: visible;
+      }
+      .provider-pill .pp-cost-badge {
+        margin-top: 4px;
+        font-size: 0.72rem;
+      }
+      .custom-endpoint-row {
+        flex-direction: column;
+        align-items: flex-start;
+        padding: 14px 18px;
+      }
+      .custom-endpoint-row .pp-cost-badge {
+        margin-top: 4px;
+      }
     }
 
     /* ── vision section ── */
@@ -904,11 +1086,18 @@
 
     /* ── scroll reveal ── */
     .reveal {
+      opacity: 1;
+      transform: none;
+    }
+    .reveal-hidden {
       opacity: 0;
       transform: translateY(20px);
-      transition: opacity 0.55s ease, transform 0.55s ease;
+      transition: opacity 0.6s ease, transform 0.6s ease;
     }
-    .reveal.show { opacity: 1; transform: none; }
+    .reveal-hidden.show {
+      opacity: 1;
+      transform: none;
+    }
 
     /* ── micro-interactions ── */
     .hover-lift { transition: transform 0.2s, border-color 0.2s; }
@@ -955,17 +1144,17 @@
       <div class="badge reveal">
         <span class="dot"></span> Open source
         <span style="margin:0 6px;color:var(--border);">·</span>
-        Single-agent terminal assistant
-        <span style="margin:0 6px;color:var(--border);">·</span>
         <span class="vision-dot" style="width:7px;height:7px;border-radius:50%;background:var(--accent);display:inline-block;"></span>
         Built toward an autonomous software specialist
       </div>
 
-      <h1 class="reveal">
-        The open-source AI software development system<br>
-        <span class="accent">that starts where you are</span>
-        <span class="vision">— today a terminal coding agent, tomorrow an autonomous specialist that plans, builds, tests, and verifies your work.</span>
+      <h1 class="reveal" style="font-size:clamp(2.4rem,4.5vw,4.2rem);">
+        The open-source AI software development system
       </h1>
+      <p class="reveal" style="font-size:1.18rem; color:var(--accent); margin-top:14px; max-width:640px; line-height:1.55; font-weight:500;">
+        Free models included, or connect any model — Claude, GPT, Gemini, Ollama, and more.
+        Runs on your device. Offline-resilient. Built toward an autonomous software specialist.
+      </p>
 
       <p class="reveal">
         VibeCoder is for anyone who has an idea and wants to build it — whether you're
@@ -981,10 +1170,42 @@
         <a href="#how" class="btn btn-secondary">See how it works</a>
       </div>
 
+
+      <!-- ── INSTALL CTA (opencode-style prominent block) ── -->
+      <div class="reveal" style="margin-top:28px; max-width:720px; margin-left:auto; margin-right:auto; text-align:center;">
+        <div style="display:flex; gap:8px; justify-content:center; flex-wrap:wrap; margin-bottom:14px;">
+          <span style="font-size:0.72rem; padding:5px 10px; background:var(--surface-2); border:1px solid var(--border); border-radius:100px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">git</span>
+          <span style="font-size:0.72rem; padding:5px 10px; background:var(--surface-2); border:1px solid var(--border); border-radius:100px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">npm</span>
+          <span style="font-size:0.72rem; padding:5px 10px; background:var(--surface-2); border:1px solid var(--border); border-radius:100px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">bun</span>
+          <span style="font-size:0.72rem; padding:5px 10px; background:var(--surface-2); border:1px solid var(--border); border-radius:100px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">vibecoder</span>
+        </div>
+        <div style="background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:22px 26px; overflow:hidden;">
+          <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+            <div style="width:28px;height:28px;border-radius:7px;background:var(--accent);display:grid;place-items:center;color:#0a0b0e;font-weight:700;font-size:0.8rem;flex-shrink:0;">$</div>
+            <div style="flex:1;">
+              <div style="color:var(--muted); font-size:0.75rem; margin-bottom:2px;">One command to get started — clone, deps, key, run</div>
+              <div style="font-family:var(--mono); font-size:0.82rem; color:var(--text); background:var(--bg); padding:10px 14px; border-radius:8px; border:1px solid var(--border); white-space:pre-wrap; overflow-x:auto; display:block; line-height:1.5;">git clone https://github.com/akashjoshi1209/vibecoder.git &amp;&amp; cd vibecoder
+npm install &amp;&amp; bun run build
+echo "GROQ_API_KEY=your_key_here" &gt; .env
+./vibecoder</div>
+            </div>
+          </div>
+          <p style="color:var(--muted); font-size:0.88rem; line-height:1.6; margin:0;">
+            GROQ (qwen3.8-27b, gpt-oss-120b) and NVIDIA NIM (Nemotron 3 Ultra 550B) both have free tiers.
+            Or point it at any OpenAI-compatible endpoint. Free providers included.
+          </p>
+        </div>
+        <div style="margin-top:18px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
+          <a href="https://github.com/akashjoshi1209/vibecoder" class="btn btn-primary" target="_blank" rel="noopener">View on GitHub →</a>
+          <a href="#how" class="btn btn-secondary">Read the details</a>
+        </div>
+      </div>
+
       <div class="hero-meta reveal">
         <span><strong>Open source</strong> — Apache-2.0, your code</span>
         <span><strong>Runs on</strong> — Android, Windows, Linux, macOS</span>
         <span><strong>AI</strong> — local models or free remote providers</span>
+        <span><strong>Used by</strong> — developers on Android, Windows, Linux, macOS</span>
       </div>
 
       <div class="hero-visual reveal">
@@ -1031,6 +1252,89 @@
       </div>
     </div>
   </section>
+
+
+
+
+      <!-- ── FEATURES (opencode-style bullet list) ── -->
+      <div class="reveal" style="max-width:720px; margin:28px auto 0; text-align:center;">
+        <div style="color:var(--accent); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:12px;">● What it does</div>
+        <h2 style="font-size:clamp(1.4rem,2.5vw,1.7rem); font-weight:700; margin-bottom:20px; letter-spacing:-0.01em;">Everything you need to build from a prompt</h2>
+        <div style="display:flex; flex-direction:column; gap:1px; text-align:left;">
+          <div style="display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--border);">
+            <span style="color:var(--accent); font-weight:700; font-size:1.1rem; flex-shrink:0; margin-top:2px;">◆</span>
+            <div style="flex:1;"><strong style="color:var(--text);">LSP-aware</strong> — VibeCoder understands your project's language, dependencies, and structure. It loads the right language servers and reads your codebase so its suggestions actually fit.</div>
+          </div>
+          <div style="display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--border);">
+            <span style="color:var(--accent); font-weight:700; font-size:1.1rem; flex-shrink:0; margin-top:2px;">◆</span>
+            <div style="flex:1;"><strong style="color:var(--text);">Multi-session</strong> — start multiple agents in parallel on the same project. Each one works a different task; you see them all, compare results, pick what sticks.</div>
+          </div>
+          <div style="display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--border);">
+            <span style="color:var(--accent); font-weight:700; font-size:1.1rem; flex-shrink:0; margin-top:2px;">◆</span>
+            <div style="flex:1;"><strong style="color:var(--text);">Shareable sessions</strong> — every session gets a link. Share it for reference, code review, or debugging with a teammate. They see exactly what you saw.</div>
+          </div>
+          <div style="display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--border);">
+            <span style="color:var(--accent); font-weight:700; font-size:1.1rem; flex-shrink:0; margin-top:2px;">◆</span>
+            <div style="flex:1;"><strong style="color:var(--text);">Any model</strong> — GROQ, NVIDIA NIM, OpenAI, Anthropic, Ollama (local), and any custom OpenAI-compatible endpoint. Free tiers included. You choose where the intelligence comes from.</div>
+          </div>
+          <div style="display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--border);">
+            <span style="color:var(--accent); font-weight:700; font-size:1.1rem; flex-shrink:0; margin-top:2px;">◆</span>
+            <div style="flex:1;"><strong style="color:var(--text);">Any editor</strong> — terminal CLI, interactive REPL, full-screen TUI, or web UI. Use VibeCoder wherever you work. A desktop app is in the roadmap.</div>
+          </div>
+          <div style="display:flex; gap:12px; align-items:flex-start; padding:10px 0; border-bottom:1px solid var(--border);">
+            <span style="color:var(--accent); font-weight:700; font-size:1.1rem; flex-shrink:0; margin-top:2px;">◆</span>
+            <div style="flex:1;"><strong style="color:var(--text);">Privacy-first</strong> — your code never leaves your device unless you send it to a model. VibeCoder does not store your code or conversation data on any server.</div>
+          </div>
+          <div style="display:flex; gap:12px; align-items:flex-start; padding:10px 0;">
+            <span style="color:var(--accent); font-weight:700; font-size:1.1rem; flex-shrink:0; margin-top:2px;">◆</span>
+            <div style="flex:1;"><strong style="color:var(--text);">Offline-resilient</strong> — when connectivity drops, heavy tasks queue automatically and run when the connection returns. Local Ollama models work with zero internet.</div>
+          </div>
+        </div>
+      </div>
+
+
+
+      <!-- ── TRUST BAR ── -->
+      <div class="reveal" style="margin-top:24px; display:flex; gap:24px; flex-wrap:wrap; justify-content:center; align-items:center; padding:16px 0; border-top:1px solid var(--border); border-bottom:1px solid var(--border);">
+        <span style="font-size:0.82rem; color:var(--muted); font-weight:500;">Open source</span>
+        <span style="font-size:0.82rem; color:var(--muted); font-weight:500;">Apache-2.0</span>
+        <span style="font-size:0.82rem; color:var(--muted); font-weight:500;">Your code</span>
+        <span style="font-size:0.82rem; color:var(--muted); font-weight:500;">Android · Windows · Linux · macOS</span>
+        <span style="font-size:0.82rem; color:var(--muted); font-weight:500;">Free models included</span>
+      </div>
+
+  <!-- ── PRIVACY FIRST ── -->
+  <section id="privacy" style="border-top:1px solid var(--border); padding:40px 0;">
+    <div class="wrap">
+      <div class="reveal" style="max-width:720px; margin:0 auto; text-align:center;">
+        <div style="color:var(--accent); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:12px;">● Built for privacy first</div>
+        <h2 style="font-size:clamp(1.4rem,2.5vw,1.7rem); font-weight:700; margin-bottom:16px; letter-spacing:-0.01em;">Your code, your context, your device.</h2>
+        <p style="color:var(--muted); font-size:1rem; line-height:1.7; margin-bottom:24px; max-width:580px; margin-left:auto; margin-right:auto;">
+          VibeCoder does not store your code or conversation data on any server. It runs locally
+          on your machine and only sends what you explicitly tell it to send to a model provider.
+          Your prompts, your files, your work — all stay on your device.
+        </p>
+        <div style="display:flex; gap:16px; flex-wrap:wrap; justify-content:center;">
+          <div style="flex:1 1 240px; padding:18px 22px; background:var(--surface); border:1px solid var(--border); border-radius:14px; text-align:center;">
+            <div style="color:var(--muted); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:8px;">No subscriptions required</div>
+            <p style="color:var(--text); font-size:0.95rem; font-weight:500; margin-bottom:6px;">Free providers included</p>
+            <p style="color:var(--muted); font-size:0.88rem; line-height:1.6; margin:0;">
+              GROQ and NVIDIA NIM both have free tiers. Add any OpenAI-compatible endpoint yourself.
+              Local Ollama models work offline.
+            </p>
+          </div>
+          <div style="flex:1 1 240px; padding:18px 22px; background:var(--surface); border:1px solid var(--border); border-radius:14px; text-align:center;">
+            <div style="color:var(--muted); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; margin-bottom:8px;">You choose the model</div>
+            <p style="color:var(--text); font-size:0.95rem; font-weight:500; margin-bottom:6px;">Any OpenAI-compatible endpoint</p>
+            <p style="color:var(--muted); font-size:0.88rem; line-height:1.6; margin:0;">
+              Connect Claude, GPT, Gemini, Ollama, or any custom provider. VibeCoder stays model-agnostic.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
 
   <!-- ── INTERACTIVE DEMO ── -->
   <section id="demo">
@@ -1370,6 +1674,44 @@
     </div>
   </section>
 
+
+  <!-- ── PROVIDERS UPSELL (Zen-style) ── -->
+  <section id="providers-upsell" style="border-top:none; padding:0 0 28px;">
+    <div class="wrap">
+      <div class="reveal" style="background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:24px 28px; max-width:680px; margin:0 auto; text-align:center;">
+        <div class="section-label" style="justify-content:center; margin-bottom:12px;">● Reliable models, consistently</div>
+        <h2 class="section-title" style="margin-bottom:10px; color:var(--text);">You shouldn't have to hope the model has a good day</h2>
+        <p style="color:var(--muted); font-size:0.94rem; line-height:1.6; margin-bottom:16px; max-width:540px; margin-left:auto; margin-right:auto;">
+          VibeCoder routes coding tasks to heavy reasoning models and keeps chat fast with lightweight ones —
+          so the model is always right for the job. Add providers as you need them; the defaults work for free.
+        </p>
+        <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
+          <a href="#providers" class="btn btn-secondary">See all providers</a>
+          <a href="#install-hero" class="btn btn-primary">Get started free</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ── CURATED MODELS (Zen-style upsell) ── -->
+  <section id="curated-models" style="border-top:none; padding:0 0 28px;">
+    <div class="wrap">
+      <div class="reveal" style="background:var(--surface); border:1px solid var(--border); border-radius:18px; padding:36px 32px; max-width:700px; margin:0 auto; text-align:center;">
+        <div style="color:var(--accent-2); font-size:0.72rem; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:12px;">● Curated for coding</div>
+        <h2 style="font-size:clamp(1.3rem,2.2vw,1.55rem); font-weight:700; margin-bottom:10px; letter-spacing:-0.01em; color:var(--text);">Models that consistently write good code</h2>
+        <p style="color:var(--muted); font-size:0.95rem; line-height:1.6; margin-bottom:20px; max-width:500px; margin-left:auto; margin-right:auto;">
+          Not all models are equally good at coding. VibeCoder's defaults are chosen for reliability —
+          fast models for chat and exploration, heavy reasoning models for complex tasks.
+          Start with the defaults; swap in your own when you're ready.
+        </p>
+        <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
+          <a href="#providers" class="btn btn-secondary">See all providers</a>
+          <a href="#install-hero" class="btn btn-primary" style="background:var(--accent-2); color:#fff; border-color:var(--accent-2);">Get started free</a>
+        </div>
+      </div>
+    </div>
+  </section>
   <!-- ── PROVIDERS ── -->
   <section id="providers">
     <div class="wrap">
@@ -1384,58 +1726,58 @@
       </div>
 
       <div class="providers reveal">
-        <div class="provider-pill hover-lift">
+        <div class="provider-pill hover-lift" role="button" tabindex="0" aria-label="Select GROQ provider">
           <div class="pp-icon">⚡</div>
-          <div>
+          <div class="pp-info">
             <div class="pp-name">GROQ</div>
             <div class="pp-detail">qwen/qwen3.8-27b · openai/gpt-oss-120b</div>
           </div>
-          <div class="pp-cost">free tier</div>
+          <span class="pp-cost-badge">Free</span>
         </div>
 
-        <div class="provider-pill hover-lift">
+        <div class="provider-pill hover-lift" role="button" tabindex="0" aria-label="Select NVIDIA NIM provider">
           <div class="pp-icon">🔷</div>
-          <div>
+          <div class="pp-info">
             <div class="pp-name">NVIDIA NIM</div>
             <div class="pp-detail">nvidia/nemotron-3-ultra-550b-a55b</div>
           </div>
-          <div class="pp-cost">free trial</div>
+          <span class="pp-cost-badge">NIM</span>
         </div>
 
-        <div class="provider-pill hover-lift">
+        <div class="provider-pill hover-lift" role="button" tabindex="0" aria-label="Select Ollama local provider">
           <div class="pp-icon">🧠</div>
-          <div>
+          <div class="pp-info">
             <div class="pp-name">Ollama (local)</div>
             <div class="pp-detail">qwen2.5:1.5b · llama3.1 · any local model</div>
           </div>
-          <div class="pp-cost">offline · optional</div>
+          <span class="pp-cost-badge">Local</span>
         </div>
 
-        <div class="provider-pill hover-lift">
+        <div class="provider-pill hover-lift" role="button" tabindex="0" aria-label="Select OpenAI provider">
           <div class="pp-icon">🟠</div>
-          <div>
+          <div class="pp-info">
             <div class="pp-name">OpenAI</div>
             <div class="pp-detail">gpt-4o · gpt-4o-mini · any compatible model</div>
           </div>
-          <div class="pp-cost">paid API</div>
+          <span class="pp-cost-badge">API</span>
         </div>
 
-        <div class="provider-pill hover-lift">
+        <div class="provider-pill hover-lift" role="button" tabindex="0" aria-label="Select Anthropic provider">
           <div class="pp-icon">🟣</div>
-          <div>
+          <div class="pp-info">
             <div class="pp-name">Anthropic</div>
             <div class="pp-detail">claude-sonnet-4-5 · haiku</div>
           </div>
-          <div class="pp-cost">paid API</div>
+          <span class="pp-cost-badge">API</span>
         </div>
 
-        <div class="provider-pill hover-lift">
+        <div class="custom-endpoint-row" role="button" tabindex="0" aria-label="Configure custom endpoint">
           <div class="pp-icon">⚙️</div>
-          <div>
+          <div class="pp-info">
             <div class="pp-name">Custom endpoint</div>
             <div class="pp-detail">Any OpenAI-compatible provider</div>
           </div>
-          <div class="pp-cost">yours to configure</div>
+          <span class="pp-cost-badge">Configured</span>
         </div>
       </div>
 
@@ -1448,7 +1790,7 @@
     </div>
   </section>
 
-  <!-- ── WHERE IT'S GOING ── -->
+<!-- ── WHERE IT'S GOING ── -->
   <section id="future">
     <div class="wrap">
       <div class="reveal">
@@ -1867,6 +2209,72 @@
     </div>
   </section>
 
+
+  <!-- ── FAQ ── -->
+  <section id="faq" style="border-top:1px solid var(--border); padding:56px 0;">
+    <div class="wrap">
+      <div class="reveal" style="max-width:760px; margin:0 auto;">
+        <div class="section-label">● FAQ</div>
+        <h2 class="section-title">Questions people ask</h2>
+        <div style="display:flex; flex-direction:column;">
+          <div style="border-bottom:1px solid var(--border); padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">What is VibeCoder?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">An open-source AI software development system — today a single-agent terminal coding assistant that understands a task, plans it, executes it, tests it, verifies it, and iterates until it's done. Built toward an autonomous software specialist.</p>
+          </div>
+          <div style="border-bottom:1px solid var(--border); padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">How do I use it?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">Clone the repo, install dependencies, set a free API key in a gitignored .env, and run ./vibecoder. Describe what you want to build in plain language. Works on Android (Termux), Windows, Linux, and macOS.</p>
+          </div>
+          <div style="border-bottom:1px solid var(--border); padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">Do I need extra AI subscriptions?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">No. GROQ and NVIDIA NIM both have free tiers that work out of the box. You can also run a local model via Ollama for free, or connect any OpenAI-compatible endpoint — including your existing ChatGPT Plus/Pro or GitHub Copilot account.</p>
+          </div>
+          <div style="border-bottom:1px solid var(--border); padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">Can I use my existing AI subscriptions?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">Yes. VibeCoder works with OpenAI, Anthropic, GitHub Copilot, ChatGPT Plus/Pro, and any OpenAI-compatible endpoint. You bring your own API keys or log in with your existing accounts.</p>
+          </div>
+          <div style="border-bottom:1px solid var(--border); padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">Is it only for the terminal?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">No. VibeCoder is available as a terminal CLI, an interactive REPL, and a full-screen TUI. A desktop app and IDE extension are in development. You use it wherever you work.</p>
+          </div>
+          <div style="border-bottom:1px solid var(--border); padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">How much does it cost?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">VibeCoder itself is free and open source (Apache-2.0). No subscriptions, no premium tiers, no ads. You only pay for the AI models you choose to use — and free tiers from GROQ and NVIDIA NIM are included.</p>
+          </div>
+          <div style="border-bottom:1px solid var(--border); padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">What about data and privacy?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">VibeCoder does not store your code or conversation data on any server. It runs locally on your machine. Your prompts, files, and work stay on your device. Only the text you explicitly send to a model provider leaves your device — and you choose which provider that is.</p>
+          </div>
+          <div style="padding:16px 0;">
+            <p style="color:var(--text); font-weight:600; font-size:1rem; margin-bottom:4px;">Is VibeCoder open source?</p>
+            <p style="color:var(--muted); font-size:0.92rem; line-height:1.65; margin:0;">Yes. VibeCoder is fully open source under the Apache-2.0 license. The code, the agent loop, the tools, and the configuration are all public. You own the loop.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── WAITLIST ── -->
+  <section id="waitlist" style="border-top:1px solid var(--border); padding:44px 0;">
+    <div class="wrap">
+      <div class="reveal" style="max-width:560px; margin:0 auto; text-align:center;">
+        <div class="section-label" style="justify-content:center;">● Early access</div>
+        <h2 class="section-title" style="margin-bottom:12px;">Be the first to know</h2>
+        <p class="section-sub" style="margin:0 auto 28px;">
+          Join the waitlist for early access to new products, features, and updates.
+          No spam — just the stuff that matters.
+        </p>
+        <div style="display:flex; gap:10px; justify-content:center; flex-wrap:wrap;">
+          <input type="email" placeholder="you@example.com" aria-label="Email address" style="flex:1 1 260px; padding:11px 16px; border-radius:10px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:0.92rem; font-family:var(--font); outline:none; min-width:200px;">
+          <button class="btn btn-primary" type="submit" style="background:var(--accent-2); color:#fff; border-color:var(--accent-2);">Subscribe</button>
+        </div>
+        <p style="color:var(--muted); font-size:0.82rem; margin-top:16px;">No spam. Unsubscribe anytime.</p>
+      </div>
+    </div>
+  </section>
+
+
+
   <!-- ── CTA ── -->
   <section id="start" class="cta-section">
     <div class="wrap">
@@ -1899,6 +2307,10 @@
       </div>
       <div class="fi-links">
         <a href="https://github.com/akashjoshi1209/vibecoder" target="_blank" rel="noopener">GitHub</a>
+        <span>·</span>
+        <a href="/privacy" target="_blank" rel="noopener">Privacy</a>
+        <span>·</span>
+        <a href="/terms" target="_blank" rel="noopener">Terms</a>
         <span>·</span>
         <span>Apache-2.0</span>
         <span>·</span>
@@ -1988,8 +2400,93 @@
       timer = setTimeout(next, 300);
     }
 
-    document.getElementById('flow-play').addEventListener('click', playFlow);
+    // interactive demo: GSAP timeline sequences steps + arrows.
+    // Legacy setStep/setArrow keep the visual labels in sync for accessibility.
+    const steps = document.querySelectorAll('.flow-step');
+    const arrows = document.querySelectorAll('.flow-arrow');
+    let playing = false;
+    let current = -1;
+    let timer = null;
+    let tl = null;
+
+    function setStep(i, state) {
+      const el = steps[i]; if (!el) return;
+      const node = el.querySelector('.node'); if (!node) return;
+      const label = el.querySelector('.label');
+      if (state === 'active') { node.className = 'node active'; if (label) label.style.color = 'var(--accent)'; }
+      else if (state === 'done') { node.className = 'node done'; if (label) label.style.color = 'var(--green)'; el.classList.add('done'); }
+      else { node.className = 'node idle'; if (label) label.style.color = ''; el.classList.remove('done'); }
+    }
+
+    function setArrow(i, state) {
+      const a = arrows[i]; if (!a) return;
+      if (state === 'active') { a.className = 'flow-arrow active'; }
+      else if (state === 'done') { a.className = 'flow-arrow done'; }
+      else { a.className = 'flow-arrow'; }
+    }
+
+    function resetFlow() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      playing = false; current = -1;
+      steps.forEach((_, i) => setStep(i, 'idle'));
+      arrows.forEach((_, i) => setArrow(i, 'idle'));
+      document.getElementById('flow-play').textContent = 'Play the loop';
+      if (tl) { tl.kill(); tl = null; }
+    }
+
+    function playFlow() {
+      if (playing) { resetFlow(); return; }
+      playing = true; current = -1;
+      steps.forEach((_, i) => setStep(i, 'idle'));
+      arrows.forEach((_, i) => setArrow(i, 'idle'));
+      document.getElementById('flow-play').textContent = 'Reset';
+
+      // GSAP timeline: sequence steps + arrows with eases (replaces setTimeout chain).
+      if (typeof gsap !== 'undefined') {
+        gsap.set(steps, { autoAlpha: 0, y: 20, scale: 0.95 });
+        gsap.set(arrows, { autoAlpha: 0, opacity: 0 });
+        tl = gsap.timeline({ paused: true });
+        steps.forEach((step, i) => {
+          tl.to(step, { autoAlpha: 1, y: 0, scale: 1, duration: 0.5, ease: 'power3.out' })
+            .to(arrows[i], { autoAlpha: 1, opacity: 1, duration: 0.3, ease: 'power2.out' }, '-=0...[truncated]
+        });
+        tl.call(() => { playing = false; document.getElementById('flow-play').textContent = 'Play the loop'; }, null, "+=0.1");
+        tl.play();
+      } else {
+        // fallback: legacy setTimeout chain
+        function next() {
+          current++;
+          if (current >= steps.length) { playing = false; document.getElementById('flow-play').textContent = 'Play the loop'; return; }
+          if (current > 0) setArrow(current - 1, 'done');
+          setStep(current, 'active');
+          if (current > 0) setStep(current - 1, 'done');
+          timer = setTimeout(next, 650);
+        }
+        timer = setTimeout(next, 300);
+      }
+    }
+
+    document.getElementById('flow-play').addEventListener('click', () => {
+      if (tl && typeof tl.restart === 'function') { tl.restart(); return; }
+      playFlow();
+    });
     document.getElementById('flow-reset').addEventListener('click', resetFlow);
+
+    // Provider card interaction: click + keyboard (Enter/Space)
+    const providerCards = document.querySelectorAll('.provider-pill[role="button"], .custom-endpoint-row[role="button"]');
+    providerCards.forEach(card => {
+      card.addEventListener('click', () => {
+        providerCards.forEach(c => c.classList.remove('selected'));
+        card.classList.add('selected');
+        card.setAttribute('aria-pressed', 'true');
+      });
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          card.click();
+        }
+      });
+    });
   </script>
 </body>
 </html>

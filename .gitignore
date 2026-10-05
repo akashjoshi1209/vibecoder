@@ -6,3 +6,26 @@ node_modules/
 ~/
 *.tgz
 .npmrc
+
+# Render artifacts from the Remotion/ffmpeg scene work
+*.mp4
+
+# Scratch python drivers and one-off test scripts
+test_*.py
+build_demo.py
+write_composition.py
+debug_scene4.py
+verify-perms.ts
+
+# Generated output dirs
+brag-output/
+graphify_out/
+demopilot/
+fonts/
+projects/
+ellix-connect-stub/
+
+# Secondary lockfiles (bun.lock is the tracked one)
+package-lock.json
+site/package-lock.json
+site/package.json
