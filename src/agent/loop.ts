@@ -16,6 +16,7 @@ import {
 } from "../llm/compact";
 import { numberSetting } from "../runtime";
 import { RatePacer, paceWait } from "../llm/pace";
+import type { RunTrace } from "../trace";
 
 export interface AgentCallbacks {
   onModelText?: (text: string) => void;
@@ -73,6 +74,7 @@ async function invokeWithApproval(
   call: ParsedToolCall,
   toolCtx: ToolContext,
   callbacks: AgentCallbacks,
+  trace?: RunTrace,
 ): Promise<string> {
   const name = call.name as string;
   try {
@@ -86,6 +88,7 @@ async function invokeWithApproval(
     }
     if (!callbacks.confirmTool) return noPrompterMessage(name, err.reason);
     const ok = await callbacks.confirmTool(name, call.args, err.reason);
+    trace?.write({ kind: "approve", tool: name, approved: ok, source: "permission", reason: err.reason });
     if (!ok) return rejectedMessage(name, err.reason);
     // Approved: re-run. A second request means the tool wants consent again
     // (e.g. a command with two destructive parts); do not loop.
@@ -132,6 +135,8 @@ export async function runAgent(
      *  Older findings then live in the digest rather than being re-lost the
      *  moment the fresh turn's context fills. */
     compactionSummary?: string;
+    /** Structured run trace (JSONL); written best-effort, never throws. */
+    trace?: RunTrace;
   },
   callbacks: AgentCallbacks = {},
 ): Promise<AgentResult> {
@@ -202,6 +207,14 @@ export async function runAgent(
           reasoningTokens * (rates.reasoning ?? rates.output)) /
         1_000_000
       : 0;
+  /** What one provider response cost, for the per-step trace record. */
+  const stepCostUsd = (u?: { promptTokens?: number | null; completionTokens?: number | null; reasoningTokens?: number | null }) =>
+    !rates || !u
+      ? 0
+      : ((u.promptTokens ?? 0) * rates.input +
+          (u.completionTokens ?? 0) * rates.output +
+          (u.reasoningTokens ?? 0) * (rates.reasoning ?? rates.output)) /
+        1_000_000;
 
   /**
    * Fold the oldest foldable range of `history` into the digest.
@@ -239,17 +252,32 @@ export async function runAgent(
       reasoningTokens += summary.usage.reasoningTokens ?? 0;
     }
     compaction = { summary: summary.text, foldedCount: plan.end };
-    callbacks.onCompact?.({
+    const info = {
       foldedMessages: plan.end - plan.start,
       foldedTokens: plan.tokens,
       summaryTokens: estimateTokens(summary.text),
-    });
+    };
+    callbacks.onCompact?.(info);
+    options.trace?.write({ kind: "compact", ...info });
     return true;
   };
 
-  /** Every exit path carries the digest out so the caller can persist it. */
-  const withState = (r: AgentResult): AgentResult =>
-    compaction ? { ...r, compactionSummary: compaction.summary } : r;
+  /** Every exit path carries the digest out so the caller can persist it.
+   *  Also the single place a turn can end, so the trace's turn.end record is
+   *  emitted here — one record per runAgent call, whatever the exit path. */
+  const withState = (r: AgentResult): AgentResult => {
+    options.trace?.write({
+      kind: "turn.end",
+      steps: r.steps,
+      aborted: r.aborted,
+      usage: r.usage ?? null,
+      costCapHit: r.costCapHit ?? null,
+      costUsd: sawUsage ? spentUsd() : null,
+    });
+    return compaction ? { ...r, compactionSummary: compaction.summary } : r;
+  };
+
+  options.trace?.write({ kind: "turn.start", model: options.model, cwd: options.toolCtx.cwd });
 
   for (let step = 0; step < maxSteps; step++) {
     // Cost cap, evaluated before the next provider call is billed. Checked at the
@@ -306,7 +334,10 @@ export async function runAgent(
             reservedTokens: effectiveReserved(),
           });
           messages = trim.messages;
-          if (trim.trimmed > 0 && retryBudgetDelta === 0) callbacks.onTrimmed?.(trim.trimmed, trim.truncatedChars);
+          if (trim.trimmed > 0 && retryBudgetDelta === 0) {
+            callbacks.onTrimmed?.(trim.trimmed, trim.truncatedChars);
+            options.trace?.write({ kind: "trim", messages: trim.trimmed, chars: trim.truncatedChars });
+          }
         }
 
         const chatOpts: ChatOptions = {
@@ -336,6 +367,15 @@ export async function runAgent(
             completionTokens += result.usage.completionTokens ?? 0;
             reasoningTokens += result.usage.reasoningTokens ?? 0;
           }
+          options.trace?.write({
+            kind: "llm.step",
+            step: step + 1,
+            promptTokens: result.usage?.promptTokens ?? null,
+            completionTokens: result.usage?.completionTokens ?? null,
+            reasoningTokens: result.usage?.reasoningTokens ?? null,
+            finish: result.finishReason,
+            costUsd: stepCostUsd(result.usage),
+          });
           break; // success
         } catch (err: any) {
           if (err instanceof ContextTooLargeError) {
@@ -450,16 +490,27 @@ export async function runAgent(
       // Interactive approval (/approve on) gates every call.
       if (callbacks.confirmTool) {
         approved = await callbacks.confirmTool(name, call.args);
+        options.trace?.write({ kind: "approve", tool: name, approved, source: "interactive", step: step + 1 });
       }
+      const execStartedAt = Date.now();
       if (!approved) {
         // Same wording as a permission-model decline, for the same reason: the
         // observed failure was a model that read a flat rejection and then went
         // looking for another way to do the thing.
         output = rejectedMessage(name, "you declined it at the approval prompt");
       } else {
-        output = await invokeWithApproval(call, options.toolCtx, callbacks);
+        output = await invokeWithApproval(call, options.toolCtx, callbacks, options.trace);
       }
       callbacks.onToolEnd?.(call.name, output);
+      options.trace?.write({
+        kind: "tool",
+        tool: name,
+        input: call.args,
+        output,
+        ms: Date.now() - execStartedAt,
+        ok: approved && !/^(ERROR|BLOCKED)/.test(output),
+        step: step + 1,
+      });
       return {
         call,
         message: { role: "tool" as const, tool_call_id: call.id, content: output, name: call.name },
@@ -486,12 +537,22 @@ export async function runAgent(
       const outputs = await Promise.all(
         parallelCalls.map(async (call) => {
           let output: string;
+          const execStartedAt = Date.now();
           try {
             output = await executeTool(call.name, call.args, options.toolCtx);
           } catch (err: any) {
             output = `ERROR: ${err?.message ?? String(err)}`;
           }
           callbacks.onToolEnd?.(call.name, output);
+          options.trace?.write({
+            kind: "tool",
+            tool: call.name,
+            input: call.args,
+            output,
+            ms: Date.now() - execStartedAt,
+            ok: !/^(ERROR|BLOCKED)/.test(output),
+            step: step + 1,
+          });
           return { call, output };
         }),
       );

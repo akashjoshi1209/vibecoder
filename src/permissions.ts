@@ -167,6 +167,21 @@ export function decide(input: {
   }
 }
 
+/** Live listeners (the run trace) are notified of every audited decision —
+ *  the seam that lets a trace record permission outcomes without threading a
+ *  tracer through each tool. A listener that throws must not turn a permission
+ *  check into a failure, so each call is guarded. */
+export type DecisionListener = (d: PermissionDecision) => void;
+const decisionListeners = new Set<DecisionListener>();
+
+/** Subscribe to every audited decision; returns an unsubscribe function. */
+export function onPermissionDecision(cb: DecisionListener): () => void {
+  decisionListeners.add(cb);
+  return () => {
+    decisionListeners.delete(cb);
+  };
+}
+
 /** Bounded audit of recent decisions. Ring-buffered: this is a debugging aid,
  *  not a security log, and it must not grow without bound in a long run. */
 const AUDIT_MAX = 200;
@@ -176,6 +191,13 @@ const auditRing: PermissionDecision[] = [];
 export function auditDecision(d: PermissionDecision): PermissionDecision {
   auditRing.push(d);
   if (auditRing.length > AUDIT_MAX) auditRing.shift();
+  for (const cb of decisionListeners) {
+    try {
+      cb(d);
+    } catch {
+      // A broken listener must never fail the check itself.
+    }
+  }
   return d;
 }
 

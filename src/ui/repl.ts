@@ -30,7 +30,8 @@ import { loadDotEnv } from "../env";
 import { runDoctor } from "../doctor";
 import { runSetup } from "../setup";
 import { readPackageJson } from "../paths";
-import { resolvePermissions, permissionAudit, type Permissions } from "../permissions";
+import { resolvePermissions, permissionAudit, onPermissionDecision, type Permissions } from "../permissions";
+import { RunTrace, replayTrace, formatReplaySummary } from "../trace";
 import { setRootConfig } from "../runtime";
 import { recordCost, costSummary, costReportText, ratesPerMillion } from "../cost";
 import {
@@ -86,6 +87,8 @@ let permissions: Permissions = resolvePermissions({}, process.cwd());
 /** The directory the agent is scoped to. Set from --cwd before init() runs so
  *  the permission model is resolved against the right root. */
 let sessionCwd = process.cwd();
+/** Run trace for this process (--trace <file>); null when not recording. */
+let trace: RunTrace | null = null;
 /** Plan mode: the next task turn investigates and plans only. */
 let planPhase = false;
 /** Plan mode is a one-turn gate; the phase applies to the turn that follows a
@@ -283,6 +286,32 @@ async function init() {
   if (process.argv.includes("--plan")) {
     planPhase = true;
     planPhaseNextTurn = true;
+  }
+
+  // Structured run trace: --trace <file> appends every provider step, tool
+  // call, approval and permission decision; --trace-anon scrubs home/cwd paths
+  // and secret-shaped tokens first so the file is safe to attach to a bug
+  // report. Permission decisions are made deep inside the tools, so the audit
+  // listener is the one seam that surfaces them here without a tracer being
+  // threaded through every tool. (--trace-replay is handled in main() — it
+  // prints a recorded trace and exits before any of this runs.)
+  const traceIdx = process.argv.indexOf("--trace");
+  if (traceIdx !== -1 && process.argv[traceIdx + 1]) {
+    trace = new RunTrace(process.argv[traceIdx + 1], {
+      anon: process.argv.includes("--trace-anon"),
+      cwd: sessionCwd,
+    });
+    onPermissionDecision((d) =>
+      trace?.write({
+        kind: "permission",
+        domain: d.domain,
+        rule: d.rule,
+        action: d.action,
+        reason: d.reason,
+        tool: d.tool,
+      }),
+    );
+    trace.write({ kind: "note", text: `trace started · provider=${providerName} model=${llmModel}` });
   }
 }
 
@@ -936,6 +965,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
         maxCostUsd: rootConfig?.maxCostUsd,
         costRates: ratesPerMillion(turnProviderName, turnModel),
         compactionSummary: compactionDigest,
+        trace: trace ?? undefined,
       },
       {
         maxSteps,
@@ -1212,6 +1242,9 @@ function printUsage(): void {
   console.log("  --ask-destructive   require approval for destructive commands");
   console.log("  --no-network        block curl/wget/ssh and inline network code");
   console.log("  --expose-secrets    pass API-key env vars into child processes");
+  console.log("  --trace <file>      append a structured run trace (JSONL) for debugging");
+  console.log("  --trace-anon        with --trace: scrub home/cwd paths and secrets (bug reports)");
+  console.log("  --trace-replay <f>  print a recorded trace offline and exit (no model needed)");
   console.log("  --plan              run the first turn in plan mode (investigate + propose, no changes)");
   console.log("  --version, -v       print version");
   console.log("  --help, -h          this help");
@@ -1245,6 +1278,29 @@ async function main() {
   }
   if (first === "--help" || first === "-h" || first === "help") {
     printUsage();
+    return;
+  }
+
+  // Offline replay: print a recorded trace and exit. Handled before init() so
+  // it needs no config, no connectivity and no model — the whole point of a
+  // replayable trace is debugging a run that cannot be re-run.
+  const replayIdx = process.argv.indexOf("--trace-replay");
+  if (replayIdx !== -1) {
+    const file = process.argv[replayIdx + 1];
+    if (!file) {
+      console.error("usage: vibecoder --trace-replay <file>");
+      process.exitCode = 1;
+      return;
+    }
+    try {
+      const { lines, summary } = replayTrace(file);
+      console.log(`trace ${file}${lines.length ? "" : " (no valid records)"}`);
+      for (const l of lines) console.log(`  ${l}`);
+      console.log(formatReplaySummary(summary));
+    } catch (err) {
+      console.error(`cannot replay ${file}: ${err instanceof Error ? err.message : String(err)}`);
+      process.exitCode = 1;
+    }
     return;
   }
 
