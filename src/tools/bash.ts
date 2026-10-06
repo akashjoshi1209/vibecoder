@@ -1,11 +1,13 @@
 import { registerTool, type ToolContext } from "./registry";
 import { spawnCollect } from "./proc";
 import {
+  auditDecision,
+  decide,
   destructiveReason,
-  checkNetworkCommand,
-  isPathAllowed,
-  parseCommands,
   filterEnv,
+  networkReason,
+  parseCommands,
+  type PermissionDomain,
   type Permissions,
 } from "../permissions";
 import { ApprovalRequiredError } from "./approval";
@@ -228,18 +230,26 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const permissions = ctx.permissions;
     const command = String(args.command ?? "");
+    // Every check below runs through decide(): one evaluator, one audit ring,
+    // so a refusal can always be traced to a domain and a rule.
+    const judge = (
+      domain: PermissionDomain,
+      extra: { reason?: string | null; path?: string; interactive?: boolean },
+    ) => auditDecision({ ...decide({ domain, perms: permissions, ...extra }), tool: "bash" });
+
     if (ctx.planPhase) {
-      const why = planBannedReason(command);
-      if (why)
-        return `BLOCKED IN PLAN MODE (read-only): ${why}. Use read-only commands (ls, grep, cat, git status/diff/log, running tests) to investigate, and describe any changes you would make in your PLAN instead.`;
+      const d = judge("plan.exec", { reason: planBannedReason(command) });
+      if (d.action === "deny")
+        return `BLOCKED IN PLAN MODE (read-only): ${d.reason}. Use read-only commands (ls, grep, cat, git status/diff/log, running tests) to investigate, and describe any changes you would make in your PLAN instead.`;
     }
 
     // ── secret-file reads ──────────────────────────────────────────────────────
     // A dotenv holds live credentials. `cat .env` is the obvious way to lift
     // one, and env_get exists precisely so the agent never has to do that.
-    if (!permissions?.exposeSecrets) {
-      const secret = secretFileInvolved(command);
-      if (secret) {
+    const secret = secretFileInvolved(command);
+    if (secret) {
+      const d = judge("env.secret", { reason: `dotenv read (${secret})` });
+      if (d.action === "deny") {
         return `BLOCKED: refusing to read ${secret} through bash — it holds live credentials. Use env_get("<KEY>") to read a single value (it masks), or run with --expose-secrets if you truly need the raw file.`;
       }
     }
@@ -253,27 +263,24 @@ registerTool({
       // returned the string "PENDING ... awaiting approval" as the tool result,
       // so nothing ever prompted and the model just saw a soft denial it would
       // try to route around.
-      if (permissions.destructive !== "allow") {
-        const reason = destructiveReason(command);
-        if (reason) {
-          if (permissions.destructive === "deny") {
-            return `BLOCKED (deny): ${reason}`;
-          }
-          throw new ApprovalRequiredError("bash", reason, args);
-        }
-      }
+      const d1 = judge("shell.destructive", {
+        reason: permissions.destructive !== "allow" ? destructiveReason(command) : null,
+      });
+      if (d1.action === "deny") return `BLOCKED (deny): ${d1.reason}`;
+      if (d1.action === "ask") throw new ApprovalRequiredError("bash", d1.reason ?? "destructive command", args);
 
       // 2. Network command check. network has no "ask" state, so this is
       //    allow-or-refuse only.
-      const networkCheck = checkNetworkCommand(command, permissions);
-      if (networkCheck) {
-        return networkCheck;
-      }
+      const d2 = judge("shell.network", {
+        reason: permissions.network !== "allow" ? networkReason(command) : null,
+      });
+      if (d2.action === "deny") return `BLOCKED (${permissions.network}): ${d2.reason}`;
 
       // 3. Filesystem scope check (when workdir is set, check it's within workspace)
       if (permissions.filesystem === "workspace" && args.workdir) {
         const workdir = String(args.workdir);
-        if (!isPathAllowed(workdir, permissions)) {
+        const d3 = judge("fs.write", { path: workdir });
+        if (d3.action === "deny") {
           return `BLOCKED: workdir "${workdir}" is outside the allowed workspace (${permissions.workspaceRoot}). Use a path within the workspace.`;
         }
       }

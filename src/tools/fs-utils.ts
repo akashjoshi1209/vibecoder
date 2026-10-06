@@ -1,6 +1,6 @@
 import * as path from "path";
 import type { ToolContext } from "./registry";
-import { isPathAllowed } from "../permissions";
+import { auditDecision, decide, type PermissionDomain } from "../permissions";
 
 export function resolve(p: string, ctx: ToolContext): string {
   // isAbsolute() handles drive letters, UNC and POSIX roots. A bare "/x" is
@@ -16,12 +16,17 @@ export function resolve(p: string, ctx: ToolContext): string {
  * Returns an error string when the path is outside the configured workspace
  * (permissions.filesystem === "workspace"), or null when access is fine.
  * Tools should call this before any read/write.
+ *
+ * Routed through decide() so the audit ring records which domain and rule
+ * stopped the call; `domain` defaults to fs.read because that is what
+ * search/glob-style callers do — write tools pass fs.write.
  */
-export function pathDenied(p: string, ctx: ToolContext): string | null {
+export function pathDenied(p: string, ctx: ToolContext, domain: PermissionDomain = "fs.read"): string | null {
   const perms = ctx.permissions;
   // No permissions on the context means no sandbox was requested.
   if (!perms) return null;
   const abs = resolve(p, ctx);
-  if (isPathAllowed(abs, perms)) return null;
+  const d = auditDecision({ ...decide({ domain, perms, path: abs }), tool: domain });
+  if (d.action === "allow") return null;
   return `BLOCKED: ${abs} is outside the allowed workspace (${perms.workspaceRoot}). Set permissions.filesystem to "full" to allow it.`;
 }

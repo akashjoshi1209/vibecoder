@@ -30,7 +30,7 @@ import { loadDotEnv } from "../env";
 import { runDoctor } from "../doctor";
 import { runSetup } from "../setup";
 import { readPackageJson } from "../paths";
-import { resolvePermissions, type Permissions } from "../permissions";
+import { resolvePermissions, permissionAudit, type Permissions } from "../permissions";
 import { setRootConfig } from "../runtime";
 import { recordCost, costSummary, costReportText, ratesPerMillion } from "../cost";
 import {
@@ -555,6 +555,22 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  filesystem  : ${p.filesystem}`);
     print(`  secrets     : ${p.exposeSecrets ? "exposed to child processes" : "withheld from child processes"}`);
     print(`${colors.dim}  set in config.json under "permissions", or per-run: --sandbox --deny-destructive --no-network${colors.reset}`);
+    // The audit ring: every check runs through decide(), so a refusal (or an
+    // allow) can always be traced to a domain and the rule that decided it.
+    const log = permissionAudit();
+    if (log.length) {
+      print(`\n  ${colors.bold}recent decisions${colors.reset} ${colors.dim}(oldest first, last ${Math.min(log.length, 8)} of ${log.length})${colors.reset}`);
+      for (const d of log.slice(-8)) {
+        const mark = d.action === "allow" ? colors.green : d.action === "ask" ? colors.yellow : colors.red;
+        print(
+          `    ${mark}${d.action.padEnd(5)}${colors.reset} ${d.domain} · ${d.rule}` +
+            `${d.reason ? ` ${colors.dim}— ${d.reason}${colors.reset}` : ""}` +
+            `${d.tool ? ` ${colors.dim}(${d.tool})${colors.reset}` : ""}`,
+        );
+      }
+    } else {
+      print(`\n  ${colors.dim}no permission decisions recorded yet this run${colors.reset}`);
+    }
     return true;
   }
 
