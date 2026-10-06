@@ -27,3 +27,10 @@ jobs:
 
       - name: Tests
         run: bun run test
+
+      # Order-dependency net: the suite also runs with a fixed random seed so a
+      # test that only passes because of file ordering fails here instead of in
+      # someone else's checkout. --isolate already gives each file a fresh
+      # global; this catches what isolation cannot (shared disk state, caches).
+      - name: Tests (randomized order, seed 4242)
+        run: bun test --isolate --randomize --seed=4242 --timeout=60000

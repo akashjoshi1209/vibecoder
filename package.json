@@ -42,7 +42,7 @@
     "build": "bun run scripts/build.ts",
     "prepublishOnly": "bun run build && bun run typecheck && bun run test",
     "typecheck": "tsc --noEmit",
-    "test": "bun test --timeout=60000",
+    "test": "bun test --isolate --timeout=60000",
     "daemon": "bun src/daemon.ts"
   },
   "dependencies": {

@@ -93,6 +93,19 @@ describe("recordChange", () => {
   });
 
   test("the log is append-only JSONL, one object per line", () => {
+    // Self-sufficient on purpose: bun test --randomize shuffles tests within
+    // the file too, so this assertion may run first. It must create the data
+    // it reads instead of assuming earlier tests already did.
+    freshSession("s-jsonl");
+    for (let i = 0; i < 4; i++) {
+      recordChange({
+        tool: "edit_file",
+        path: join(work, "jsonl.ts"),
+        cwd: work,
+        beforeText: `v${i}`,
+        afterText: `v${i + 1}`,
+      });
+    }
     const text = readFileSync(changeLogPath(), "utf8");
     const lines = text.split("\n").filter(Boolean);
     expect(lines.length).toBeGreaterThan(3);
