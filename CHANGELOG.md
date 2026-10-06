@@ -44,6 +44,28 @@ file to the GitHub release.
   `decide()` core with a bounded audit ring in `src/permissions.ts`, and a
   `/permissions` command that shows recent decisions (domain + rule).
 
+### Sandbox write-allowlist + threat model
+- `--sandbox` now also gates shell *redirections*: in workspace-scope mode a
+  `> file` target must resolve inside the workspace (scratch targets —
+  `/dev/null`, `/tmp`, `C:\Windows\Temp`, … — are exempt) or the command asks
+  for approval and runs once approved; unattended it is refused.
+  `TMP`/`TEMP`/`TMPDIR` are pointed at `<workspace>/.vibecoder/tmp` so
+  temp-file writers land inside the allowlist (re-exported after
+  `/etc/profile`, which on Git for Windows rewrites them unconditionally).
+- `THREAT_MODEL.md` documents what ask-mode does and does not protect
+  (advisory parsing, argv destinations of unclassified commands, no kernel
+  boundary on Windows, …), linked from the README.
+
+### Fixed: an approved `ask` never ran
+- Approving a destructive command re-ran it, which re-asked (the check is a
+  pure function of the command), and the loop treated the second request as
+  "no approver attached" — the human said yes and nothing happened. The
+  approval flow now hands the tool a one-shot consent marker
+  (`approvalSig`, cleared when the call returns), so the approved call runs
+  exactly once and the next identical call asks again. Unattended runs still
+  refuse explicitly; approval requests on the parallel path now report as
+  unattended refusals instead of generic errors.
+
 ### Replayable run trace
 - `--trace <file>` records provider steps, tool calls, approvals, permission
   decisions, trims and compactions as JSONL; `--trace-replay <file>` prints

@@ -1,6 +1,7 @@
 import { ContextTooLargeError, type ChatOptions, type Message, type StreamResult, type ToolCall } from "../llm/types";
 import { listTools, executeTool, needsApproval, type ToolContext } from "../tools/registry";
 import {
+  approvalSig,
   isApprovalRequired,
   noPrompterMessage,
   rejectedMessage,
@@ -90,8 +91,14 @@ async function invokeWithApproval(
     const ok = await callbacks.confirmTool(name, call.args, err.reason);
     trace?.write({ kind: "approve", tool: name, approved: ok, source: "permission", reason: err.reason });
     if (!ok) return rejectedMessage(name, err.reason);
-    // Approved: re-run. A second request means the tool wants consent again
-    // (e.g. a command with two destructive parts); do not loop.
+    // Approved: hand the consent to the tool for exactly this re-run. The
+    // marker is one-shot — cleared below whatever happens — so a later call
+    // with the same arguments has to ask again. Without it the tool's `ask`
+    // check, being a pure function of the command, would fire again on its own
+    // re-run and the human's "yes" would end in "no approver attached".
+    // A request that still fires after that is the tool asking for consent a
+    // second time (e.g. two destructive parts): do not loop.
+    toolCtx.approval = { tool: name, sig: approvalSig(name, call.args), at: Date.now() };
     try {
       return await executeTool(name, call.args, toolCtx);
     } catch (retryErr) {
@@ -100,6 +107,8 @@ async function invokeWithApproval(
         ? String((retryErr as Record<string, unknown>).message)
         : String(retryErr);
       return `ERROR: ${msg}`;
+    } finally {
+      delete toolCtx.approval;
     }
   }
 }
@@ -487,7 +496,11 @@ export async function runAgent(
       callbacks.onToolStart?.(name, call.args);
       let output: string;
       let approved = true;
-      // Interactive approval (/approve on) gates every call.
+      // Interactive approval (/approve on) gates every call. Note the marker is
+      // NOT seeded here: with /approve off this returns true automatically
+      // (nobody was asked), and treating an auto-yes as human consent would
+      // silently neuter destructive: "ask". Only the permission path below —
+      // where a reason means a human actually answered — records consent.
       if (callbacks.confirmTool) {
         approved = await callbacks.confirmTool(name, call.args);
         options.trace?.write({ kind: "approve", tool: name, approved, source: "interactive", step: step + 1 });
@@ -541,7 +554,11 @@ export async function runAgent(
           try {
             output = await executeTool(call.name, call.args, options.toolCtx);
           } catch (err: any) {
-            output = `ERROR: ${err?.message ?? String(err)}`;
+            // This path is parallel precisely because nothing can prompt, so an
+            // approval request is an unattended refusal — not a generic error.
+            output = isApprovalRequired(err)
+              ? noPrompterMessage(call.name, err.reason)
+              : `ERROR: ${err?.message ?? String(err)}`;
           }
           callbacks.onToolEnd?.(call.name, output);
           options.trace?.write({

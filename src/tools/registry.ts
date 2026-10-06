@@ -8,6 +8,11 @@ export interface ToolContext {
   planPhase?: boolean;
   /** Effective permissions from config. */
   permissions?: import("../permissions").Permissions;
+  /** One-shot human consent, recorded by the approval flow after confirmTool
+   *  says yes and cleared as soon as that re-run returns. A tool's `ask`
+   *  check matches it (see approvalSig) so an approved call runs exactly once
+   *  instead of asking again on its own re-run. */
+  approval?: { tool: string; sig: string; at: number };
 }
 
 export interface Tool {

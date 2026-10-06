@@ -149,6 +149,7 @@ Self-edits are **staged, audited, and revertible**, never silently live:
 Key fields:
 
 - `provider` / `model` — defaults
+- `permissions` — `allow`/`ask`/`deny` for destructive commands, network, and workspace-scoped filesystem access (see [THREAT_MODEL.md](THREAT_MODEL.md) for exactly what that does and does not protect)
 - `temperature`, `maxInputTokens`, `maxInputTokensPerMinute` — sampling + budget controls
 - `providers` — any OpenAI-compatible endpoint or Anthropic, one entry per provider
 - `routing` — dual-model routing (fast chat model + heavy task model)

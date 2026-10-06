@@ -85,6 +85,7 @@ export type PermissionDomain =
   | "shell.network"
   | "plan.exec"
   | "env.secret"
+  | "sandbox.write"
   | "unknown";
 
 export type DecisionAction = "allow" | "ask" | "deny";
@@ -156,6 +157,24 @@ export function decide(input: {
       if (isPathAllowed(input.path, perms)) return d("fs=workspace", "allow");
       return d("fs=outside-workspace", "deny", {
         reason: `path outside the workspace (${perms.workspaceRoot})`,
+      });
+    }
+    case "sandbox.write": {
+      // Sandbox write-allowlist: with filesystem="workspace" the shell's
+      // redirection targets must stay inside the workspace (which contains the
+      // sandbox scratch dir, .vibecoder/tmp). Outside → ask when a human can
+      // answer ("unless approved"), deny when nobody can.
+      if (!perms || perms.filesystem !== "workspace") return d("sandbox=off", "allow");
+      if (!input.path) {
+        return d("sandbox=write-allowlist", input.interactive ? "ask" : "deny", {
+          reason: "no write target given",
+        });
+      }
+      if (isPathAllowed(input.path, perms)) {
+        return d("sandbox=write-allowlist", "allow");
+      }
+      return d("sandbox=write-allowlist", input.interactive ? "ask" : "deny", {
+        reason: `write target outside the workspace (${perms.workspaceRoot})`,
       });
     }
     case "shell.exec":

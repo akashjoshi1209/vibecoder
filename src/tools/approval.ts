@@ -46,6 +46,16 @@ export function isApprovalRequired(err: unknown): err is ApprovalRequiredError {
   );
 }
 
+/** Stable signature of one approval request (tool + exact arguments).
+ *
+ *  The loop records this on the ToolContext after confirmTool says yes, so the
+ *  immediate re-run can prove the human's consent covers exactly this call —
+ *  without it, a tool whose `ask` check is a pure function of the command
+ *  would ask forever: approve, re-run, ask again, end in "no approver". */
+export function approvalSig(tool: string, args: Record<string, unknown>): string {
+  return `${tool} ${JSON.stringify(args)}`;
+}
+
 /** Message handed back to the model when a human declines. */
 export function rejectedMessage(tool: string, reason: string): string {
   return (

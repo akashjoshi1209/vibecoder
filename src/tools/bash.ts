@@ -10,8 +10,10 @@ import {
   type PermissionDomain,
   type Permissions,
 } from "../permissions";
-import { ApprovalRequiredError } from "./approval";
+import { ApprovalRequiredError, approvalSig } from "./approval";
 import { numberSetting } from "../runtime";
+import { mkdirSync } from "node:fs";
+import { join, resolve as pathResolve } from "node:path";
 
 /**
  * Hard cap on how much command output comes back to the model.
@@ -129,6 +131,39 @@ function findIsDestructive(argv: string[]): boolean {
   return false;
 }
 
+/**
+ * Where a command line redirects output: the target of `> file`, `>> file`
+ * and `2> file`. An fd duplication like `2>&1` writes nowhere — its "target"
+ * starts with `&`, which the capture excludes — so it drops out for free.
+ */
+export function redirectTargets(command: string): string[] {
+  const out = new Set<string>();
+  for (const cmd of parseCommands(command)) {
+    const re = />{1,2}\s*"?([^\s"';|&]+)"?/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(cmd.raw))) out.add(m[1]);
+  }
+  return [...out];
+}
+
+/** Scratch targets that write nowhere interesting — /dev/null and friends, the
+ *  OS temp dirs. Checked against BOTH the raw target (bash resolves `/dev/null`
+ *  itself; path.resolve would turn it into `<cwd>\dev\null` on Windows) and the
+ *  resolved absolute path (for `C:\Windows\Temp\x`). */
+export function isSandboxScratch(p: string): boolean {
+  const n = p
+    .replace(/\\/g, "/")
+    .toLowerCase()
+    .replace(/^([a-z]):/, "/$1"); // C:/x → /c/x (colon dropped)
+  return (
+    n === "/dev/null" ||
+    n === "/dev/stdout" ||
+    n.startsWith("/tmp/") ||
+    n.startsWith("/var/tmp/") ||
+    n.startsWith("/c/windows/temp/")
+  );
+}
+
 function planBannedReason(command: string): string | null {
   for (const cmd of parseCommands(command)) {
     const name = (cmd.argv[0] ?? "").toLowerCase().replace(/\.(exe|cmd|bat)$/, "");
@@ -230,12 +265,21 @@ registerTool({
   async run(args: Record<string, unknown>, ctx: ToolContext): Promise<string> {
     const permissions = ctx.permissions;
     const command = String(args.command ?? "");
+    const cwd = args.workdir ? String(args.workdir) : ctx.cwd;
     // Every check below runs through decide(): one evaluator, one audit ring,
     // so a refusal can always be traced to a domain and a rule.
     const judge = (
       domain: PermissionDomain,
       extra: { reason?: string | null; path?: string; interactive?: boolean },
     ) => auditDecision({ ...decide({ domain, perms: permissions, ...extra }), tool: "bash" });
+
+    // Did the human just say yes to THIS exact call? The loop records a
+    // one-shot consent marker on ctx after confirmTool approves and clears it
+    // when the call returns; the "ask" checks below pass through it. Without
+    // that, an approved command would re-ask on its own re-run (the check is a
+    // pure function of the command) and land in "no approver attached".
+    const consented =
+      ctx.approval?.tool === "bash" && ctx.approval.sig === approvalSig("bash", args);
 
     if (ctx.planPhase) {
       const d = judge("plan.exec", { reason: planBannedReason(command) });
@@ -267,7 +311,9 @@ registerTool({
         reason: permissions.destructive !== "allow" ? destructiveReason(command) : null,
       });
       if (d1.action === "deny") return `BLOCKED (deny): ${d1.reason}`;
-      if (d1.action === "ask") throw new ApprovalRequiredError("bash", d1.reason ?? "destructive command", args);
+      if (d1.action === "ask" && !consented) {
+        throw new ApprovalRequiredError("bash", d1.reason ?? "destructive command", args);
+      }
 
       // 2. Network command check. network has no "ask" state, so this is
       //    allow-or-refuse only.
@@ -284,20 +330,80 @@ registerTool({
           return `BLOCKED: workdir "${workdir}" is outside the allowed workspace (${permissions.workspaceRoot}). Use a path within the workspace.`;
         }
       }
+
+      // 4. Sandbox write-allowlist: in workspace-scope mode the command's
+      //    redirections must write inside the workspace (the sandbox scratch
+      //    dir, .vibecoder/tmp, lives there too). A target outside → ask, so
+      //    the human can approve this one command ("unless approved"). When
+      //    no prompter is attached, invokeWithApproval turns the ask into an
+      //    explicit "needs approval" refusal — never a silent run.
+      if (permissions.filesystem === "workspace") {
+        for (const target of redirectTargets(command)) {
+          const abs = pathResolve(cwd, target);
+          if (isSandboxScratch(target) || isSandboxScratch(abs)) continue;
+          const d4 = judge("sandbox.write", {
+            path: abs,
+            interactive: true,
+            reason: `command redirection targets ${target}`,
+          });
+          if (d4.action === "ask" && !consented) {
+            throw new ApprovalRequiredError(
+              "bash",
+              `the command writes outside the workspace (redirect target "${target}")`,
+              args,
+            );
+          }
+          if (d4.action === "deny") {
+            return `BLOCKED (sandbox): redirect target "${target}" is outside the allowed workspace (${permissions.workspaceRoot}). Sandbox mode writes only inside the workspace — scratch goes in ${permissions.workspaceRoot}/.vibecoder/tmp.`;
+          }
+        }
+      }
     }
     // ──────────────────────────────────────────────────────────────────────────────
 
-    const cwd = args.workdir ? String(args.workdir) : ctx.cwd;
     const timeout = Math.max(0, Number(args.timeout ?? 120000));
+
+    // Sandbox temp: point TMP/TEMP/TMPDIR at <workspace>/.vibecoder/tmp so a
+    // tool that writes "nowhere in particular" writes somewhere inspectable
+    // (and inside the write-allowlist) instead of the OS temp dir.
+    const sandboxEnv: Record<string, string> = {};
+    if (permissions?.filesystem === "workspace") {
+      try {
+        const tmpDir = join(permissions.workspaceRoot, ".vibecoder", "tmp");
+        mkdirSync(tmpDir, { recursive: true });
+        sandboxEnv.TMP = tmpDir;
+        sandboxEnv.TEMP = tmpDir;
+        sandboxEnv.TMPDIR = tmpDir;
+      } catch {
+        // Scratch dir not creatable — keep the system temp; the redirect
+        // allowlist above still applies.
+      }
+    }
+
+    // Profile-safe: a login shell runs /etc/profile AFTER inheriting our env,
+    // and Git for Windows' profile rewrites TMP/TEMP/TMPDIR to /tmp
+    // unconditionally — so export them inside the -lc string too, where they
+    // execute after the profile and win. Windows-native children (node, …) then
+    // write temp files into the workspace scratch dir, inside the allowlist.
+    const shQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+    const sandboxEntries = Object.entries(sandboxEnv);
+    const sandboxExports = sandboxEntries.length
+      ? "export " + sandboxEntries.map(([k, v]) => `${k}=${shQuote(v)}`).join(" ") + "; "
+      : "";
+    const shellArg = `${sandboxExports}${command}`;
 
     let res;
     try {
       res = await spawnCollect({
-        cmd: ["bash", "-lc", command],
+        cmd: ["bash", "-lc", shellArg],
         cwd,
         // Withhold API-key-shaped vars unless explicitly opted in, so
         // `printenv GROQ_API_KEY` inside bash cannot exfiltrate them.
-        env: { ...filterEnv(process.env as Record<string, string | undefined>, permissions), NO_COLOR: "1" } as Record<string, string>,
+        env: {
+          ...filterEnv(process.env as Record<string, string | undefined>, permissions),
+          NO_COLOR: "1",
+          ...sandboxEnv,
+        } as Record<string, string>,
         timeoutMs: timeout,
         signal: ctx.signal,
       });
