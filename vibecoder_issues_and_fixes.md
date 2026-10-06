@@ -132,3 +132,20 @@ log(0)       → Error: math domain error ✓
 - Tool registered and callable
 - DuckDuckGo Instant Answer API works (tested: query "vibecoder github" returned abstract + results)
 - HTML fallback available if API fails
+
+
+---
+
+## Round 3 - Phantom Worktree Change Investigation (2026-10-06)
+
+### 13. Mystery file deletions/reversions during the round-2 merge
+- **Problem:** During the 2026-10-06 merge session (`merge-remote-work`), files (`src/ui/repl.ts`, `package.json`, `src/tools/proc.ts`, `src/tools/search.ts`, `src/tools/network.test.ts`) were observed to revert or vanish from the worktree between tool calls, repeatedly, without any tool writing them. Cause was never identified in-session; this entry records the post-hoc diagnosis.
+- **Diagnosis performed (round 3):**
+  - Git hooks: only `*.sample` files in `.git/hooks` - no custom `post-merge`/`pre-commit` hook could have rewritten files.
+  - Reflog across the merge window (10:41-11:40): only the expected `checkout`, `merge (fast-forward)` and `commit` entries - no unexpected `reset`, `stash` or `checkout` that would delete/revert worktree content.
+  - Stash list: empty. `git fsck`: only pre-existing dangling commits from an unrelated 09-18 rebase.
+  - `core.autocrlf=true` with **no `.gitattributes`**: any operation that makes git "touch" a file rewrites line endings, which produces whole-file modification noise and can look like content reversion in diffs.
+  - `core.fileMode=false`, `core.symlinks=false`: normal for Windows, not implicated.
+- **Likely causes (ranked):** (1) concurrent writers - two agent/tool sessions editing the same worktree in parallel during the merge; (2) line-ending rewrites via `autocrlf=true` surfacing as apparent reverts. No git-side mechanism was found that could delete tracked files silently.
+- **Mitigation (runbook):** snapshot before any large merge - `git stash push --include-untracked -m pre-merge` and/or a `git commit -am wip` checkpoint; after unexplained changes run `git status --porcelain=v2` + `git diff --stat` before touching anything else. Recommend adding `.gitattributes` (`* text=auto`) as a follow-up so line endings stop producing phantom diffs.
+- **Verification:** n/a - environment-side; no reproducible git mechanism found, documented for future sessions.
