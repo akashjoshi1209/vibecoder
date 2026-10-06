@@ -1,6 +1,7 @@
 import { registerTool, type ToolContext } from "./registry";
 import { spawnCollect } from "./proc";
 import { pathDenied } from "./fs-utils";
+import { recordNote } from "../changelog";
 
 // ── read-only git operations ────────────────────────────────────────────────────
 
@@ -190,6 +191,9 @@ registerTool({
     if (!branch || branch === "HEAD") return "NOTE: not on a named branch (detached HEAD) — nothing to push";
     const push = await runGit(["push", "--force-with-lease", remote, branch], `git push --force-with-lease ${remote} ${branch}`, ctx);
     if (push.includes("Everything up-to-date")) return `up to date on ${remote}/${branch}`;
+    // A force-push rewrites published history, which is far less recoverable
+    // than a local edit. Put it in the session timeline next to the changes.
+    recordNote("git_push_ff", `force-pushed ${branch} to ${remote} (history rewritten — local reflog is the only undo)`);
     return push;
   },
 });
@@ -284,6 +288,13 @@ registerTool({
     const commit = await runGit(["commit", "-m", message], `git commit -m "${message}"`, ctx);
     const hashMatch = commit.match(/\[(\w+\s+\d+\s+[a-f0-9]+)\]/);
     const summary = hashMatch ? hashMatch[1] : commit;
+
+    // Note it in the session timeline. A commit is the point where the working
+    // tree stops being recoverable from the pre-images alone — /revert can undo
+    // an uncommitted write, but once it is committed the change is in history.
+    // Recording the boundary is what lets someone reading /diff later see that
+    // these files went from "revertible" to "committed".
+    recordNote("git_commit", `committed ${files.split(/\s+/).filter(Boolean).length} file(s): ${String(message).slice(0, 80)}`);
 
     return `Committed as:\n${summary}\n\nStaged changes:\n${status || "(none)"}`;
   },

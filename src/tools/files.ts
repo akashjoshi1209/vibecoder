@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
 import { isSelfFile, isProtectedFile, auditSelfEdit } from "../self-edit";
+import { recordChange, isChangeStorePath } from "../changelog";
 
 async function fileText(p: string): Promise<string> {
   try {
@@ -26,8 +27,30 @@ function protectedError(p: string): string {
   return `ERROR: SELF-EDIT PROTECTED — ${p} is the append-only audit ledger. It cannot be modified or deleted; self-edits are recorded there automatically.`;
 }
 
+function changeStoreError(p: string): string {
+  return `ERROR: AUDIT TRAIL PROTECTED — ${p} is the change log or its undo store. The agent cannot rewrite its own record of what it changed; that would make /diff and /revert worthless.`;
+}
+
+/** Record the mutation so /diff can list it and /revert can undo it. */
+async function logChange(
+  tool: string,
+  p: string,
+  ctx: ToolContext,
+  before: string | null,
+  after: string,
+  note: string,
+): Promise<string> {
+  try {
+    const entry = recordChange({ tool, path: p, cwd: ctx.cwd, beforeText: before, afterText: after, note });
+    return `recorded in this session's change log — /diff to review, /revert to undo`;
+  } catch (err: any) {
+    return `WARNING: wrote the file but could not record it in the change log (${err?.message ?? err}) — /revert will not cover it`;
+  }
+}
+
 async function preWriteNote(p: string, content: string): Promise<{ ok: boolean; note: string }> {
   if (isProtectedFile(p)) return { ok: false, note: protectedError(p) };
+  if (isChangeStorePath(p)) return { ok: false, note: changeStoreError(p) };
   if (isSelfFile(p)) {
     const before = (await fileExists(p)) ? await fileText(p) : "";
     return { ok: true, note: auditSelfEdit("write_file", p, before, content, `wrote ${content.length} bytes`) };
@@ -158,9 +181,12 @@ registerTool({
     const content = String(args.content ?? "");
     const guard = await preWriteNote(p, content);
     if (!guard.ok) return guard.note;
+    // Capture the pre-image before the write lands; after this point it is gone.
+    const before = (await fileExists(p)) ? await fileText(p) : null;
     mkdirSync(dirname(p), { recursive: true });
     await writeFileAsync(p, content, "utf8");
-    return `Wrote ${content.length} bytes to ${p}${guard.note ? "\n" + guard.note : ""}`;
+    const trail = await logChange("write_file", p, ctx, before, content, before === null ? "created" : `overwrote ${before.length} bytes`);
+    return `Wrote ${content.length} bytes to ${p}\n${trail}${guard.note ? "\n" + guard.note : ""}`;
   },
 });
 
@@ -194,6 +220,7 @@ registerTool({
     const replaceAll = Boolean(args.replaceAll);
     if (!(await fileExists(p))) return `ERROR: file not found: ${p}`;
     if (isProtectedFile(p)) return protectedError(p);
+    if (isChangeStorePath(p)) return changeStoreError(p);
     const text = await fileText(p);
     if (!oldString) return `ERROR: oldString cannot be empty`;
     const count = text.split(oldString).length - 1;
@@ -210,6 +237,7 @@ registerTool({
     const note = isSelfFile(p)
       ? auditSelfEdit("edit_file", p, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`)
       : "";
-    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}${note ? "\n" + note : ""}`;
+    const trail = await logChange("edit_file", p, ctx, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`);
+    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}\n${trail}${note ? "\n" + note : ""}`;
   },
 });

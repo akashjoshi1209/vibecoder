@@ -27,12 +27,46 @@ export interface SpawnCollectResult {
   aborted: boolean;
 }
 
-/** Kill the whole process group (works because children are detached/group leaders). */
+/**
+ * Kill a spawned child and everything it started.
+ *
+ * The POSIX path kills the process group (children are spawned detached, so the
+ * child is a group leader and `-pid` reaches the whole tree).
+ *
+ * Windows has no process groups in that sense: `process.kill(-pid)` throws, the
+ * fallback `child.kill()` kills only the immediate child, and any grandchild it
+ * started survives. That is not cosmetic. `bash -lc "sleep 30"` dies, but
+ * `sleep` keeps the inherited stdout pipe open, so Node never emits `close` and
+ * the tool call does not return until the grandchild exits on its own — a
+ * 120s timeout that is not honoured, holding an agent step open for two minutes.
+ * This was the cause of the long-flaky `bash` suite: a different test failed on
+ * each run depending on which child happened to inherit the pipe.
+ *
+ * `taskkill /T` is the documented way to kill a Windows process tree.
+ */
 export function killProcessGroup(
   child: { pid?: number; kill: (signal?: NodeJS.Signals) => boolean },
   signal: NodeJS.Signals = "SIGKILL",
 ): void {
   if (child.pid === undefined || child.pid <= 0) return;
+  if (platform() === "win32") {
+    try {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      // taskkill reports a non-zero status when the pid is already gone; that is
+      // a success for our purposes. Still fall through to child.kill() as a
+      // belt-and-braces attempt.
+    } catch {
+      /* fall through */
+    }
+    try {
+      child.kill(signal);
+    } catch {
+      /* already gone */
+    }
+    return;
+  }
   try {
     process.kill(-child.pid, signal);
   } catch {
@@ -160,6 +194,13 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
         timedOut = true;
         opts.onTimeout?.();
         killProcessGroup(child);
+        // Return whatever we have now. `close` waits for the stdout/stderr pipes
+        // to close, and a surviving grandchild (Windows tree-kill failure, or a
+        // process that outlived SIGKILL) would hold them open for as long as it
+        // runs — so waiting for `close` is what let a 120s timeout stretch into
+        // minutes. The timeout is the contract; honour it whether or not the
+        // kernel cooperates.
+        settle(-1);
       }, opts.timeoutMs);
     }
 

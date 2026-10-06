@@ -33,6 +33,14 @@ export interface RootConfig {
   /** Optional per-session cost cap in USD. When set, the agent stops after the
    *  cumulative estimated cost exceeds this value. Default: undefined (no cap). */
   maxCostUsd?: number;
+    /** Max characters of shell output returned to the model per tool call.
+     *  Default 30000. Overlong output is trimmed from the middle, keeping the
+     *  head (first errors) and tail (summary). VIBECODER_MAX_OUTPUT overrides
+     *  this per-run. */
+    maxToolOutputChars?: number;
+    /** Max search results (grep/glob) returned per call. Default 50. Both tools
+     *  accept an `offset` so a truncated result set can be paged. */
+    maxSearchResults?: number;
   /** Plan mode: task turns investigate + produce a plan for human approval before executing. */
   planMode?: boolean;
   queue?: QueueConfig;

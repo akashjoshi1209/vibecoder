@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // src/daemon.ts
-import { mkdirSync as mkdirSync5, readFileSync as readFileSync6, writeFileSync as writeFileSync4, unlinkSync } from "node:fs";
-import { homedir as homedir6 } from "node:os";
-import { join as join9 } from "node:path";
+import { mkdirSync as mkdirSync6, readFileSync as readFileSync7, writeFileSync as writeFileSync5, unlinkSync as unlinkSync2 } from "node:fs";
+import { homedir as homedir7 } from "node:os";
+import { join as join10 } from "node:path";
 
 // src/llm/types.ts
 class ContextTooLargeError extends Error {
@@ -424,6 +424,7 @@ class OpenAICompatibleProvider {
     const toolCalls = [];
     let finishReason = null;
     let reasoning = "";
+    let usage;
     const processLine = (line) => {
       if (!line.startsWith("data:"))
         return;
@@ -438,6 +439,15 @@ class OpenAICompatibleProvider {
       }
       const delta = json.choices?.[0]?.delta;
       finishReason = json.choices?.[0]?.finish_reason ?? finishReason;
+      const u = json.usage;
+      if (u) {
+        usage = {
+          promptTokens: u.prompt_tokens ?? usage?.promptTokens,
+          completionTokens: u.completion_tokens ?? usage?.completionTokens,
+          reasoningTokens: u.completion_tokens_details?.reasoning_tokens ?? u.prompt_tokens_details?.cached_tokens ?? usage?.reasoningTokens
+        };
+        onChunk({ content: "", usage });
+      }
       if (!delta)
         return;
       if (delta.content) {
@@ -486,7 +496,7 @@ class OpenAICompatibleProvider {
     const rest = buffer.trim();
     if (rest)
       processLine(rest);
-    return { text, toolCalls, finishReason, reasoning: reasoning || undefined };
+    return { text, toolCalls, finishReason, reasoning: reasoning || undefined, usage };
   }
 }
 
@@ -549,7 +559,8 @@ var FALLBACK_CONFIG = {
     filesystem: "full",
     exposeSecrets: false
   },
-  maxCostUsd: undefined
+  maxCostUsd: undefined,
+  maxToolOutputChars: 30000
 };
 function userConfigFile() {
   const sessionDir = process.env.VIBECODER_SESSION_DIR;
@@ -662,6 +673,12 @@ function validateConfig(cfg) {
       }
     }
   }
+  if (o.maxToolOutputChars !== undefined) {
+    const n = Number(o.maxToolOutputChars);
+    if (!Number.isFinite(n) || n < 2000) {
+      errors.push("config.maxToolOutputChars must be a number >= 2000");
+    }
+  }
   return errors;
 }
 function deepMerge(base, override) {
@@ -728,7 +745,7 @@ function createProvider(config, providerName) {
 // src/env.ts
 import { existsSync as existsSync3, readFileSync as readFileSync3 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname2, join as join3 } from "node:path";
+import { dirname as dirname2, join as join3, resolve } from "node:path";
 var loaded = new Set;
 function envLine(line) {
   const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
@@ -738,6 +755,7 @@ function envLine(line) {
   if (!key)
     return null;
   let value = m[2];
+  value = value.replace(/\r$/, "");
   value = value.replace(/^"|"$/g, "").replace(/^'|'$/g, "");
   return [key, value];
 }
@@ -745,22 +763,28 @@ function loadDotEnv() {
   if (process.env.VIBECODER_NO_DOTENV === "1")
     return;
   const candidates = [
+    process.env.VIBECODER_ENV_FILE,
+    join3(process.cwd(), ".env"),
     join3(packageRoot(), ".env"),
     join3(dirname2(packageRoot()), ".env"),
     join3(homedir2(), ".vibecoder", ".env")
-  ];
-  for (const file of candidates) {
+  ].filter((f) => !!f);
+  const seen = new Set;
+  for (const raw of candidates) {
+    const file = resolve(raw);
+    if (seen.has(file))
+      continue;
+    seen.add(file);
     if (loaded.has(file))
       continue;
     loaded.add(file);
     if (!existsSync3(file))
       continue;
     const text = readFileSync3(file, "utf8");
-    for (const raw of text.split(`
-`)) {
-      if (!raw.trim() || raw.trim().startsWith("#"))
+    for (const rawLine of text.split(/\r?\n/)) {
+      if (!rawLine.trim() || rawLine.trim().startsWith("#"))
         continue;
-      const kv = envLine(raw);
+      const kv = envLine(rawLine);
       if (!kv)
         continue;
       const [key, value] = kv;
@@ -802,16 +826,49 @@ var HEAVY_RULES = [
 ];
 var CHAT_RULES = [RE_CHAT_GREETING, RE_CHAT_SOCIAL, RE_CHAT_ACK, RE_CHAT_META, RE_CHAT_FACTUAL];
 function classifyMessage(text) {
+  return classifyMessageWhy(text).intent;
+}
+function classifyMessageWhy(text) {
   const t = (text ?? "").trim();
   if (!t)
-    return "chat";
-  if (HEAVY_RULES.some((re) => re.test(t)))
-    return "heavy";
-  if (CHAT_RULES.some((re) => re.test(t)))
-    return "chat";
-  if (t.length > 300)
-    return "heavy";
-  return "ambiguous";
+    return { intent: "chat", reason: "empty message" };
+  for (const re of HEAVY_RULES) {
+    const m = re.exec(t);
+    if (m)
+      return { intent: "heavy", reason: `matched /${ruleLabel(re)}/ on "${truncate(m[0])}"` };
+  }
+  for (const re of CHAT_RULES) {
+    const m = re.exec(t);
+    if (m)
+      return { intent: "chat", reason: `matched /${ruleLabel(re)}/ on "${truncate(m[0])}"` };
+  }
+  if (t.length > 300) {
+    return { intent: "heavy", reason: `long message (${t.length} chars > 300)` };
+  }
+  return { intent: "ambiguous", reason: "no rule matched" };
+}
+function truncate(s) {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length > 40 ? one.slice(0, 40) + "…" : one;
+}
+var RULE_NAMES = {
+  [RE_HEAVY_FENCE.source]: "code fence",
+  [RE_HEAVY_IDIOM.source]: "code idiom",
+  [RE_HEAVY_FILE.source]: "filename",
+  [RE_HEAVY_COMMAND.source]: "task verb",
+  [RE_HEAVY_CREATE.source]: "create-a-thing",
+  [RE_HEAVY_BUG.source]: "bug/error words",
+  [RE_HEAVY_ANALYSIS.source]: "analysis words",
+  [RE_HEAVY_LANG_TASK.source]: "language + task",
+  [RE_HEAVY_RUN.source]: "cli invocation",
+  [RE_CHAT_GREETING.source]: "greeting",
+  [RE_CHAT_SOCIAL.source]: "social",
+  [RE_CHAT_ACK.source]: "acknowledgement",
+  [RE_CHAT_META.source]: "meta about the assistant",
+  [RE_CHAT_FACTUAL.source]: "short factual"
+};
+function ruleLabel(re) {
+  return RULE_NAMES[re.source] ?? re.source.slice(0, 24);
 }
 
 class ModelRouter {
@@ -1020,6 +1077,29 @@ function createConnectivityPoller(opts, onChange) {
   };
 }
 
+// src/tools/approval.ts
+class ApprovalRequiredError extends Error {
+  tool;
+  reason;
+  args;
+  constructor(tool, reason, args = {}) {
+    super(`approval required: ${tool} — ${reason}`);
+    this.name = "ApprovalRequiredError";
+    this.tool = tool;
+    this.reason = reason;
+    this.args = args;
+  }
+}
+function isApprovalRequired(err) {
+  return err instanceof ApprovalRequiredError || typeof err === "object" && err !== null && err.name === "ApprovalRequiredError" && typeof err.reason === "string";
+}
+function rejectedMessage(tool, reason) {
+  return `BLOCKED: the human declined to run ${tool} (${reason}). ` + `Do not retry this action or find a workaround for it. ` + `Either pick a different approach that avoids it, or finish and tell the user ` + `what you needed and why.`;
+}
+function noPrompterMessage(tool, reason) {
+  return `BLOCKED: ${tool} needs approval (${reason}) but no approver is attached to this run. ` + `Unattended runs cannot ask. Either run with destructive:"allow" in config.json, ` + `or set destructive:"deny" so this fails fast and loudly rather than looking approved.`;
+}
+
 // src/tools/registry.ts
 var registry = new Map;
 function registerTool(tool) {
@@ -1041,8 +1121,13 @@ async function executeTool(name, args, ctx) {
   try {
     return await tool.run(args, ctx);
   } catch (err) {
+    if (isApprovalRequired(err))
+      throw err;
     return `ERROR: ${err?.message ?? String(err)}`;
   }
+}
+function needsApproval(ctx) {
+  return ctx.permissions?.destructive === "ask";
 }
 
 // src/agent/tool-call.ts
@@ -1239,6 +1324,30 @@ async function paceWait(pacer, tokens, signal) {
 }
 
 // src/agent/loop.ts
+async function invokeWithApproval(call, toolCtx, callbacks) {
+  const name = call.name;
+  try {
+    return await executeTool(name, call.args, toolCtx);
+  } catch (err) {
+    if (!isApprovalRequired(err)) {
+      const msg = err && typeof err === "object" && "message" in err ? String(err.message) : String(err);
+      return `ERROR: ${msg}`;
+    }
+    if (!callbacks.confirmTool)
+      return noPrompterMessage(name, err.reason);
+    const ok = await callbacks.confirmTool(name, call.args, err.reason);
+    if (!ok)
+      return rejectedMessage(name, err.reason);
+    try {
+      return await executeTool(name, call.args, toolCtx);
+    } catch (retryErr) {
+      if (isApprovalRequired(retryErr))
+        return noPrompterMessage(name, retryErr.reason);
+      const msg = retryErr && typeof retryErr === "object" && "message" in retryErr ? String(retryErr.message) : String(retryErr);
+      return `ERROR: ${msg}`;
+    }
+  }
+}
 async function runAgent(options, callbacks = {}) {
   const maxSteps = callbacks.maxSteps ?? 40;
   const messages = [{ role: "system", content: options.systemPrompt }, ...options.initialMessages];
@@ -1257,11 +1366,35 @@ async function runAgent(options, callbacks = {}) {
   const MAX_CONSECUTIVE_FAILURES = 3;
   let consecutiveFailures = 0;
   const stepSummaries = [];
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let reasoningTokens = 0;
+  let sawUsage = false;
+  const usageOrUndefined = () => sawUsage ? { promptTokens, completionTokens, reasoningTokens } : undefined;
+  const costCap = options.maxCostUsd;
+  const rates = options.costRates;
+  const spentUsd = () => rates ? (promptTokens * rates.input + completionTokens * rates.output + reasoningTokens * (rates.reasoning ?? rates.output)) / 1e6 : 0;
   for (let step = 0;step < maxSteps; step++) {
+    if (costCap !== undefined && rates && sawUsage && spentUsd() >= costCap) {
+      const spent = spentUsd();
+      const msg = `(stopped at the cost cap: ~$${spent.toFixed(4)} of the configured $${costCap.toFixed(2)}. ` + `The work so far is on disk — /diff shows what changed. Raise maxCostUsd in config.json, ` + `or split the task. This is an estimate from token counts, so treat it as close, not exact.)`;
+      callbacks.onModelText?.(`
+${msg}
+`);
+      callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "cost_cap" });
+      return {
+        finalText: msg,
+        toolCalls,
+        steps: step,
+        aborted: false,
+        usage: usageOrUndefined(),
+        costCapHit: { limitUsd: costCap, spentUsd: spent }
+      };
+    }
     if (options.signal?.aborted) {
       callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
       return { finalText: `
-[interrupted]`, toolCalls, steps: step, aborted: true };
+[interrupted]`, toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
     }
     callbacks.onStepUpdate?.(step + 1, toolCalls, maxSteps);
     let result = null;
@@ -1297,6 +1430,12 @@ async function runAgent(options, callbacks = {}) {
           if (pacer)
             pacer.record(estimateRequestTokens());
           stepOk = true;
+          if (result.usage) {
+            sawUsage = true;
+            promptTokens += result.usage.promptTokens ?? 0;
+            completionTokens += result.usage.completionTokens ?? 0;
+            reasoningTokens += result.usage.reasoningTokens ?? 0;
+          }
           break;
         } catch (err) {
           if (err instanceof ContextTooLargeError && retryBudgetDelta === 0) {
@@ -1306,7 +1445,7 @@ async function runAgent(options, callbacks = {}) {
           if (options.signal?.aborted || err?.name === "AbortError") {
             callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
             return { finalText: `
-[interrupted]`, toolCalls, steps: step, aborted: true };
+[interrupted]`, toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
           }
           break;
         }
@@ -1329,7 +1468,8 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
           finalText: finalMsg,
           toolCalls,
           steps: step,
-          aborted: false
+          aborted: false,
+          usage: usageOrUndefined()
         };
       }
       continue;
@@ -1342,7 +1482,7 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
     }
     if (result.toolCalls.length === 0) {
       callbacks.onDone?.(result);
-      return { finalText: result.text, toolCalls, steps: step + 1, aborted: false };
+      return { finalText: result.text, toolCalls, steps: step + 1, aborted: false, usage: usageOrUndefined() };
     }
     const normalizedCalls = normalizeToolCalls(result.toolCalls, step + 1);
     const assistantMsg = {
@@ -1373,20 +1513,17 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
           output: ""
         };
       }
-      callbacks.onToolStart?.(call.name, call.args);
+      const name = call.name;
+      callbacks.onToolStart?.(name, call.args);
       let output;
       let approved = true;
       if (callbacks.confirmTool) {
-        approved = await callbacks.confirmTool(call.name, call.args);
+        approved = await callbacks.confirmTool(name, call.args);
       }
       if (!approved) {
-        output = "(tool call rejected by user — inform the user and adjust your approach)";
+        output = rejectedMessage(name, "you declined it at the approval prompt");
       } else {
-        try {
-          output = await executeTool(call.name, call.args, options.toolCtx);
-        } catch (err) {
-          output = `ERROR: ${err?.message ?? String(err)}`;
-        }
+        output = await invokeWithApproval(call, options.toolCtx, callbacks);
       }
       callbacks.onToolEnd?.(call.name, output);
       return {
@@ -1395,8 +1532,9 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
         output
       };
     };
+    const approvalMayFire = needsApproval(options.toolCtx);
     let results;
-    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool) {
+    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool && !approvalMayFire) {
       toolCalls += parallelCalls.length;
       for (const call of parallelCalls) {
         callbacks.onToolStart?.(call.name, call.args);
@@ -1418,7 +1556,10 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
       const noNameResults = await Promise.all(parsed.filter((c) => !c.name).map((call) => runOne(call)));
       results = [...noNameResults, ...results];
     } else {
-      results = await Promise.all(parsed.map((call) => runOne(call)));
+      results = [];
+      for (const call of parsed) {
+        results.push(await runOne(call));
+      }
     }
     for (const r of results) {
       messages.push(r.message);
@@ -1444,7 +1585,7 @@ ${stepSummaries.length} step(s) ran, ${toolCalls} tool call(s). Try a more focus
 ${maxMsg}
 `);
   callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "max_steps" });
-  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false };
+  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false, usage: usageOrUndefined() };
 }
 
 // src/queue.ts
@@ -1639,6 +1780,17 @@ import { platform } from "node:os";
 function killProcessGroup(child, signal = "SIGKILL") {
   if (child.pid === undefined || child.pid <= 0)
     return;
+  if (platform() === "win32") {
+    try {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        stdio: ["ignore", "ignore", "ignore"]
+      });
+    } catch {}
+    try {
+      child.kill(signal);
+    } catch {}
+    return;
+  }
   try {
     process.kill(-child.pid, signal);
   } catch {
@@ -1746,6 +1898,7 @@ function spawnCollect(opts) {
         timedOut = true;
         opts.onTimeout?.();
         killProcessGroup(child);
+        settle(-1);
       }, opts.timeoutMs);
     }
     const onAbort = () => {
@@ -1765,7 +1918,7 @@ function spawnCollect(opts) {
 }
 
 // src/permissions.ts
-import { isAbsolute, join as join5, resolve, dirname as dirname4, basename } from "node:path";
+import { isAbsolute, join as join5, resolve as resolve2, dirname as dirname4, basename } from "node:path";
 import { realpathSync } from "node:fs";
 import { homedir as homedir4 } from "node:os";
 function resolvePermissions(config, workspaceRoot) {
@@ -2211,24 +2364,20 @@ function parseCommands(command, depth = 0) {
   }
   return out;
 }
-function checkDestructiveCommand(command, perms) {
-  if (perms.destructive === "allow")
-    return null;
+function destructiveReason(command) {
   for (const cmd of parseCommands(command)) {
     const reason = destructiveReasonFor(cmd);
-    if (reason) {
-      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): ${reason}` : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
-    }
+    if (reason)
+      return reason;
     if (/(^|[^0-9<>])>{1,2}|\d>&/.test(cmd.raw)) {
       const target = cmd.raw.match(/>{1,2}\s*"?([^\s"';|&]+)"?/);
       const t = target?.[1] ?? "";
       const isScratch = t === "/dev/null" || t === "/dev/stdout" || t === "NUL" || t.startsWith("/tmp/") || t.startsWith("/var/tmp/") || t.startsWith("C:/Windows/Temp/") || t.startsWith("C:\\Windows\\Temp\\");
       if (!isScratch)
-        return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): output redirection (may overwrite files)` : `PENDING (${perms.destructive}): output redirection (may overwrite files) — awaiting approval`;
+        return "output redirection (may overwrite files)";
     }
-    if (commandName(cmd.argv[0] ?? "") === "tee") {
-      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): tee writes to a file` : `PENDING (${perms.destructive}): tee writes to a file — awaiting approval`;
-    }
+    if (commandName(cmd.argv[0] ?? "") === "tee")
+      return "tee writes to a file";
   }
   return null;
 }
@@ -2265,7 +2414,7 @@ function resolvePath(p) {
   }
   if (!isAbsolute(expanded))
     expanded = join5(process.cwd(), expanded);
-  return realPath(resolve(expanded));
+  return realPath(resolve2(expanded));
 }
 function realPath(abs) {
   const tail = [];
@@ -2301,8 +2450,35 @@ function filterEnv(env, perms) {
   return out;
 }
 
+// src/runtime.ts
+var _config = null;
+function numberSetting(key, fallback, min = 0) {
+  const v = _config?.[key];
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n) || n < min)
+    return fallback;
+  return n;
+}
+
 // src/tools/bash.ts
-var MAX_OUTPUT = 30000;
+function resolveMaxOutput() {
+  const fromEnv = Number(process.env.VIBECODER_MAX_OUTPUT);
+  if (Number.isFinite(fromEnv) && fromEnv >= 2000)
+    return Math.floor(fromEnv);
+  return numberSetting("maxToolOutputChars", 30000, 2000);
+}
+function capOutput(output, max) {
+  if (output.length <= max)
+    return output;
+  const headLen = Math.max(2000, Math.floor(max * 0.3));
+  const tailLen = Math.max(2000, max - headLen - 160);
+  const head = output.slice(0, headLen);
+  const tail = output.slice(output.length - tailLen);
+  const dropped = output.length - headLen - tailLen;
+  return `${head}
+` + `[... ${dropped} characters omitted from the middle — this output was ${output.length} chars, ` + `the cap is ${max}. Raise it with VIBECODER_MAX_OUTPUT=<n> or config.json maxToolOutputChars, ` + `or re-run narrowed to what you need. ...]
+` + `${tail}`;
+}
 var PLAN_MODE_BANNED = {
   rm: "file/directory-destroying command",
   rmdir: "directory removal",
@@ -2480,12 +2656,14 @@ registerTool({
       }
     }
     if (permissions) {
-      const destructiveCheck = checkDestructiveCommand(command, permissions);
-      if (destructiveCheck) {
-        if (destructiveCheck.startsWith("BLOCKED")) {
-          return destructiveCheck;
+      if (permissions.destructive !== "allow") {
+        const reason = destructiveReason(command);
+        if (reason) {
+          if (permissions.destructive === "deny") {
+            return `BLOCKED (deny): ${reason}`;
+          }
+          throw new ApprovalRequiredError("bash", reason, args);
         }
-        return destructiveCheck;
       }
       const networkCheck = checkNetworkCommand(command, permissions);
       if (networkCheck) {
@@ -2530,11 +2708,9 @@ registerTool({
 ` : "") + "[killed: interrupted]";
     if (!output)
       output = "(no output)";
-    if (output.length > MAX_OUTPUT) {
-      const keep = MAX_OUTPUT - 200;
-      const trimmed = output.length - keep;
-      output = `...[trimmed ${trimmed} chars from beginning]
-` + output.slice(output.length - keep);
+    const limit = resolveMaxOutput();
+    if (output.length > limit) {
+      output = capOutput(output, limit);
     }
     return output;
   }
@@ -2542,7 +2718,7 @@ registerTool({
 
 // src/tools/fs-utils.ts
 import * as path from "path";
-function resolve3(p, ctx) {
+function resolve4(p, ctx) {
   if (path.isAbsolute(p))
     return path.resolve(p);
   return path.resolve(ctx.cwd, p);
@@ -2551,27 +2727,27 @@ function pathDenied(p, ctx) {
   const perms = ctx.permissions;
   if (!perms)
     return null;
-  const abs = resolve3(p, ctx);
+  const abs = resolve4(p, ctx);
   if (isPathAllowed(abs, perms))
     return null;
   return `BLOCKED: ${abs} is outside the allowed workspace (${perms.workspaceRoot}). Set permissions.filesystem to "full" to allow it.`;
 }
 
 // src/tools/files.ts
-import { dirname as dirname6, join as join7 } from "node:path";
-import { mkdirSync as mkdirSync4, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
+import { dirname as dirname7, join as join8 } from "node:path";
+import { mkdirSync as mkdirSync5, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
 import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
 
 // src/self-edit.ts
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync as existsSync6, mkdirSync as mkdirSync3, readFileSync as readFileSync5, appendFileSync, readdirSync, writeFileSync as writeFileSync3 } from "node:fs";
 import { homedir as homedir5 } from "node:os";
-import { join as join6, resolve as resolve4, dirname as dirname5 } from "node:path";
+import { join as join6, resolve as resolve5, dirname as dirname5 } from "node:path";
 var LEDGER_NAME = "SELF_EDITS.jsonl";
 function repoRoot() {
   const env = process.env.VIBECODER_REPO_ROOT;
   if (env)
-    return resolve4(env);
+    return resolve5(env);
   return dirname5(packageRoot());
 }
 function installMode() {
@@ -2606,17 +2782,17 @@ function backupsDir() {
   return join6(userDataRoot(), "backups");
 }
 function isSameFile(a, b) {
-  return resolve4(a) === resolve4(b);
+  return resolve5(a) === resolve5(b);
 }
 function reposWhere() {
   if (process.env.VIBECODER_REPO_ROOT) {
-    const root = resolve4(process.env.VIBECODER_REPO_ROOT);
+    const root = resolve5(process.env.VIBECODER_REPO_ROOT);
     return { root, config: join6(root, "config.json"), env: join6(root, ".env") };
   }
   return null;
 }
 function isSelfFile(abs) {
-  const a = resolve4(abs);
+  const a = resolve5(abs);
   const repo = reposWhere();
   if (repo && (isSameFile(a, repo.config) || isSameFile(a, repo.env)))
     return true;
@@ -2661,6 +2837,99 @@ function auditSelfEdit(toolName, abs, beforeText, afterText, note) {
   return `SELF-EDIT recorded to ${LEDGER_NAME} (file ${display}): staged, not live. Tell the human it needs /reload-config to go live, or /undo-self-edits to revert.`;
 }
 
+// src/changelog.ts
+import { createHash as createHash2 } from "node:crypto";
+import {
+  appendFileSync as appendFileSync2,
+  copyFileSync as copyFileSync2,
+  existsSync as existsSync7,
+  mkdirSync as mkdirSync4,
+  readFileSync as readFileSync6,
+  rmSync as rmSync2,
+  unlinkSync,
+  writeFileSync as writeFileSync4
+} from "node:fs";
+import { homedir as homedir6 } from "node:os";
+import { dirname as dirname6, isAbsolute as isAbsolute3, join as join7, relative, resolve as resolve6, sep } from "node:path";
+var CHANGE_LOG_NAME = "changes.jsonl";
+var UNDO_DIR_NAME = "undo";
+var MAX_UNDO_BYTES = 512 * 1024;
+function dataRoot() {
+  const env = process.env.VIBECODER_SESSION_DIR;
+  return env || join7(homedir6(), ".vibecoder");
+}
+function changeLogPath() {
+  return join7(dataRoot(), CHANGE_LOG_NAME);
+}
+function undoDir() {
+  return join7(dataRoot(), UNDO_DIR_NAME);
+}
+function isChangeStorePath(abs) {
+  const a = resolve6(abs);
+  if (a === resolve6(changeLogPath()))
+    return true;
+  const dir = resolve6(undoDir());
+  return a === dir || a.startsWith(dir + sep);
+}
+function shaOf2(text) {
+  return createHash2("sha256").update(text).digest("hex");
+}
+var currentSession = "";
+function recordChange(params) {
+  const abs = resolve6(params.path);
+  const existed = params.beforeText !== null;
+  const entry = {
+    ts: new Date().toISOString(),
+    sessionId: currentSession,
+    tool: params.tool,
+    path: abs,
+    rel: displayPath(abs, params.cwd),
+    beforeSha: params.beforeText === null ? "" : shaOf2(params.beforeText),
+    afterSha: shaOf2(params.afterText),
+    existedBefore: existed,
+    undoFile: null,
+    beforeBytes: params.beforeText === null ? 0 : Buffer.byteLength(params.beforeText),
+    afterBytes: Buffer.byteLength(params.afterText),
+    note: params.note ?? ""
+  };
+  if (existed && params.beforeText !== null) {
+    const bytes = Buffer.byteLength(params.beforeText);
+    if (bytes <= MAX_UNDO_BYTES) {
+      const name = `${entry.beforeSha.slice(0, 16)}.bak`;
+      const dest = join7(undoDir(), name);
+      try {
+        mkdirSync4(undoDir(), { recursive: true });
+        const tmp = `${dest}.${process.pid}.tmp`;
+        writeFileSync4(tmp, params.beforeText, "utf8");
+        copyFileSync2(tmp, dest);
+        try {
+          unlinkSync(tmp);
+        } catch {}
+        entry.undoFile = name;
+      } catch {
+        entry.undoFile = null;
+      }
+    }
+  }
+  append(changeLogPath(), entry);
+  return entry;
+}
+function append(file, record) {
+  try {
+    mkdirSync4(dirname6(file), { recursive: true });
+    appendFileSync2(file, JSON.stringify(record) + `
+`, "utf8");
+  } catch {}
+}
+function displayPath(abs, cwd) {
+  try {
+    const rel = relative(resolve6(cwd), abs);
+    if (rel && !rel.startsWith("..") && !isAbsolute3(rel))
+      return rel.replace(/\\/g, "/");
+  } catch {}
+  return abs;
+}
+
 // src/tools/files.ts
 async function fileText(p) {
   try {
@@ -2680,9 +2949,22 @@ async function fileExists(p) {
 function protectedError(p) {
   return `ERROR: SELF-EDIT PROTECTED — ${p} is the append-only audit ledger. It cannot be modified or deleted; self-edits are recorded there automatically.`;
 }
+function changeStoreError(p) {
+  return `ERROR: AUDIT TRAIL PROTECTED — ${p} is the change log or its undo store. The agent cannot rewrite its own record of what it changed; that would make /diff and /revert worthless.`;
+}
+async function logChange(tool, p, ctx, before, after, note) {
+  try {
+    const entry = recordChange({ tool, path: p, cwd: ctx.cwd, beforeText: before, afterText: after, note });
+    return `recorded in this session's change log — /diff to review, /revert to undo`;
+  } catch (err) {
+    return `WARNING: wrote the file but could not record it in the change log (${err?.message ?? err}) — /revert will not cover it`;
+  }
+}
 async function preWriteNote(p, content) {
   if (isProtectedFile(p))
     return { ok: false, note: protectedError(p) };
+  if (isChangeStorePath(p))
+    return { ok: false, note: changeStoreError(p) };
   if (isSelfFile(p)) {
     const before = await fileExists(p) ? await fileText(p) : "";
     return { ok: true, note: auditSelfEdit("write_file", p, before, content, `wrote ${content.length} bytes`) };
@@ -2712,7 +2994,7 @@ registerTool({
     }
   },
   async run(args, ctx) {
-    const p = args.path ? resolve3(String(args.path), ctx) : ctx.cwd;
+    const p = args.path ? resolve4(String(args.path), ctx) : ctx.cwd;
     const denied = pathDenied(p, ctx);
     if (denied)
       return denied;
@@ -2733,7 +3015,7 @@ registerTool({
       } else if (e.isFile()) {
         let size = "";
         try {
-          const st = statSync2(join7(p, e.name));
+          const st = statSync2(join8(p, e.name));
           size = formatSize(st.size);
         } catch {
           size = "?";
@@ -2765,7 +3047,7 @@ registerTool({
     }
   },
   async run(args, ctx) {
-    const p = resolve3(String(args.path), ctx);
+    const p = resolve4(String(args.path), ctx);
     const denied = pathDenied(p, ctx);
     if (denied)
       return denied;
@@ -2807,7 +3089,7 @@ registerTool({
   async run(args, ctx) {
     if (ctx.planPhase)
       return `BLOCKED IN PLAN MODE: write_file is disabled while investigating. Record what you would write in your PLAN (FILES: ...) instead; the human approves before any file is touched.`;
-    const p = resolve3(String(args.path), ctx);
+    const p = resolve4(String(args.path), ctx);
     const denied = pathDenied(p, ctx);
     if (denied)
       return denied;
@@ -2815,9 +3097,12 @@ registerTool({
     const guard = await preWriteNote(p, content);
     if (!guard.ok)
       return guard.note;
-    mkdirSync4(dirname6(p), { recursive: true });
+    const before = await fileExists(p) ? await fileText(p) : null;
+    mkdirSync5(dirname7(p), { recursive: true });
     await writeFileAsync(p, content, "utf8");
-    return `Wrote ${content.length} bytes to ${p}${guard.note ? `
+    const trail = await logChange("write_file", p, ctx, before, content, before === null ? "created" : `overwrote ${before.length} bytes`);
+    return `Wrote ${content.length} bytes to ${p}
+${trail}${guard.note ? `
 ` + guard.note : ""}`;
   }
 });
@@ -2842,7 +3127,7 @@ registerTool({
   async run(args, ctx) {
     if (ctx.planPhase)
       return `BLOCKED IN PLAN MODE: edit_file is disabled while investigating. Describe the exact change in your PLAN instead; the human approves before any file is touched.`;
-    const p = resolve3(String(args.path), ctx);
+    const p = resolve4(String(args.path), ctx);
     const denied = pathDenied(p, ctx);
     if (denied)
       return denied;
@@ -2853,6 +3138,8 @@ registerTool({
       return `ERROR: file not found: ${p}`;
     if (isProtectedFile(p))
       return protectedError(p);
+    if (isChangeStorePath(p))
+      return changeStoreError(p);
     const text = await fileText(p);
     if (!oldString)
       return `ERROR: oldString cannot be empty`;
@@ -2870,7 +3157,9 @@ registerTool({
     await writeFileAsync(p, updated, "utf8");
     const replaced = replaceAll ? count : 1;
     const note = isSelfFile(p) ? auditSelfEdit("edit_file", p, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`) : "";
-    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}${note ? `
+    const trail = await logChange("edit_file", p, ctx, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`);
+    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}
+${trail}${note ? `
 ` + note : ""}`;
   }
 });
@@ -2878,7 +3167,7 @@ registerTool({
 // src/tools/glob.ts
 import { opendir } from "node:fs/promises";
 import { access } from "node:fs/promises";
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 var EXCLUDE_DEFAULTS = ["node_modules", ".git"];
 function segmentToRegExp(seg) {
   let re = "^";
@@ -2956,7 +3245,7 @@ async function globScan(pattern, opts) {
           if (exclusions.has(e.name))
             continue;
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          const childAbs = join8(dir, e.name);
+          const childAbs = join9(dir, e.name);
           if (e.isDirectory()) {
             await recurse(remaining, childAbs, childRel);
           } else if (!onlyFiles || e.isFile()) {
@@ -2977,7 +3266,7 @@ async function globScan(pattern, opts) {
           break;
         if (e.isDirectory() && !exclusions.has(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining, join8(dir, e.name), childRel);
+          await recurse(remaining, join9(dir, e.name), childRel);
         }
       }
       return;
@@ -3015,7 +3304,7 @@ async function globScan(pattern, opts) {
           continue;
         if (rx.test(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining.slice(1), join8(dir, e.name), childRel);
+          await recurse(remaining.slice(1), join9(dir, e.name), childRel);
         }
       }
     }
@@ -3028,17 +3317,22 @@ async function globScan(pattern, opts) {
 var MAX_RESULTS = 50;
 var MAX_SCANNED = 2000;
 var DEFAULT_TIMEOUT_MS = 60000;
+function pageSize() {
+  return numberSetting("maxSearchResults", MAX_RESULTS, 1);
+}
 registerTool({
   definition: {
     type: "function",
     function: {
       name: "glob",
-      description: "List files matching a glob pattern (e.g. **/*.ts, src/**). Returns matching file paths.",
+      description: "List files matching a glob pattern (e.g. **/*.ts, src/**). Returns matching file paths, sorted. Results are paged: when more than `limit` match, the output says so and gives the `offset` to pass for the next page.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string", description: "Glob pattern to search" },
-          cwd: { type: "string", description: "Directory to search in (optional, defaults to workspace)" }
+          cwd: { type: "string", description: "Directory to search in (optional, defaults to workspace)" },
+          limit: { type: "number", description: `Max results to return (optional, default ${MAX_RESULTS})` },
+          offset: { type: "number", description: "Skip this many matches before returning results (optional, default 0). Use it to page through a truncated result set." }
         },
         required: ["pattern"]
       }
@@ -3050,21 +3344,30 @@ registerTool({
     const denied = pathDenied(dir, ctx);
     if (denied)
       return denied;
-    const matches = [];
+    const limit = Math.max(1, Number(args.limit ?? pageSize()) || pageSize());
+    const offset = Math.max(0, Number(args.offset ?? 0) || 0);
+    let matches;
     try {
-      const found = await globScan(pattern, { cwd: dir, onlyFiles: true, maxResults: MAX_SCANNED });
-      matches.push(...found);
+      matches = await globScan(pattern, { cwd: dir, onlyFiles: true, maxResults: MAX_SCANNED });
     } catch (err) {
       return `ERROR: glob failed: ${err?.message ?? String(err)}`;
     }
-    const list = matches.slice(0, MAX_RESULTS);
-    let out = list.sort().join(`
+    matches.sort();
+    const total = matches.length;
+    const sliced = matches.slice(offset, offset + limit);
+    if (!sliced.length) {
+      return total === 0 ? "(no matches)" : `(no matches at offset ${offset}; ${total} total match${total === 1 ? "" : "es"} — you paged past the end)`;
+    }
+    let out = sliced.join(`
 `);
-    if (list.length === 0)
-      out = "(no matches)";
-    else if (matches.length > MAX_RESULTS)
+    const next = offset + sliced.length;
+    if (next < total) {
       out += `
-...(${matches.length - MAX_RESULTS} more)`;
+[${next} of ${total} matches shown — pass offset: ${next} for the next page]`;
+    } else {
+      out += `
+[${total} match${total === 1 ? "" : "es"} total]`;
+    }
     return out;
   }
 });
@@ -3073,14 +3376,16 @@ registerTool({
     type: "function",
     function: {
       name: "grep",
-      description: "Search file contents with a regex. Returns file paths and line numbers of matches.",
+      description: "Search file contents with a regex. Returns file paths and line numbers of matches. Results are paged: when more than `limit` match, the output says so and gives the `offset` to pass for the next page. Narrow the pattern or `include` glob instead of paging when you can.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string", description: "Regex pattern to search for" },
           include: { type: "string", description: "File glob to filter (e.g. *.ts) (optional)" },
           path: { type: "string", description: "Directory to search (optional, defaults to workspace)" },
-          timeout: { type: "number", description: "Timeout in milliseconds (optional, default 60000)" }
+          timeout: { type: "number", description: "Timeout in milliseconds (optional, default 60000)" },
+          limit: { type: "number", description: `Max results to return (optional, default ${MAX_RESULTS})` },
+          offset: { type: "number", description: "Skip this many matches before returning results (optional, default 0). Use it to page through a truncated result set." }
         },
         required: ["pattern"]
       }
@@ -3094,6 +3399,8 @@ registerTool({
       return denied;
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
+    const limit = Math.max(1, Number(args.limit ?? pageSize()) || pageSize());
+    const offset = Math.max(0, Number(args.offset ?? 0) || 0);
     const res = await spawnCollect({
       cmd: [
         "grep",
@@ -3113,23 +3420,31 @@ registerTool({
     });
     const lines = res.stdout.split(`
 `).filter(Boolean);
-    const shown = lines.slice(0, MAX_RESULTS);
-    let result = shown.join(`
-`);
-    if (res.timedOut)
-      result += `
-[killed: timed out after ${timeout} ms]`;
-    else if (res.aborted)
-      result += `
+    const total = lines.length;
+    const sliced = lines.slice(offset, offset + limit);
+    if (res.timedOut) {
+      return sliced.join(`
+`) + `
+[killed: timed out after ${timeout} ms — this is a partial result set, not the whole match list]`;
+    }
+    if (res.aborted)
+      return sliced.join(`
+`) + `
 [aborted]`;
-    if (res.exitCode !== 0 && !lines.length)
-      result += res.stderr.trim() ? `ERROR: ${res.stderr.trim()}` : "";
-    if (!lines.length)
-      result = result.trim() || "(no matches)";
-    else if (lines.length > MAX_RESULTS)
-      result += `
-...(${lines.length - MAX_RESULTS} more)`;
-    return result;
+    if (total === 0) {
+      const err = res.stderr.trim();
+      return err ? `ERROR: ${err}` : "(no matches)";
+    }
+    if (!sliced.length) {
+      return `(no matches at offset ${offset}; ${total} total match${total === 1 ? "" : "es"} — you paged past the end)`;
+    }
+    let out = sliced.join(`
+`);
+    const next = offset + sliced.length;
+    out += next < total ? `
+[${next} of ${total} matches shown — pass offset: ${next} for the next page, or narrow the pattern]` : `
+[${total} match${total === 1 ? "" : "es"} total]`;
+    return out;
   }
 });
 
@@ -3332,15 +3647,15 @@ async function drainQueue(deps, signal) {
 // src/daemon.ts
 function expandHome2(p) {
   if (p === "~")
-    return homedir6();
+    return homedir7();
   if (p.startsWith("~/"))
-    return join9(homedir6(), p.slice(2));
+    return join10(homedir7(), p.slice(2));
   return p;
 }
-var PID_FILE = join9(homedir6(), ".vibecoder", "queue-daemon.pid");
+var PID_FILE = join10(homedir7(), ".vibecoder", "queue-daemon.pid");
 function readPid() {
   try {
-    const s = readFileSync6(PID_FILE, "utf8").trim();
+    const s = readFileSync7(PID_FILE, "utf8").trim();
     const pid = Number(s);
     return Number.isFinite(pid) ? pid : null;
   } catch {
@@ -3348,12 +3663,12 @@ function readPid() {
   }
 }
 function writePid() {
-  mkdirSync5(join9(homedir6(), ".vibecoder"), { recursive: true });
-  writeFileSync4(PID_FILE, String(process.pid));
+  mkdirSync6(join10(homedir7(), ".vibecoder"), { recursive: true });
+  writeFileSync5(PID_FILE, String(process.pid));
 }
 function removePid() {
   try {
-    unlinkSync(PID_FILE);
+    unlinkSync2(PID_FILE);
   } catch {}
 }
 function alive(pid) {
@@ -3377,11 +3692,11 @@ function logger(logPath) {
   const ts = () => new Date().toISOString();
   if (!logPath)
     return (line) => console.log(`[${ts()}] ${line}`);
-  mkdirSync5(logPath.replace(/[/\\][^/\\]+$/, ""), { recursive: true });
+  mkdirSync6(logPath.replace(/[/\\][^/\\]+$/, ""), { recursive: true });
   return (line) => {
     const text = `[${ts()}] ${line}
 `;
-    writeFileSync4(logPath, text, { flag: "a" });
+    writeFileSync5(logPath, text, { flag: "a" });
   };
 }
 async function main() {
@@ -3403,7 +3718,7 @@ async function main() {
     process.exit(1);
   });
   const rawLogFile = cfg.queue?.daemonLog;
-  const logFile = rawLogFile ? expandHome2(rawLogFile) : join9(homedir6(), ".vibecoder", "queue-daemon.log");
+  const logFile = rawLogFile ? expandHome2(rawLogFile) : join10(homedir7(), ".vibecoder", "queue-daemon.log");
   setQueueFileOverride(cfg.queue?.file);
   const onLog = logger(logFile);
   const onLogToConsole = (line) => {
@@ -3463,7 +3778,7 @@ function cmdStatus() {
   }
   let queued = 0;
   try {
-    const tasks = JSON.parse(readFileSync6(queueFile(), "utf8"));
+    const tasks = JSON.parse(readFileSync7(queueFile(), "utf8"));
     queued = tasks.filter((t) => t.status === "queued" || t.status === "running").length;
   } catch {}
   console.log(`[queue] daemon running (pid ${pid}) — ${queued} queued/running task(s)`);

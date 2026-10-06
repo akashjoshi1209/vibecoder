@@ -19,6 +19,25 @@ export interface ChatChunk {
   tool_calls?: Partial<ToolCall>[];
   finish_reason?: string | null;
   reasoning?: string;
+  /** Token accounting, when the provider sends it. Streaming APIs usually
+   *  deliver it only in the final chunk, so it appears once per turn. */
+  usage?: TokenUsage;
+}
+
+/**
+ * Token counts for one provider response.
+ *
+ * Field names follow the OpenAI-compatible shape, which is also what the
+ * Anthropic provider maps onto it. Optional because several providers omit
+ * usage on streamed responses unless explicitly asked, and a missing count must
+ * not break a turn — cost tracking degrades to an estimate, it does not fail.
+ */
+export interface TokenUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  /** Reasoning/thinking tokens, reported separately by several providers and
+   *  billed at their own rate on some of them. */
+  reasoningTokens?: number;
 }
 
 export interface ChatOptions {
@@ -56,6 +75,9 @@ export interface StreamResult {
   toolCalls: ToolCall[];
   finishReason: string | null;
   reasoning?: string;
+  /** Token usage for this response, if the provider reported it. Absent means
+   *  "unknown", not "zero" — cost tracking must not treat it as free. */
+  usage?: TokenUsage;
 }
 
 export interface LLMProvider {

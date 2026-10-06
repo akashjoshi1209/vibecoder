@@ -1,4 +1,4 @@
-import { ContextTooLargeError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig } from "../types";
+import { ContextTooLargeError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig, type TokenUsage } from "../types";
 import { withTimeout, LLMTimeoutError, type TimeoutSpec } from "../timeout";
 import { isTransientRateLimit, parseRetryAfter, sleepAbortable } from "../retry";
 
@@ -101,6 +101,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const toolCalls: ToolCall[] = [];
     let finishReason: string | null = null;
     let reasoning = "";
+    let usage: TokenUsage | undefined;
 
     const processLine = (line: string) => {
       if (!line.startsWith("data:")) return;
@@ -114,6 +115,21 @@ export class OpenAICompatibleProvider implements LLMProvider {
       }
       const delta = json.choices?.[0]?.delta;
       finishReason = json.choices?.[0]?.finish_reason ?? finishReason;
+      // Usage normally rides along on the final chunk. It was being read off the
+      // SSE object and dropped on the floor, which is the whole reason cost
+      // tracking had nothing to track: every turn looked like it cost nothing.
+      const u = json.usage;
+      if (u) {
+        usage = {
+          promptTokens: u.prompt_tokens ?? usage?.promptTokens,
+          completionTokens: u.completion_tokens ?? usage?.completionTokens,
+          reasoningTokens:
+            u.completion_tokens_details?.reasoning_tokens ??
+            u.prompt_tokens_details?.cached_tokens ??
+            usage?.reasoningTokens,
+        };
+        onChunk({ content: "", usage });
+      }
       if (!delta) return;
 
       if (delta.content) {
@@ -159,6 +175,6 @@ export class OpenAICompatibleProvider implements LLMProvider {
     const rest = buffer.trim();
     if (rest) processLine(rest);
 
-    return { text, toolCalls, finishReason, reasoning: reasoning || undefined };
+    return { text, toolCalls, finishReason, reasoning: reasoning || undefined, usage };
   }
 }

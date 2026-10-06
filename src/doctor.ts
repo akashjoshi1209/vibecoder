@@ -7,6 +7,9 @@ import { installMode, ledgerPath } from "./self-edit";
 import { readPackageJson } from "./paths";
 import { ollamaBinary, ollamaIsUp, ollamaModels, ollamaBaseUrl } from "./ollama";
 import { createProvider } from "./llm/client";
+import { resolvePermissions } from "./permissions";
+import { changeLogPath } from "./changelog";
+import { indexPath } from "./checkpoint";
 
 function maskKey(v?: string): string {
   if (!v) return "not set";
@@ -125,7 +128,34 @@ export async function runDoctor(): Promise<number> {
   say(`  sessions:  ~/.vibecoder/sessions/  (saved conversations)`);
   say(`  queue:     ~/.vibecoder/queue.json (offline task queue)`);
   say(`  ledger:    ${ledgerPath()}`);
+  say(`  changes:   ${changeLogPath()}  (every file the agent writes, with pre-images)`);
+  say(`  checkpoints: ${indexPath()}  (restore points for /restore)`);
   say(`  user env:  ~/.vibecoder/.env      (optional API keys, e.g. GROQ_API_KEY=...)`);
+
+  // ── effective permission model ──────────────────────────────────────────────
+  // This check had been missing. `permissions` in config.json used to be
+  // unreadable from doctor, so there was no way to confirm what the agent was
+  // actually allowed to do without starting a session and running /permissions.
+  // Reporting the *resolved* numbers here — not the raw config — matters because
+  // the guards read the resolved model, which depends on the workspace root and
+  // the CLI overrides. doctor and the live session therefore cannot disagree.
+  const resolvedPerms = resolvePermissions(cfg, process.cwd());
+  out.push("");
+  say(`permissions (in force for ${process.cwd()})`);
+  say(
+    `  destructive: ${resolvedPerms.destructive}` +
+      (resolvedPerms.destructive === "deny"
+        ? "  (rm, git reset, redirects and friends are refused)"
+        : resolvedPerms.destructive === "ask"
+          ? "  (you are prompted for each one)"
+          : "  (unrestricted — rm and force-push run with no confirmation)"),
+  );
+  say(`  network:     ${resolvedPerms.network}`);
+  say(`  filesystem:  ${resolvedPerms.filesystem}`);
+  say(`  secrets:     ${resolvedPerms.exposeSecrets ? "EXPOSED to child processes" : "withheld from child processes"}`);
+  if (resolvedPerms.destructive === "allow" && resolvedPerms.filesystem === "full") {
+    say(`  note:        permissive defaults. --sandbox, or "permissions" in config.json, tightens this.`);
+  }
 
   // ── verdict ─────────────────────────────────────────────────────────────────
   const userCfgExists = existsSync(userConfigFile());

@@ -14,7 +14,19 @@ function ctx(): ToolContext {
 }
 
 afterAll(() => {
-  for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+  for (const d of tmpDirs) {
+    // Windows holds a handle briefly after a child exits, so rmSync can throw
+    // EBUSY. A leftover temp directory is harmless; failing the suite over one
+    // hides real regressions, so retry briefly and then give up quietly.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+        break;
+      } catch {
+        /* still locked; try again */
+      }
+    }
+  }
   tmpDirs = [];
 });
 

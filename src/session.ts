@@ -13,12 +13,40 @@ export interface SessionMeta {
   messageCount: number;
 }
 
+/**
+ * A turn that ended without finishing its task.
+ *
+ * The gap this closes: `--resume` used to replay the conversation and nothing
+ * more. The model came back into a transcript ending mid-`edit_file` — a tool
+ * result it never saw, or a "I'll now run the tests" with no test output — and
+ * had to infer from prose whether the work had landed. On a 40-step task that is
+ * guesswork, and the usual outcome is either duplicated edits or a false claim
+ * that the work is done.
+ *
+ * So the reason a turn stopped is recorded alongside the transcript, and
+ * `/resume` says it out loud.
+ */
+export interface PendingTask {
+  /** The user message that started the unfinished work. */
+  request: string;
+  /** Why the turn ended. */
+  reason: "max_steps" | "aborted" | "error" | "cost_cap" | "interrupted";
+  /** Tool calls made during the turn — a proxy for how far it got. */
+  toolCalls: number;
+  /** Checkpoint id taken at the start of this turn, if one was auto-taken. */
+  checkpointId?: string;
+  at: number;
+}
+
 export interface SessionData extends SessionMeta {
   cwd: string;
   systemPrompt: string;
   messages: Message[];
   routerMode?: "auto" | "chat" | "heavy";
   planMode?: boolean;
+  /** Set while a turn is in flight and at most one, so an interrupted run is
+   *  visibly unfinished. Cleared when a turn completes normally. */
+  pending?: PendingTask;
 }
 
 let _root: string | null = null;

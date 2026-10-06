@@ -60,6 +60,11 @@ export const FALLBACK_CONFIG: RootConfig = {
   /** Optional per-session cost cap in USD. When set, the agent stops after the
    *  cumulative estimated cost exceeds this value. Default: undefined (no cap). */
   maxCostUsd: undefined,
+  /** Max characters of shell output returned to the model per call (default 30000).
+   *  Overlong output is trimmed from the middle, keeping the head (first errors)
+   *  and tail (summary). Raise this for monorepo builds and full test runs.
+   *  VIBECODER_MAX_OUTPUT overrides it per-run. */
+  maxToolOutputChars: 30000,
 };
 
 export function userConfigFile(): string {
@@ -177,6 +182,12 @@ export function validateConfig(cfg: unknown): string[] {
       if (p.exposeSecrets !== undefined && typeof p.exposeSecrets !== "boolean") {
         errors.push("config.permissions.exposeSecrets must be true or false");
       }
+    }
+  }
+  if (o.maxToolOutputChars !== undefined) {
+    const n = Number(o.maxToolOutputChars);
+    if (!Number.isFinite(n) || n < 2000) {
+      errors.push("config.maxToolOutputChars must be a number >= 2000");
     }
   }
   return errors;

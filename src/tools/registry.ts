@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "../llm/types";
+import { isApprovalRequired } from "./approval";
 
 export interface ToolContext {
   cwd: string;
@@ -45,6 +46,17 @@ export async function executeTool(name: string, args: Record<string, unknown>, c
   try {
     return await tool.run(args, ctx);
   } catch (err: any) {
+    // An approval request is control flow, not an error to flatten into a
+    // string. Swallowing it here is exactly what made permissions.destructive
+    // "ask" a silent no-op — the loop never saw a request, so nothing prompted.
+    if (isApprovalRequired(err)) throw err;
     return `ERROR: ${err?.message ?? String(err)}`;
   }
+}
+
+/** True when the active permission model may require a human decision mid-run.
+ *  The agent loop uses this to avoid fanning tool calls out in parallel, since
+ *  approvals have to be asked one at a time. */
+export function needsApproval(ctx: ToolContext): boolean {
+  return ctx.permissions?.destructive === "ask";
 }

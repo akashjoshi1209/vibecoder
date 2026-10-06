@@ -90,12 +90,62 @@ const CHAT_RULES: RegExp[] = [RE_CHAT_GREETING, RE_CHAT_SOCIAL, RE_CHAT_ACK, RE_
  * is ambiguous (handled by the cheap-model fallback when strategy is "hybrid").
  */
 export function classifyMessage(text: string): Classification {
+  return classifyMessageWhy(text).intent;
+}
+
+/**
+ * The classifier plus the reason for its verdict.
+ *
+ * Worth having because the rules are blunt and a misroute is otherwise
+ * undiagnosable: RE_HEAVY_FILE matches any mention of `config.json` or `README`,
+ * so "what does config.json mean" is classified heavy, and RE_HEAVY_COMMAND
+ * matches the bare word "fix" inside "how do I fix my formatting". With only the
+ * verdict, a user staring at the wrong model has nothing to look at; naming the
+ * rule that fired turns that into a one-line answer.
+ */
+export function classifyMessageWhy(text: string): { intent: Classification; reason: string } {
   const t = (text ?? "").trim();
-  if (!t) return "chat";
-  if (HEAVY_RULES.some((re) => re.test(t))) return "heavy";
-  if (CHAT_RULES.some((re) => re.test(t))) return "chat";
-  if (t.length > 300) return "heavy";
-  return "ambiguous";
+  if (!t) return { intent: "chat", reason: "empty message" };
+
+  for (const re of HEAVY_RULES) {
+    const m = re.exec(t);
+    if (m) return { intent: "heavy", reason: `matched /${ruleLabel(re)}/ on "${truncate(m[0])}"` };
+  }
+  for (const re of CHAT_RULES) {
+    const m = re.exec(t);
+    if (m) return { intent: "chat", reason: `matched /${ruleLabel(re)}/ on "${truncate(m[0])}"` };
+  }
+  if (t.length > 300) {
+    return { intent: "heavy", reason: `long message (${t.length} chars > 300)` };
+  }
+  return { intent: "ambiguous", reason: "no rule matched" };
+}
+
+function truncate(s: string): string {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length > 40 ? one.slice(0, 40) + "…" : one;
+}
+
+/** Stable short name for a rule, so reasons can be read without the source. */
+const RULE_NAMES: Record<string, string> = {
+  [RE_HEAVY_FENCE.source]: "code fence",
+  [RE_HEAVY_IDIOM.source]: "code idiom",
+  [RE_HEAVY_FILE.source]: "filename",
+  [RE_HEAVY_COMMAND.source]: "task verb",
+  [RE_HEAVY_CREATE.source]: "create-a-thing",
+  [RE_HEAVY_BUG.source]: "bug/error words",
+  [RE_HEAVY_ANALYSIS.source]: "analysis words",
+  [RE_HEAVY_LANG_TASK.source]: "language + task",
+  [RE_HEAVY_RUN.source]: "cli invocation",
+  [RE_CHAT_GREETING.source]: "greeting",
+  [RE_CHAT_SOCIAL.source]: "social",
+  [RE_CHAT_ACK.source]: "acknowledgement",
+  [RE_CHAT_META.source]: "meta about the assistant",
+  [RE_CHAT_FACTUAL.source]: "short factual",
+};
+
+function ruleLabel(re: RegExp): string {
+  return RULE_NAMES[re.source] ?? re.source.slice(0, 24);
 }
 
 // --- Router -----------------------------------------------------------------

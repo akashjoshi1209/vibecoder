@@ -1,5 +1,10 @@
 import { ContextTooLargeError, type ChatOptions, type Message, type StreamResult, type ToolCall } from "../llm/types";
-import { listTools, executeTool, type ToolContext } from "../tools/registry";
+import { listTools, executeTool, needsApproval, type ToolContext } from "../tools/registry";
+import {
+  isApprovalRequired,
+  noPrompterMessage,
+  rejectedMessage,
+} from "../tools/approval";
 import { normalizeToolCalls, parseToolCalls, type ParsedToolCall } from "./tool-call";
 import { estimateTokens, estimateMessagesTokens, trimMessages, type TrimResult } from "../llm/tokens";
 import { RatePacer, paceWait } from "../llm/pace";
@@ -10,7 +15,11 @@ export interface AgentCallbacks {
   onToolStart?: (name: string, args: Record<string, unknown>) => void;
   onToolEnd?: (name: string, result: string) => void;
   onDone?: (result: StreamResult) => void;
-  confirmTool?: (name: string, args: Record<string, unknown>) => Promise<boolean>;
+  /** Approval gate. `reason` is set when the request came from the permission
+   *  model (destructive: "ask") rather than from /approve being on — the UI
+   *  should prompt on a reason even when blanket approval is off, because the
+   *  user did explicitly ask to be consulted for destructive commands. */
+  confirmTool?: (name: string, args: Record<string, unknown>, reason?: string) => Promise<boolean>;
   maxSteps?: number;
   /** If trimmed, a short note is passed through this callback. */
   onTrimmed?: (trimmed: number, truncatedChars: number) => void;
@@ -25,6 +34,56 @@ export interface AgentResult {
   toolCalls: number;
   steps: number;
   aborted: boolean;
+  /** Tokens spent across every step of this turn. A 40-step turn makes 41
+   *  provider calls and costs accordingly, so this is the only figure worth
+   *  showing; per-step costs are not what anyone budgets against. Undefined
+   *  when the provider reported no usage at all. */
+  usage?: { promptTokens: number; completionTokens: number; reasoningTokens: number };
+  /** Set when the turn stopped because maxCostUsd was reached. */
+  costCapHit?: { limitUsd: number; spentUsd: number };
+}
+
+/**
+ * Run one tool call, handling a mid-run approval request.
+ *
+ * A tool in `permissions.destructive: "ask"` mode throws ApprovalRequiredError
+ * instead of executing. That is control flow, not failure, so it is handled
+ * here: ask the human, and re-run the same call if they say yes.
+ *
+ * The prompt is requested with a `reason`, which is how the UI knows to ask even
+ * when /approve is off. Without that, "ask" degenerates back into the silent
+ * no-op it was before.
+ */
+async function invokeWithApproval(
+  call: ParsedToolCall,
+  toolCtx: ToolContext,
+  callbacks: AgentCallbacks,
+): Promise<string> {
+  const name = call.name as string;
+  try {
+    return await executeTool(name, call.args, toolCtx);
+  } catch (err) {
+    if (!isApprovalRequired(err)) {
+      const msg = err && typeof err === "object" && "message" in err
+        ? String((err as Record<string, unknown>).message)
+        : String(err);
+      return `ERROR: ${msg}`;
+    }
+    if (!callbacks.confirmTool) return noPrompterMessage(name, err.reason);
+    const ok = await callbacks.confirmTool(name, call.args, err.reason);
+    if (!ok) return rejectedMessage(name, err.reason);
+    // Approved: re-run. A second request means the tool wants consent again
+    // (e.g. a command with two destructive parts); do not loop.
+    try {
+      return await executeTool(name, call.args, toolCtx);
+    } catch (retryErr) {
+      if (isApprovalRequired(retryErr)) return noPrompterMessage(name, retryErr.reason);
+      const msg = retryErr && typeof retryErr === "object" && "message" in retryErr
+        ? String((retryErr as Record<string, unknown>).message)
+        : String(retryErr);
+      return `ERROR: ${msg}`;
+    }
+  }
 }
 
 export async function runAgent(
@@ -42,6 +101,18 @@ export async function runAgent(
     /** Optional per-minute input-token cap (e.g. GROQ free-tier ITPM). When set,
      *  requests are paced (free sleep) so the rolling-minute estimate stays under it. */
     maxInputTokensPerMinute?: number;
+    /** Hard spend ceiling for this turn in USD.
+     *
+     * `maxCostUsd` in config.json was validated and documented but never read by
+     * anything: the loop had no cost accounting at all, so setting it to 5 and
+     * handing the agent a 40-step task produced no limit whatsoever. The cap is
+     * enforced here, between steps, because that is the only place a decision
+     * can still be made before the next provider call is billed. */
+    maxCostUsd?: number;
+    /** USD-per-million-token rates for the provider actually in use. Without
+     *  these the cap cannot be evaluated and is skipped — an unenforceable cap
+     *  that claims to be enforced is worse than none, so it reports why. */
+    costRates?: { input: number; output: number; reasoning?: number };
   },
   callbacks: AgentCallbacks = {},
 ): Promise<AgentResult> {
@@ -77,10 +148,49 @@ export async function runAgent(
   let consecutiveFailures = 0;
   const stepSummaries: string[] = [];
 
+  // Running token totals for the whole turn. Accumulated per successful step
+  // rather than read off the final result, because a 40-step turn bills 41
+  // provider calls and the last one alone says almost nothing about the cost.
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let reasoningTokens = 0;
+  let sawUsage = false;
+  const usageOrUndefined = () =>
+    sawUsage ? { promptTokens, completionTokens, reasoningTokens } : undefined;
+  const costCap = options.maxCostUsd;
+  const rates = options.costRates;
+  const spentUsd = () =>
+    rates
+      ? (promptTokens * rates.input +
+          completionTokens * rates.output +
+          reasoningTokens * (rates.reasoning ?? rates.output)) /
+        1_000_000
+      : 0;
+
   for (let step = 0; step < maxSteps; step++) {
+    // Cost cap, evaluated before the next provider call is billed. Checked at the
+    // top of the step rather than the bottom so a turn that overshoots stops
+    // without one further round trip.
+    if (costCap !== undefined && rates && sawUsage && spentUsd() >= costCap) {
+      const spent = spentUsd();
+      const msg =
+        `(stopped at the cost cap: ~$${spent.toFixed(4)} of the configured $${costCap.toFixed(2)}. ` +
+        `The work so far is on disk — /diff shows what changed. Raise maxCostUsd in config.json, ` +
+        `or split the task. This is an estimate from token counts, so treat it as close, not exact.)`;
+      callbacks.onModelText?.(`\n${msg}\n`);
+      callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "cost_cap" });
+      return {
+        finalText: msg,
+        toolCalls,
+        steps: step,
+        aborted: false,
+        usage: usageOrUndefined(),
+        costCapHit: { limitUsd: costCap, spentUsd: spent },
+      };
+    }
     if (options.signal?.aborted) {
       callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
-      return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true };
+      return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
     }
     callbacks.onStepUpdate?.(step + 1, toolCalls, maxSteps);
 
@@ -121,6 +231,15 @@ export async function runAgent(
           });
           if (pacer) pacer.record(estimateRequestTokens());
           stepOk = true;
+          // Fold this step's billing into the turn total. Providers that omit
+          // usage leave the counters alone and sawUsage stays false, so the
+          // caller can tell "unknown" from "free".
+          if (result.usage) {
+            sawUsage = true;
+            promptTokens += result.usage.promptTokens ?? 0;
+            completionTokens += result.usage.completionTokens ?? 0;
+            reasoningTokens += result.usage.reasoningTokens ?? 0;
+          }
           break; // success
         } catch (err: any) {
           if (err instanceof ContextTooLargeError && retryBudgetDelta === 0) {
@@ -129,7 +248,7 @@ export async function runAgent(
           }
           if (options.signal?.aborted || err?.name === "AbortError") {
             callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
-            return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true };
+            return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
           }
           // For transient errors, let the step-retry loop handle it.
           break; // will retry if attempts remain
@@ -155,6 +274,7 @@ export async function runAgent(
           toolCalls,
           steps: step,
           aborted: false,
+          usage: usageOrUndefined(),
         };
       }
       // Skip this step but continue the loop (transient glitch).
@@ -173,7 +293,7 @@ export async function runAgent(
     if (result.toolCalls.length === 0) {
       // No tool calls: conversation finished
       callbacks.onDone?.(result);
-      return { finalText: result.text, toolCalls, steps: step + 1, aborted: false };
+      return { finalText: result.text, toolCalls, steps: step + 1, aborted: false, usage: usageOrUndefined() };
     }
 
     // Normalize tool-call ids so the assistant message and its tool results
@@ -195,12 +315,13 @@ export async function runAgent(
     const parsed = parseToolCalls(normalizedCalls);
 
     // Run independent tool calls in parallel when there are 2+ and no abort
-    // pending. Sequential execution is kept when there is only one call or the
-    // user has asked to confirm tools one at a time (confirmTool may depend on
-    // prior tool results being visible, so we keep ordering there).
+    // pending. Sequential execution is kept when there is only one call, when
+    // the user has asked to confirm tools one at a time, or when the permission
+    // model may need to ask a human mid-run (confirmTool may depend on prior
+    // tool results being visible, and approvals must not interleave).
     const PARALLEL_THRESHOLD = 2;
     const parallelCalls = parsed.filter((c) => c.name);
-    const runOne = async (call: ParsedToolCall) => {
+    const runOne = async (call: ParsedToolCall): Promise<ToolResult> => {
       toolCalls++;
       if (!call.name) {
         const id = call.id || `call_${toolCalls}`;
@@ -216,20 +337,21 @@ export async function runAgent(
           output: "",
         };
       }
-      callbacks.onToolStart?.(call.name, call.args);
+      const name = call.name;
+      callbacks.onToolStart?.(name, call.args);
       let output: string;
       let approved = true;
+      // Interactive approval (/approve on) gates every call.
       if (callbacks.confirmTool) {
-        approved = await callbacks.confirmTool(call.name, call.args);
+        approved = await callbacks.confirmTool(name, call.args);
       }
       if (!approved) {
-        output = "(tool call rejected by user — inform the user and adjust your approach)";
+        // Same wording as a permission-model decline, for the same reason: the
+        // observed failure was a model that read a flat rejection and then went
+        // looking for another way to do the thing.
+        output = rejectedMessage(name, "you declined it at the approval prompt");
       } else {
-        try {
-          output = await executeTool(call.name, call.args, options.toolCtx);
-        } catch (err: any) {
-          output = `ERROR: ${err?.message ?? String(err)}`;
-        }
+        output = await invokeWithApproval(call, options.toolCtx, callbacks);
       }
       callbacks.onToolEnd?.(call.name, output);
       return {
@@ -239,11 +361,17 @@ export async function runAgent(
       };
     };
 
-    // runOne is async, so ReturnType is a Promise. Awaited unwraps it to the
-    // shape actually stored per result.
-    type ToolResult = Awaited<ReturnType<typeof runOne>>;
+    type ToolResult = {
+      call: ParsedToolCall;
+      message: Message;
+      output: string;
+    };
+
+    // Approval may arrive mid-run (permissions.destructive === "ask"), so it
+    // cannot be decided before the parallel fan-out.
+    const approvalMayFire = needsApproval(options.toolCtx);
     let results: ToolResult[];
-    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool) {
+    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool && !approvalMayFire) {
       // Parallel: fire all tool starts together, then collect results in order.
       toolCalls += parallelCalls.length;
       for (const call of parallelCalls) {
@@ -271,8 +399,14 @@ export async function runAgent(
       );
       results = [...noNameResults, ...results];
     } else {
-      // Sequential: preserve existing behaviour, including per-call confirmTool.
-      results = await Promise.all(parsed.map((call) => runOne(call)));
+      // Truly sequential. This used to be `Promise.all(parsed.map(runOne))`,
+      // which despite the comment ran every call concurrently — so with
+      // /approve on, or with destructive:"ask", several prompts could be
+      // interleaved and the answers could land against the wrong calls.
+      results = [];
+      for (const call of parsed) {
+        results.push(await runOne(call));
+      }
     }
 
     for (const r of results) {
@@ -300,5 +434,5 @@ export async function runAgent(
       : `(reached max steps without completion. ${toolCalls} tool call(s) were attempted.)`;
   callbacks.onModelText?.(`\n${maxMsg}\n`);
   callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "max_steps" });
-  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false };
+  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false, usage: usageOrUndefined() };
 }

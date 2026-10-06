@@ -39,6 +39,27 @@ function rateFor(provider: string, _model: string): { input: number; output: num
   return TOKEN_COSTS[provider] ?? { input: 0.00001, output: 0.00003 };
 }
 
+/**
+ * Per-million-token rates for a provider, for callers that need to price tokens
+ * themselves — the agent loop, which enforces maxCostUsd and so must be able to
+ * evaluate the cap between steps.
+ *
+ * The rate table is per-token above, so this scales by 1e6 to hand back the
+ * per-million form the loop multiplies against raw token counts.
+ */
+export function ratesPerMillion(
+  provider: string,
+  model: string,
+): { input: number; output: number; reasoning?: number } {
+  const r = rateFor(provider, model);
+  return { input: r.input * 1e6, output: r.output * 1e6, reasoning: r.reasoning };
+}
+
+/** True when a provider's pricing is known rather than the blanket fallback. */
+export function hasKnownRates(provider: string): boolean {
+  return provider in TOKEN_COSTS;
+}
+
 export function recordCost(params: {
   provider: string;
   model: string;

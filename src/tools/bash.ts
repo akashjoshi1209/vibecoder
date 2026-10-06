@@ -1,15 +1,60 @@
 import { registerTool, type ToolContext } from "./registry";
 import { spawnCollect } from "./proc";
 import {
-  checkDestructiveCommand,
+  destructiveReason,
   checkNetworkCommand,
   isPathAllowed,
   parseCommands,
   filterEnv,
   type Permissions,
 } from "../permissions";
+import { ApprovalRequiredError } from "./approval";
+import { numberSetting } from "../runtime";
 
-const MAX_OUTPUT = 30000;
+/**
+ * Hard cap on how much command output comes back to the model.
+ *
+ * Overridable because the right value depends entirely on the task: a monorepo
+ * `tsc` run or a full test suite needs far more than a one-line `git status`,
+ * and 30k silently amputated the interesting part. Env var first (per-run),
+ * then config.json (persistent), then this default.
+ */
+function resolveMaxOutput(): number {
+  const fromEnv = Number(process.env.VIBECODER_MAX_OUTPUT);
+  if (Number.isFinite(fromEnv) && fromEnv >= 2000) return Math.floor(fromEnv);
+  return numberSetting("maxToolOutputChars", 30_000, 2000);
+}
+
+/**
+ * Trim long output while keeping BOTH ends.
+ *
+ * The previous version kept only the tail, on the reasoning that errors and exit
+ * codes live at the end. That is true and it is not sufficient: the head of a
+ * `tsc` or `bun test` run is where the first error and the failing file list
+ * are, while the tail is just "12 passed, 88 failed". Dropping the head left the
+ * model with a summary and no diagnosis, and it had no way to ask for the rest.
+ *
+ * So we keep a head slice (first errors, file lists) and a longer tail (the
+ * summary), and say exactly how much was dropped from the middle so the model
+ * knows to re-run with a narrower filter rather than concluding the output was
+ * short.
+ */
+export function capOutput(output: string, max: number): string {
+  if (output.length <= max) return output;
+  // 30/70 head/tail: the head carries the first failure, the tail the summary.
+  const headLen = Math.max(2000, Math.floor(max * 0.3));
+  const tailLen = Math.max(2000, max - headLen - 160);
+  const head = output.slice(0, headLen);
+  const tail = output.slice(output.length - tailLen);
+  const dropped = output.length - headLen - tailLen;
+  return (
+    `${head}\n` +
+    `[... ${dropped} characters omitted from the middle — this output was ${output.length} chars, ` +
+    `the cap is ${max}. Raise it with VIBECODER_MAX_OUTPUT=<n> or config.json maxToolOutputChars, ` +
+    `or re-run narrowed to what you need. ...]\n` +
+    `${tail}`
+  );
+}
 
 /** Commands that mutate state, independent of permissions.destructive. Plan mode
  *  is a read-only *investigation* phase, so these are refused outright even when
@@ -201,18 +246,25 @@ registerTool({
 
     // ── permission checks ──────────────────────────────────────────────────────
     if (permissions) {
-      // 1. Destructive command check
-      const destructiveCheck = checkDestructiveCommand(command, permissions);
-      if (destructiveCheck) {
-        if (destructiveCheck.startsWith("BLOCKED")) {
-          return destructiveCheck;
+      // 1. Destructive command check.
+      //
+      // "deny" returns a refusal. "ask" throws ApprovalRequiredError so the
+      // agent loop can prompt a human and re-run on approval — previously this
+      // returned the string "PENDING ... awaiting approval" as the tool result,
+      // so nothing ever prompted and the model just saw a soft denial it would
+      // try to route around.
+      if (permissions.destructive !== "allow") {
+        const reason = destructiveReason(command);
+        if (reason) {
+          if (permissions.destructive === "deny") {
+            return `BLOCKED (deny): ${reason}`;
+          }
+          throw new ApprovalRequiredError("bash", reason, args);
         }
-        // "PENDING" — in ask mode, we can't prompt from a tool call.
-        // Treat as blocked unless the caller handles it (the loop can re-prompt).
-        return destructiveCheck;
       }
 
-      // 2. Network command check
+      // 2. Network command check. network has no "ask" state, so this is
+      //    allow-or-refuse only.
       const networkCheck = checkNetworkCommand(command, permissions);
       if (networkCheck) {
         return networkCheck;
@@ -255,11 +307,9 @@ registerTool({
     if (res.aborted) output += (output ? "\n" : "") + "[killed: interrupted]";
     if (!output) output = "(no output)";
 
-    if (output.length > MAX_OUTPUT) {
-      // Keep the tail where errors/exit codes live; trim the head (build logs).
-      const keep = MAX_OUTPUT - 200;
-      const trimmed = output.length - keep;
-      output = `...[trimmed ${trimmed} chars from beginning]\n` + output.slice(output.length - keep);
+    const limit = resolveMaxOutput();
+    if (output.length > limit) {
+      output = capOutput(output, limit);
     }
 
     return output;

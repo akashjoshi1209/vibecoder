@@ -419,6 +419,7 @@ class OpenAICompatibleProvider {
     const toolCalls = [];
     let finishReason = null;
     let reasoning = "";
+    let usage;
     const processLine = (line) => {
       if (!line.startsWith("data:"))
         return;
@@ -433,6 +434,15 @@ class OpenAICompatibleProvider {
       }
       const delta = json.choices?.[0]?.delta;
       finishReason = json.choices?.[0]?.finish_reason ?? finishReason;
+      const u = json.usage;
+      if (u) {
+        usage = {
+          promptTokens: u.prompt_tokens ?? usage?.promptTokens,
+          completionTokens: u.completion_tokens ?? usage?.completionTokens,
+          reasoningTokens: u.completion_tokens_details?.reasoning_tokens ?? u.prompt_tokens_details?.cached_tokens ?? usage?.reasoningTokens
+        };
+        onChunk({ content: "", usage });
+      }
       if (!delta)
         return;
       if (delta.content) {
@@ -481,7 +491,7 @@ class OpenAICompatibleProvider {
     const rest = buffer.trim();
     if (rest)
       processLine(rest);
-    return { text, toolCalls, finishReason, reasoning: reasoning || undefined };
+    return { text, toolCalls, finishReason, reasoning: reasoning || undefined, usage };
   }
 }
 
@@ -561,7 +571,8 @@ var FALLBACK_CONFIG = {
     filesystem: "full",
     exposeSecrets: false
   },
-  maxCostUsd: undefined
+  maxCostUsd: undefined,
+  maxToolOutputChars: 30000
 };
 function userConfigFile() {
   const sessionDir = process.env.VIBECODER_SESSION_DIR;
@@ -674,6 +685,12 @@ function validateConfig(cfg) {
       }
     }
   }
+  if (o.maxToolOutputChars !== undefined) {
+    const n = Number(o.maxToolOutputChars);
+    if (!Number.isFinite(n) || n < 2000) {
+      errors.push("config.maxToolOutputChars must be a number >= 2000");
+    }
+  }
   return errors;
 }
 function deepMerge(base, override) {
@@ -781,16 +798,49 @@ var HEAVY_RULES = [
 ];
 var CHAT_RULES = [RE_CHAT_GREETING, RE_CHAT_SOCIAL, RE_CHAT_ACK, RE_CHAT_META, RE_CHAT_FACTUAL];
 function classifyMessage(text) {
+  return classifyMessageWhy(text).intent;
+}
+function classifyMessageWhy(text) {
   const t = (text ?? "").trim();
   if (!t)
-    return "chat";
-  if (HEAVY_RULES.some((re) => re.test(t)))
-    return "heavy";
-  if (CHAT_RULES.some((re) => re.test(t)))
-    return "chat";
-  if (t.length > 300)
-    return "heavy";
-  return "ambiguous";
+    return { intent: "chat", reason: "empty message" };
+  for (const re of HEAVY_RULES) {
+    const m = re.exec(t);
+    if (m)
+      return { intent: "heavy", reason: `matched /${ruleLabel(re)}/ on "${truncate(m[0])}"` };
+  }
+  for (const re of CHAT_RULES) {
+    const m = re.exec(t);
+    if (m)
+      return { intent: "chat", reason: `matched /${ruleLabel(re)}/ on "${truncate(m[0])}"` };
+  }
+  if (t.length > 300) {
+    return { intent: "heavy", reason: `long message (${t.length} chars > 300)` };
+  }
+  return { intent: "ambiguous", reason: "no rule matched" };
+}
+function truncate(s) {
+  const one = s.replace(/\s+/g, " ").trim();
+  return one.length > 40 ? one.slice(0, 40) + "…" : one;
+}
+var RULE_NAMES = {
+  [RE_HEAVY_FENCE.source]: "code fence",
+  [RE_HEAVY_IDIOM.source]: "code idiom",
+  [RE_HEAVY_FILE.source]: "filename",
+  [RE_HEAVY_COMMAND.source]: "task verb",
+  [RE_HEAVY_CREATE.source]: "create-a-thing",
+  [RE_HEAVY_BUG.source]: "bug/error words",
+  [RE_HEAVY_ANALYSIS.source]: "analysis words",
+  [RE_HEAVY_LANG_TASK.source]: "language + task",
+  [RE_HEAVY_RUN.source]: "cli invocation",
+  [RE_CHAT_GREETING.source]: "greeting",
+  [RE_CHAT_SOCIAL.source]: "social",
+  [RE_CHAT_ACK.source]: "acknowledgement",
+  [RE_CHAT_META.source]: "meta about the assistant",
+  [RE_CHAT_FACTUAL.source]: "short factual"
+};
+function ruleLabel(re) {
+  return RULE_NAMES[re.source] ?? re.source.slice(0, 24);
 }
 
 class ModelRouter {
@@ -999,6 +1049,29 @@ function createConnectivityPoller(opts, onChange) {
   };
 }
 
+// src/tools/approval.ts
+class ApprovalRequiredError extends Error {
+  tool;
+  reason;
+  args;
+  constructor(tool, reason, args = {}) {
+    super(`approval required: ${tool} — ${reason}`);
+    this.name = "ApprovalRequiredError";
+    this.tool = tool;
+    this.reason = reason;
+    this.args = args;
+  }
+}
+function isApprovalRequired(err) {
+  return err instanceof ApprovalRequiredError || typeof err === "object" && err !== null && err.name === "ApprovalRequiredError" && typeof err.reason === "string";
+}
+function rejectedMessage(tool, reason) {
+  return `BLOCKED: the human declined to run ${tool} (${reason}). ` + `Do not retry this action or find a workaround for it. ` + `Either pick a different approach that avoids it, or finish and tell the user ` + `what you needed and why.`;
+}
+function noPrompterMessage(tool, reason) {
+  return `BLOCKED: ${tool} needs approval (${reason}) but no approver is attached to this run. ` + `Unattended runs cannot ask. Either run with destructive:"allow" in config.json, ` + `or set destructive:"deny" so this fails fast and loudly rather than looking approved.`;
+}
+
 // src/tools/registry.ts
 var registry = new Map;
 function registerTool(tool) {
@@ -1020,8 +1093,13 @@ async function executeTool(name, args, ctx) {
   try {
     return await tool.run(args, ctx);
   } catch (err) {
+    if (isApprovalRequired(err))
+      throw err;
     return `ERROR: ${err?.message ?? String(err)}`;
   }
+}
+function needsApproval(ctx) {
+  return ctx.permissions?.destructive === "ask";
 }
 
 // src/agent/tool-call.ts
@@ -1218,6 +1296,30 @@ async function paceWait(pacer, tokens, signal) {
 }
 
 // src/agent/loop.ts
+async function invokeWithApproval(call, toolCtx, callbacks) {
+  const name = call.name;
+  try {
+    return await executeTool(name, call.args, toolCtx);
+  } catch (err) {
+    if (!isApprovalRequired(err)) {
+      const msg = err && typeof err === "object" && "message" in err ? String(err.message) : String(err);
+      return `ERROR: ${msg}`;
+    }
+    if (!callbacks.confirmTool)
+      return noPrompterMessage(name, err.reason);
+    const ok = await callbacks.confirmTool(name, call.args, err.reason);
+    if (!ok)
+      return rejectedMessage(name, err.reason);
+    try {
+      return await executeTool(name, call.args, toolCtx);
+    } catch (retryErr) {
+      if (isApprovalRequired(retryErr))
+        return noPrompterMessage(name, retryErr.reason);
+      const msg = retryErr && typeof retryErr === "object" && "message" in retryErr ? String(retryErr.message) : String(retryErr);
+      return `ERROR: ${msg}`;
+    }
+  }
+}
 async function runAgent(options, callbacks = {}) {
   const maxSteps = callbacks.maxSteps ?? 40;
   const messages = [{ role: "system", content: options.systemPrompt }, ...options.initialMessages];
@@ -1236,11 +1338,35 @@ async function runAgent(options, callbacks = {}) {
   const MAX_CONSECUTIVE_FAILURES = 3;
   let consecutiveFailures = 0;
   const stepSummaries = [];
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let reasoningTokens = 0;
+  let sawUsage = false;
+  const usageOrUndefined = () => sawUsage ? { promptTokens, completionTokens, reasoningTokens } : undefined;
+  const costCap = options.maxCostUsd;
+  const rates = options.costRates;
+  const spentUsd = () => rates ? (promptTokens * rates.input + completionTokens * rates.output + reasoningTokens * (rates.reasoning ?? rates.output)) / 1e6 : 0;
   for (let step = 0;step < maxSteps; step++) {
+    if (costCap !== undefined && rates && sawUsage && spentUsd() >= costCap) {
+      const spent = spentUsd();
+      const msg = `(stopped at the cost cap: ~$${spent.toFixed(4)} of the configured $${costCap.toFixed(2)}. ` + `The work so far is on disk — /diff shows what changed. Raise maxCostUsd in config.json, ` + `or split the task. This is an estimate from token counts, so treat it as close, not exact.)`;
+      callbacks.onModelText?.(`
+${msg}
+`);
+      callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "cost_cap" });
+      return {
+        finalText: msg,
+        toolCalls,
+        steps: step,
+        aborted: false,
+        usage: usageOrUndefined(),
+        costCapHit: { limitUsd: costCap, spentUsd: spent }
+      };
+    }
     if (options.signal?.aborted) {
       callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
       return { finalText: `
-[interrupted]`, toolCalls, steps: step, aborted: true };
+[interrupted]`, toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
     }
     callbacks.onStepUpdate?.(step + 1, toolCalls, maxSteps);
     let result = null;
@@ -1276,6 +1402,12 @@ async function runAgent(options, callbacks = {}) {
           if (pacer)
             pacer.record(estimateRequestTokens());
           stepOk = true;
+          if (result.usage) {
+            sawUsage = true;
+            promptTokens += result.usage.promptTokens ?? 0;
+            completionTokens += result.usage.completionTokens ?? 0;
+            reasoningTokens += result.usage.reasoningTokens ?? 0;
+          }
           break;
         } catch (err) {
           if (err instanceof ContextTooLargeError && retryBudgetDelta === 0) {
@@ -1285,7 +1417,7 @@ async function runAgent(options, callbacks = {}) {
           if (options.signal?.aborted || err?.name === "AbortError") {
             callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
             return { finalText: `
-[interrupted]`, toolCalls, steps: step, aborted: true };
+[interrupted]`, toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
           }
           break;
         }
@@ -1308,7 +1440,8 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
           finalText: finalMsg,
           toolCalls,
           steps: step,
-          aborted: false
+          aborted: false,
+          usage: usageOrUndefined()
         };
       }
       continue;
@@ -1321,7 +1454,7 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
     }
     if (result.toolCalls.length === 0) {
       callbacks.onDone?.(result);
-      return { finalText: result.text, toolCalls, steps: step + 1, aborted: false };
+      return { finalText: result.text, toolCalls, steps: step + 1, aborted: false, usage: usageOrUndefined() };
     }
     const normalizedCalls = normalizeToolCalls(result.toolCalls, step + 1);
     const assistantMsg = {
@@ -1352,20 +1485,17 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
           output: ""
         };
       }
-      callbacks.onToolStart?.(call.name, call.args);
+      const name = call.name;
+      callbacks.onToolStart?.(name, call.args);
       let output;
       let approved = true;
       if (callbacks.confirmTool) {
-        approved = await callbacks.confirmTool(call.name, call.args);
+        approved = await callbacks.confirmTool(name, call.args);
       }
       if (!approved) {
-        output = "(tool call rejected by user — inform the user and adjust your approach)";
+        output = rejectedMessage(name, "you declined it at the approval prompt");
       } else {
-        try {
-          output = await executeTool(call.name, call.args, options.toolCtx);
-        } catch (err) {
-          output = `ERROR: ${err?.message ?? String(err)}`;
-        }
+        output = await invokeWithApproval(call, options.toolCtx, callbacks);
       }
       callbacks.onToolEnd?.(call.name, output);
       return {
@@ -1374,8 +1504,9 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
         output
       };
     };
+    const approvalMayFire = needsApproval(options.toolCtx);
     let results;
-    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool) {
+    if (parallelCalls.length >= PARALLEL_THRESHOLD && !callbacks.confirmTool && !approvalMayFire) {
       toolCalls += parallelCalls.length;
       for (const call of parallelCalls) {
         callbacks.onToolStart?.(call.name, call.args);
@@ -1397,7 +1528,10 @@ Last steps: ${stepSummaries.slice(-3).join("; ")}` : "";
       const noNameResults = await Promise.all(parsed.filter((c) => !c.name).map((call) => runOne(call)));
       results = [...noNameResults, ...results];
     } else {
-      results = await Promise.all(parsed.map((call) => runOne(call)));
+      results = [];
+      for (const call of parsed) {
+        results.push(await runOne(call));
+      }
     }
     for (const r of results) {
       messages.push(r.message);
@@ -1423,7 +1557,7 @@ ${stepSummaries.length} step(s) ran, ${toolCalls} tool call(s). Try a more focus
 ${maxMsg}
 `);
   callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "max_steps" });
-  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false };
+  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false, usage: usageOrUndefined() };
 }
 
 // src/queue.ts
@@ -1611,6 +1745,17 @@ import { platform } from "node:os";
 function killProcessGroup(child, signal = "SIGKILL") {
   if (child.pid === undefined || child.pid <= 0)
     return;
+  if (platform() === "win32") {
+    try {
+      spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        stdio: ["ignore", "ignore", "ignore"]
+      });
+    } catch {}
+    try {
+      child.kill(signal);
+    } catch {}
+    return;
+  }
   try {
     process.kill(-child.pid, signal);
   } catch {
@@ -1718,6 +1863,7 @@ function spawnCollect(opts) {
         timedOut = true;
         opts.onTimeout?.();
         killProcessGroup(child);
+        settle(-1);
       }, opts.timeoutMs);
     }
     const onAbort = () => {
@@ -2183,24 +2329,20 @@ function parseCommands(command, depth = 0) {
   }
   return out;
 }
-function checkDestructiveCommand(command, perms) {
-  if (perms.destructive === "allow")
-    return null;
+function destructiveReason(command) {
   for (const cmd of parseCommands(command)) {
     const reason = destructiveReasonFor(cmd);
-    if (reason) {
-      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): ${reason}` : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
-    }
+    if (reason)
+      return reason;
     if (/(^|[^0-9<>])>{1,2}|\d>&/.test(cmd.raw)) {
       const target = cmd.raw.match(/>{1,2}\s*"?([^\s"';|&]+)"?/);
       const t = target?.[1] ?? "";
       const isScratch = t === "/dev/null" || t === "/dev/stdout" || t === "NUL" || t.startsWith("/tmp/") || t.startsWith("/var/tmp/") || t.startsWith("C:/Windows/Temp/") || t.startsWith("C:\\Windows\\Temp\\");
       if (!isScratch)
-        return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): output redirection (may overwrite files)` : `PENDING (${perms.destructive}): output redirection (may overwrite files) — awaiting approval`;
+        return "output redirection (may overwrite files)";
     }
-    if (commandName(cmd.argv[0] ?? "") === "tee") {
-      return perms.destructive === "deny" ? `BLOCKED (${perms.destructive}): tee writes to a file` : `PENDING (${perms.destructive}): tee writes to a file — awaiting approval`;
-    }
+    if (commandName(cmd.argv[0] ?? "") === "tee")
+      return "tee writes to a file";
   }
   return null;
 }
@@ -2273,8 +2415,38 @@ function filterEnv(env, perms) {
   return out;
 }
 
+// src/runtime.ts
+var _config = null;
+function setRootConfig(cfg) {
+  _config = cfg;
+}
+function numberSetting(key, fallback, min = 0) {
+  const v = _config?.[key];
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n) || n < min)
+    return fallback;
+  return n;
+}
+
 // src/tools/bash.ts
-var MAX_OUTPUT = 30000;
+function resolveMaxOutput() {
+  const fromEnv = Number(process.env.VIBECODER_MAX_OUTPUT);
+  if (Number.isFinite(fromEnv) && fromEnv >= 2000)
+    return Math.floor(fromEnv);
+  return numberSetting("maxToolOutputChars", 30000, 2000);
+}
+function capOutput(output, max) {
+  if (output.length <= max)
+    return output;
+  const headLen = Math.max(2000, Math.floor(max * 0.3));
+  const tailLen = Math.max(2000, max - headLen - 160);
+  const head = output.slice(0, headLen);
+  const tail = output.slice(output.length - tailLen);
+  const dropped = output.length - headLen - tailLen;
+  return `${head}
+` + `[... ${dropped} characters omitted from the middle — this output was ${output.length} chars, ` + `the cap is ${max}. Raise it with VIBECODER_MAX_OUTPUT=<n> or config.json maxToolOutputChars, ` + `or re-run narrowed to what you need. ...]
+` + `${tail}`;
+}
 var PLAN_MODE_BANNED = {
   rm: "file/directory-destroying command",
   rmdir: "directory removal",
@@ -2452,12 +2624,14 @@ registerTool({
       }
     }
     if (permissions) {
-      const destructiveCheck = checkDestructiveCommand(command, permissions);
-      if (destructiveCheck) {
-        if (destructiveCheck.startsWith("BLOCKED")) {
-          return destructiveCheck;
+      if (permissions.destructive !== "allow") {
+        const reason = destructiveReason(command);
+        if (reason) {
+          if (permissions.destructive === "deny") {
+            return `BLOCKED (deny): ${reason}`;
+          }
+          throw new ApprovalRequiredError("bash", reason, args);
         }
-        return destructiveCheck;
       }
       const networkCheck = checkNetworkCommand(command, permissions);
       if (networkCheck) {
@@ -2502,11 +2676,9 @@ registerTool({
 ` : "") + "[killed: interrupted]";
     if (!output)
       output = "(no output)";
-    if (output.length > MAX_OUTPUT) {
-      const keep = MAX_OUTPUT - 200;
-      const trimmed = output.length - keep;
-      output = `...[trimmed ${trimmed} chars from beginning]
-` + output.slice(output.length - keep);
+    const limit = resolveMaxOutput();
+    if (output.length > limit) {
+      output = capOutput(output, limit);
     }
     return output;
   }
@@ -2530,8 +2702,8 @@ function pathDenied(p, ctx) {
 }
 
 // src/tools/files.ts
-import { dirname as dirname5, join as join6 } from "node:path";
-import { mkdirSync as mkdirSync4, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
+import { dirname as dirname6, join as join7 } from "node:path";
+import { mkdirSync as mkdirSync5, readdirSync as readdirSync2, statSync as statSync2 } from "node:fs";
 import { readFile as readFileAsync, writeFile as writeFileAsync } from "node:fs/promises";
 
 // src/self-edit.ts
@@ -2719,6 +2891,215 @@ function selfFileDiffStat() {
   return `config.json changed since last snapshot (${backup.split("/").pop()}) — ~${changed} line(s) differ`;
 }
 
+// src/changelog.ts
+import { createHash as createHash2 } from "node:crypto";
+import {
+  appendFileSync as appendFileSync2,
+  copyFileSync as copyFileSync2,
+  existsSync as existsSync6,
+  mkdirSync as mkdirSync4,
+  readFileSync as readFileSync5,
+  rmSync as rmSync2,
+  unlinkSync,
+  writeFileSync as writeFileSync4
+} from "node:fs";
+import { homedir as homedir5 } from "node:os";
+import { dirname as dirname5, isAbsolute as isAbsolute3, join as join6, relative, resolve as resolve5, sep } from "node:path";
+var CHANGE_LOG_NAME = "changes.jsonl";
+var UNDO_DIR_NAME = "undo";
+var MAX_UNDO_BYTES = 512 * 1024;
+function dataRoot() {
+  const env = process.env.VIBECODER_SESSION_DIR;
+  return env || join6(homedir5(), ".vibecoder");
+}
+function changeLogPath() {
+  return join6(dataRoot(), CHANGE_LOG_NAME);
+}
+function undoDir() {
+  return join6(dataRoot(), UNDO_DIR_NAME);
+}
+function isChangeStorePath(abs) {
+  const a = resolve5(abs);
+  if (a === resolve5(changeLogPath()))
+    return true;
+  const dir = resolve5(undoDir());
+  return a === dir || a.startsWith(dir + sep);
+}
+function shaOf2(text) {
+  return createHash2("sha256").update(text).digest("hex");
+}
+var currentSession = "";
+function setChangeSession(id) {
+  currentSession = id;
+}
+function recordChange(params) {
+  const abs = resolve5(params.path);
+  const existed = params.beforeText !== null;
+  const entry = {
+    ts: new Date().toISOString(),
+    sessionId: currentSession,
+    tool: params.tool,
+    path: abs,
+    rel: displayPath(abs, params.cwd),
+    beforeSha: params.beforeText === null ? "" : shaOf2(params.beforeText),
+    afterSha: shaOf2(params.afterText),
+    existedBefore: existed,
+    undoFile: null,
+    beforeBytes: params.beforeText === null ? 0 : Buffer.byteLength(params.beforeText),
+    afterBytes: Buffer.byteLength(params.afterText),
+    note: params.note ?? ""
+  };
+  if (existed && params.beforeText !== null) {
+    const bytes = Buffer.byteLength(params.beforeText);
+    if (bytes <= MAX_UNDO_BYTES) {
+      const name = `${entry.beforeSha.slice(0, 16)}.bak`;
+      const dest = join6(undoDir(), name);
+      try {
+        mkdirSync4(undoDir(), { recursive: true });
+        const tmp = `${dest}.${process.pid}.tmp`;
+        writeFileSync4(tmp, params.beforeText, "utf8");
+        copyFileSync2(tmp, dest);
+        try {
+          unlinkSync(tmp);
+        } catch {}
+        entry.undoFile = name;
+      } catch {
+        entry.undoFile = null;
+      }
+    }
+  }
+  append(changeLogPath(), entry);
+  return entry;
+}
+function recordNote(tool, note) {
+  append(changeLogPath(), {
+    ts: new Date().toISOString(),
+    sessionId: currentSession,
+    tool,
+    note
+  });
+}
+function append(file, record) {
+  try {
+    mkdirSync4(dirname5(file), { recursive: true });
+    appendFileSync2(file, JSON.stringify(record) + `
+`, "utf8");
+  } catch {}
+}
+function displayPath(abs, cwd) {
+  try {
+    const rel = relative(resolve5(cwd), abs);
+    if (rel && !rel.startsWith("..") && !isAbsolute3(rel))
+      return rel.replace(/\\/g, "/");
+  } catch {}
+  return abs;
+}
+function readChanges(sessionId) {
+  const file = changeLogPath();
+  if (!existsSync6(file))
+    return [];
+  let text;
+  try {
+    text = readFileSync5(file, "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of text.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    try {
+      const rec = JSON.parse(line);
+      if (sessionId && rec.sessionId !== sessionId)
+        continue;
+      out.push(rec);
+    } catch {}
+  }
+  return out;
+}
+function sessionDiff(sessionId) {
+  const byPath = new Map;
+  const notes = [];
+  for (const rec of readChanges(sessionId)) {
+    if (!("path" in rec)) {
+      notes.push(rec);
+      continue;
+    }
+    const prior = byPath.get(rec.path);
+    if (!prior) {
+      byPath.set(rec.path, {
+        path: rec.path,
+        rel: rec.rel,
+        undoFile: rec.undoFile,
+        created: !rec.existedBefore,
+        edits: 1,
+        firstTs: rec.ts,
+        lastTs: rec.ts
+      });
+    } else {
+      prior.edits++;
+      prior.lastTs = rec.ts;
+      if (prior.undoFile === null && rec.undoFile)
+        prior.undoFile = rec.undoFile;
+    }
+  }
+  return { files: [...byPath.values()], notes };
+}
+function revertSession(sessionId, paths = []) {
+  const diff = sessionDiff(sessionId);
+  const wanted = new Set(paths.map((p) => resolve5(p)));
+  const targets = diff.files.filter((f) => wanted.size === 0 || wanted.has(resolve5(f.path)));
+  if (!targets.length) {
+    return { ok: false, error: paths.length ? `no changes recorded for: ${paths.join(", ")}` : "no changes recorded in this session" };
+  }
+  const restored = [];
+  const deleted = [];
+  const skipped = [];
+  for (const f of targets) {
+    if (f.created) {
+      try {
+        rmSync2(f.path, { force: true });
+        deleted.push(f.rel);
+      } catch (err) {
+        skipped.push(`${f.rel} (delete failed: ${err?.message ?? err})`);
+      }
+      continue;
+    }
+    if (!f.undoFile) {
+      skipped.push(`${f.rel} (no pre-image stored — too large to snapshot)`);
+      continue;
+    }
+    try {
+      const src = join6(undoDir(), f.undoFile);
+      if (!existsSync6(src)) {
+        skipped.push(`${f.rel} (pre-image missing: ${f.undoFile})`);
+        continue;
+      }
+      copyFileSync2(src, f.path);
+      restored.push(f.rel);
+    } catch (err) {
+      skipped.push(`${f.rel} (${err?.message ?? err})`);
+    }
+  }
+  return { ok: true, restored, deleted, skipped };
+}
+function describeDiff(diff) {
+  if (!diff.files.length && !diff.notes.length)
+    return "no file changes recorded in this session";
+  const lines = [];
+  for (const f of diff.files) {
+    const verb = f.created ? "created" : "modified";
+    const times = f.edits > 1 ? ` (${f.edits} edits)` : "";
+    const undoable = f.created ? "" : f.undoFile ? "" : " [no pre-image]";
+    lines.push(`  ${verb}  ${f.rel}${times}${undoable}`);
+  }
+  for (const n of diff.notes)
+    lines.push(`  ${n.tool}  ${n.note}`);
+  return lines.join(`
+`);
+}
+
 // src/tools/files.ts
 async function fileText(p) {
   try {
@@ -2738,9 +3119,22 @@ async function fileExists(p) {
 function protectedError(p) {
   return `ERROR: SELF-EDIT PROTECTED — ${p} is the append-only audit ledger. It cannot be modified or deleted; self-edits are recorded there automatically.`;
 }
+function changeStoreError(p) {
+  return `ERROR: AUDIT TRAIL PROTECTED — ${p} is the change log or its undo store. The agent cannot rewrite its own record of what it changed; that would make /diff and /revert worthless.`;
+}
+async function logChange(tool, p, ctx, before, after, note) {
+  try {
+    const entry = recordChange({ tool, path: p, cwd: ctx.cwd, beforeText: before, afterText: after, note });
+    return `recorded in this session's change log — /diff to review, /revert to undo`;
+  } catch (err) {
+    return `WARNING: wrote the file but could not record it in the change log (${err?.message ?? err}) — /revert will not cover it`;
+  }
+}
 async function preWriteNote(p, content) {
   if (isProtectedFile(p))
     return { ok: false, note: protectedError(p) };
+  if (isChangeStorePath(p))
+    return { ok: false, note: changeStoreError(p) };
   if (isSelfFile(p)) {
     const before = await fileExists(p) ? await fileText(p) : "";
     return { ok: true, note: auditSelfEdit("write_file", p, before, content, `wrote ${content.length} bytes`) };
@@ -2791,7 +3185,7 @@ registerTool({
       } else if (e.isFile()) {
         let size = "";
         try {
-          const st = statSync2(join6(p, e.name));
+          const st = statSync2(join7(p, e.name));
           size = formatSize(st.size);
         } catch {
           size = "?";
@@ -2873,9 +3267,12 @@ registerTool({
     const guard = await preWriteNote(p, content);
     if (!guard.ok)
       return guard.note;
-    mkdirSync4(dirname5(p), { recursive: true });
+    const before = await fileExists(p) ? await fileText(p) : null;
+    mkdirSync5(dirname6(p), { recursive: true });
     await writeFileAsync(p, content, "utf8");
-    return `Wrote ${content.length} bytes to ${p}${guard.note ? `
+    const trail = await logChange("write_file", p, ctx, before, content, before === null ? "created" : `overwrote ${before.length} bytes`);
+    return `Wrote ${content.length} bytes to ${p}
+${trail}${guard.note ? `
 ` + guard.note : ""}`;
   }
 });
@@ -2911,6 +3308,8 @@ registerTool({
       return `ERROR: file not found: ${p}`;
     if (isProtectedFile(p))
       return protectedError(p);
+    if (isChangeStorePath(p))
+      return changeStoreError(p);
     const text = await fileText(p);
     if (!oldString)
       return `ERROR: oldString cannot be empty`;
@@ -2928,7 +3327,9 @@ registerTool({
     await writeFileAsync(p, updated, "utf8");
     const replaced = replaceAll ? count : 1;
     const note = isSelfFile(p) ? auditSelfEdit("edit_file", p, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`) : "";
-    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}${note ? `
+    const trail = await logChange("edit_file", p, ctx, text, updated, `replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}`);
+    return `Edited ${p}: replaced ${replaced} occurrence${replaced > 1 ? "s" : ""}
+${trail}${note ? `
 ` + note : ""}`;
   }
 });
@@ -2936,7 +3337,7 @@ registerTool({
 // src/tools/glob.ts
 import { opendir } from "node:fs/promises";
 import { access } from "node:fs/promises";
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 var EXCLUDE_DEFAULTS = ["node_modules", ".git"];
 function segmentToRegExp(seg) {
   let re = "^";
@@ -3014,7 +3415,7 @@ async function globScan(pattern, opts) {
           if (exclusions.has(e.name))
             continue;
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          const childAbs = join7(dir, e.name);
+          const childAbs = join8(dir, e.name);
           if (e.isDirectory()) {
             await recurse(remaining, childAbs, childRel);
           } else if (!onlyFiles || e.isFile()) {
@@ -3035,7 +3436,7 @@ async function globScan(pattern, opts) {
           break;
         if (e.isDirectory() && !exclusions.has(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining, join7(dir, e.name), childRel);
+          await recurse(remaining, join8(dir, e.name), childRel);
         }
       }
       return;
@@ -3073,7 +3474,7 @@ async function globScan(pattern, opts) {
           continue;
         if (rx.test(e.name)) {
           const childRel = rel ? `${rel}/${e.name}` : e.name;
-          await recurse(remaining.slice(1), join7(dir, e.name), childRel);
+          await recurse(remaining.slice(1), join8(dir, e.name), childRel);
         }
       }
     }
@@ -3086,17 +3487,22 @@ async function globScan(pattern, opts) {
 var MAX_RESULTS = 50;
 var MAX_SCANNED = 2000;
 var DEFAULT_TIMEOUT_MS = 60000;
+function pageSize() {
+  return numberSetting("maxSearchResults", MAX_RESULTS, 1);
+}
 registerTool({
   definition: {
     type: "function",
     function: {
       name: "glob",
-      description: "List files matching a glob pattern (e.g. **/*.ts, src/**). Returns matching file paths.",
+      description: "List files matching a glob pattern (e.g. **/*.ts, src/**). Returns matching file paths, sorted. Results are paged: when more than `limit` match, the output says so and gives the `offset` to pass for the next page.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string", description: "Glob pattern to search" },
-          cwd: { type: "string", description: "Directory to search in (optional, defaults to workspace)" }
+          cwd: { type: "string", description: "Directory to search in (optional, defaults to workspace)" },
+          limit: { type: "number", description: `Max results to return (optional, default ${MAX_RESULTS})` },
+          offset: { type: "number", description: "Skip this many matches before returning results (optional, default 0). Use it to page through a truncated result set." }
         },
         required: ["pattern"]
       }
@@ -3108,21 +3514,30 @@ registerTool({
     const denied = pathDenied(dir, ctx);
     if (denied)
       return denied;
-    const matches = [];
+    const limit = Math.max(1, Number(args.limit ?? pageSize()) || pageSize());
+    const offset = Math.max(0, Number(args.offset ?? 0) || 0);
+    let matches;
     try {
-      const found = await globScan(pattern, { cwd: dir, onlyFiles: true, maxResults: MAX_SCANNED });
-      matches.push(...found);
+      matches = await globScan(pattern, { cwd: dir, onlyFiles: true, maxResults: MAX_SCANNED });
     } catch (err) {
       return `ERROR: glob failed: ${err?.message ?? String(err)}`;
     }
-    const list = matches.slice(0, MAX_RESULTS);
-    let out = list.sort().join(`
+    matches.sort();
+    const total = matches.length;
+    const sliced = matches.slice(offset, offset + limit);
+    if (!sliced.length) {
+      return total === 0 ? "(no matches)" : `(no matches at offset ${offset}; ${total} total match${total === 1 ? "" : "es"} — you paged past the end)`;
+    }
+    let out = sliced.join(`
 `);
-    if (list.length === 0)
-      out = "(no matches)";
-    else if (matches.length > MAX_RESULTS)
+    const next = offset + sliced.length;
+    if (next < total) {
       out += `
-...(${matches.length - MAX_RESULTS} more)`;
+[${next} of ${total} matches shown — pass offset: ${next} for the next page]`;
+    } else {
+      out += `
+[${total} match${total === 1 ? "" : "es"} total]`;
+    }
     return out;
   }
 });
@@ -3131,14 +3546,16 @@ registerTool({
     type: "function",
     function: {
       name: "grep",
-      description: "Search file contents with a regex. Returns file paths and line numbers of matches.",
+      description: "Search file contents with a regex. Returns file paths and line numbers of matches. Results are paged: when more than `limit` match, the output says so and gives the `offset` to pass for the next page. Narrow the pattern or `include` glob instead of paging when you can.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string", description: "Regex pattern to search for" },
           include: { type: "string", description: "File glob to filter (e.g. *.ts) (optional)" },
           path: { type: "string", description: "Directory to search (optional, defaults to workspace)" },
-          timeout: { type: "number", description: "Timeout in milliseconds (optional, default 60000)" }
+          timeout: { type: "number", description: "Timeout in milliseconds (optional, default 60000)" },
+          limit: { type: "number", description: `Max results to return (optional, default ${MAX_RESULTS})` },
+          offset: { type: "number", description: "Skip this many matches before returning results (optional, default 0). Use it to page through a truncated result set." }
         },
         required: ["pattern"]
       }
@@ -3152,6 +3569,8 @@ registerTool({
       return denied;
     const include = args.include ? String(args.include) : "*";
     const timeout = Math.max(0, Number(args.timeout ?? DEFAULT_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS);
+    const limit = Math.max(1, Number(args.limit ?? pageSize()) || pageSize());
+    const offset = Math.max(0, Number(args.offset ?? 0) || 0);
     const res = await spawnCollect({
       cmd: [
         "grep",
@@ -3171,23 +3590,31 @@ registerTool({
     });
     const lines = res.stdout.split(`
 `).filter(Boolean);
-    const shown = lines.slice(0, MAX_RESULTS);
-    let result = shown.join(`
-`);
-    if (res.timedOut)
-      result += `
-[killed: timed out after ${timeout} ms]`;
-    else if (res.aborted)
-      result += `
+    const total = lines.length;
+    const sliced = lines.slice(offset, offset + limit);
+    if (res.timedOut) {
+      return sliced.join(`
+`) + `
+[killed: timed out after ${timeout} ms — this is a partial result set, not the whole match list]`;
+    }
+    if (res.aborted)
+      return sliced.join(`
+`) + `
 [aborted]`;
-    if (res.exitCode !== 0 && !lines.length)
-      result += res.stderr.trim() ? `ERROR: ${res.stderr.trim()}` : "";
-    if (!lines.length)
-      result = result.trim() || "(no matches)";
-    else if (lines.length > MAX_RESULTS)
-      result += `
-...(${lines.length - MAX_RESULTS} more)`;
-    return result;
+    if (total === 0) {
+      const err = res.stderr.trim();
+      return err ? `ERROR: ${err}` : "(no matches)";
+    }
+    if (!sliced.length) {
+      return `(no matches at offset ${offset}; ${total} total match${total === 1 ? "" : "es"} — you paged past the end)`;
+    }
+    let out = sliced.join(`
+`);
+    const next = offset + sliced.length;
+    out += next < total ? `
+[${next} of ${total} matches shown — pass offset: ${next} for the next page, or narrow the pattern]` : `
+[${total} match${total === 1 ? "" : "es"} total]`;
+    return out;
   }
 });
 
@@ -3400,7 +3827,7 @@ async function drainQueue(deps, signal) {
 
 // src/ollama.ts
 import { spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync7 } from "node:fs";
+import { existsSync as existsSync8 } from "node:fs";
 var OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434";
 function ollamaBaseUrl(explicit) {
   const raw = explicit ?? process.env.OLLAMA_HOST ?? OLLAMA_DEFAULT_URL;
@@ -3417,7 +3844,7 @@ async function ollamaIsUp(baseUrl, timeoutMs = 800) {
 }
 function ollamaBinary() {
   const explicit = process.env.OLLAMA_BIN;
-  if (explicit && existsSync7(explicit))
+  if (explicit && existsSync8(explicit))
     return explicit;
   const absolutes = [
     "/data/data/com.termux/files/usr/bin/ollama",
@@ -3426,14 +3853,14 @@ function ollamaBinary() {
     "/usr/local/go/bin/ollama"
   ];
   for (const p of absolutes)
-    if (existsSync7(p))
+    if (existsSync8(p))
       return p;
   const pathDirs = (process.env.PATH ?? "").split(":");
   for (const dir of pathDirs) {
     if (!dir)
       continue;
     const candidate = `${dir.replace(/\/+$/, "")}/ollama`;
-    if (existsSync7(candidate))
+    if (existsSync8(candidate))
       return candidate;
   }
   return null;
@@ -3727,26 +4154,26 @@ registerTool({
 });
 
 // src/tools/env.ts
-import { join as pathJoin, dirname as dirname6, resolve as resolve5 } from "node:path";
+import { join as pathJoin, dirname as dirname7, resolve as resolve6 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 import { readFile, writeFile, rename } from "node:fs/promises";
-import { existsSync as existsSync8, realpathSync as realpathSync2 } from "node:fs";
+import { existsSync as existsSync9, realpathSync as realpathSync2 } from "node:fs";
 function envPlanBlocked(ctx) {
   return ctx.planPhase ? "BLOCKED IN PLAN MODE (read-only): env_set is disabled while investigating. Record the intended environment change in your PLAN instead; the human approves before anything is written." : null;
 }
 var _repoRoot = (() => {
   const from = (start) => {
     try {
-      let dir = resolve5(start);
+      let dir = resolve6(start);
       for (let i = 0;i < 10; i++) {
-        if (existsSync8(pathJoin(dir, "package.json")) || existsSync8(pathJoin(dir, ".git"))) {
+        if (existsSync9(pathJoin(dir, "package.json")) || existsSync9(pathJoin(dir, ".git"))) {
           return dir;
         }
-        const parent = dirname6(dir);
+        const parent = dirname7(dir);
         if (parent === dir)
           return null;
         try {
-          if (realpathSync2.native(dir) !== resolve5(dir))
+          if (realpathSync2.native(dir) !== resolve6(dir))
             return null;
         } catch {
           return null;
@@ -3758,7 +4185,7 @@ var _repoRoot = (() => {
       return null;
     }
   };
-  return from(process.cwd()) ?? from(dirname6(fileURLToPath2(import.meta.url))) ?? process.cwd();
+  return from(process.cwd()) ?? from(dirname7(fileURLToPath2(import.meta.url))) ?? process.cwd();
 })();
 function envPath() {
   const override = process.env.VIBECODER_ENV_FILE;
@@ -4029,11 +4456,11 @@ registerTool({
     const lines = [];
     if (unstaged) {
       lines.push("--- unstaged changes ---");
-      lines.push(truncate(unstaged, maxLines));
+      lines.push(truncate2(unstaged, maxLines));
     }
     if (staged) {
       lines.push("--- staged changes ---");
-      lines.push(truncate(staged, maxLines));
+      lines.push(truncate2(staged, maxLines));
     }
     if (!unstaged && !staged)
       lines.push(head);
@@ -4151,6 +4578,7 @@ registerTool({
     const push = await runGit(["push", "--force-with-lease", remote, branch], `git push --force-with-lease ${remote} ${branch}`, ctx);
     if (push.includes("Everything up-to-date"))
       return `up to date on ${remote}/${branch}`;
+    recordNote("git_push_ff", `force-pushed ${branch} to ${remote} (history rewritten — local reflog is the only undo)`);
     return push;
   }
 });
@@ -4214,7 +4642,7 @@ async function runGit(args, label, ctx) {
     out = "(no output)";
   return out;
 }
-function truncate(s, maxLines) {
+function truncate2(s, maxLines) {
   const lines = s.split(`
 `);
   if (lines.length <= maxLines)
@@ -4254,6 +4682,7 @@ registerTool({
     const commit = await runGit(["commit", "-m", message], `git commit -m "${message}"`, ctx);
     const hashMatch = commit.match(/\[(\w+\s+\d+\s+[a-f0-9]+)\]/);
     const summary = hashMatch ? hashMatch[1] : commit;
+    recordNote("git_commit", `committed ${files.split(/\s+/).filter(Boolean).length} file(s): ${String(message).slice(0, 80)}`);
     return `Committed as:
 ${summary}
 
@@ -4523,17 +4952,17 @@ function buildSummary(checks, results) {
 }
 
 // src/session.ts
-import { existsSync as existsSync9, mkdirSync as mkdirSync5, readdirSync as readdirSync3, readFileSync as readFileSync5, rmSync as rmSync2, writeFileSync as writeFileSync4 } from "node:fs";
-import { homedir as homedir5 } from "node:os";
-import { join as join8 } from "node:path";
+import { existsSync as existsSync10, mkdirSync as mkdirSync6, readdirSync as readdirSync3, readFileSync as readFileSync6, rmSync as rmSync3, writeFileSync as writeFileSync5 } from "node:fs";
+import { homedir as homedir6 } from "node:os";
+import { join as join9 } from "node:path";
 var _root2 = null;
 function root2() {
   if (_root2)
     return _root2;
   const envDir = process.env.VIBECODER_SESSION_DIR;
-  _root2 = envDir || join8(homedir5(), ".vibecoder");
-  mkdirSync5(_root2, { recursive: true });
-  mkdirSync5(join8(_root2, "sessions"), { recursive: true });
+  _root2 = envDir || join9(homedir6(), ".vibecoder");
+  mkdirSync6(_root2, { recursive: true });
+  mkdirSync6(join9(_root2, "sessions"), { recursive: true });
   return _root2;
 }
 function sanitizeId(id) {
@@ -4554,39 +4983,39 @@ function resolveResumeArg(argv) {
   return { resume: true, name };
 }
 function lastFile() {
-  return join8(root2(), "last.json");
+  return join9(root2(), "last.json");
 }
 function sessionFile(id) {
   const clean = sanitizeId(id);
   const fname = clean === id ? clean : `${clean}--${shortHash(id)}`;
-  return join8(root2(), "sessions", `${fname}.json`);
+  return join9(root2(), "sessions", `${fname}.json`);
 }
 function saveSession(s) {
   s.updatedAt = Date.now();
   if (!s.createdAt)
     s.createdAt = s.updatedAt;
   const f = sessionFile(s.id);
-  writeFileSync4(f, JSON.stringify(s, null, 2));
+  writeFileSync5(f, JSON.stringify(s, null, 2));
   return f;
 }
 function loadSession(id) {
   if (!id)
     return null;
   const f = sessionFile(id);
-  if (!existsSync9(f))
+  if (!existsSync10(f))
     return null;
   try {
-    return JSON.parse(readFileSync5(f, "utf8"));
+    return JSON.parse(readFileSync6(f, "utf8"));
   } catch {
     return null;
   }
 }
 function deleteSession(id) {
   const f = sessionFile(id);
-  if (!existsSync9(f))
+  if (!existsSync10(f))
     return false;
   try {
-    rmSync2(f, { force: true });
+    rmSync3(f, { force: true });
     return true;
   } catch {
     return false;
@@ -4594,15 +5023,15 @@ function deleteSession(id) {
 }
 function listSessions() {
   const out = [];
-  const dir = join8(root2(), "sessions");
-  if (!existsSync9(dir))
+  const dir = join9(root2(), "sessions");
+  if (!existsSync10(dir))
     return out;
   for (const name of readdirSync3(dir)) {
     if (!name.endsWith(".json"))
       continue;
     let s = null;
     try {
-      const parsed = JSON.parse(readFileSync5(join8(dir, name), "utf8"));
+      const parsed = JSON.parse(readFileSync6(join9(dir, name), "utf8"));
       if (parsed && typeof parsed.id === "string" && Array.isArray(parsed.messages))
         s = parsed;
     } catch {}
@@ -4622,13 +5051,13 @@ function listSessions() {
   return out;
 }
 function saveLast(s) {
-  writeFileSync4(lastFile(), JSON.stringify(s, null, 2));
+  writeFileSync5(lastFile(), JSON.stringify(s, null, 2));
 }
 function loadLast() {
-  if (!existsSync9(lastFile()))
+  if (!existsSync10(lastFile()))
     return null;
   try {
-    return JSON.parse(readFileSync5(lastFile(), "utf8"));
+    return JSON.parse(readFileSync6(lastFile(), "utf8"));
   } catch {
     return null;
   }
@@ -5797,9 +6226,9 @@ registerTool({
 import { createInterface as createInterface2 } from "node:readline";
 
 // src/env.ts
-import { existsSync as existsSync10, readFileSync as readFileSync6 } from "node:fs";
-import { homedir as homedir6 } from "node:os";
-import { dirname as dirname7, join as join9 } from "node:path";
+import { existsSync as existsSync11, readFileSync as readFileSync7 } from "node:fs";
+import { homedir as homedir7 } from "node:os";
+import { dirname as dirname8, join as join10, resolve as resolve7 } from "node:path";
 var loaded = new Set;
 function envLine(line) {
   const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
@@ -5809,6 +6238,7 @@ function envLine(line) {
   if (!key)
     return null;
   let value = m[2];
+  value = value.replace(/\r$/, "");
   value = value.replace(/^"|"$/g, "").replace(/^'|'$/g, "");
   return [key, value];
 }
@@ -5816,22 +6246,28 @@ function loadDotEnv() {
   if (process.env.VIBECODER_NO_DOTENV === "1")
     return;
   const candidates = [
-    join9(packageRoot(), ".env"),
-    join9(dirname7(packageRoot()), ".env"),
-    join9(homedir6(), ".vibecoder", ".env")
-  ];
-  for (const file of candidates) {
+    process.env.VIBECODER_ENV_FILE,
+    join10(process.cwd(), ".env"),
+    join10(packageRoot(), ".env"),
+    join10(dirname8(packageRoot()), ".env"),
+    join10(homedir7(), ".vibecoder", ".env")
+  ].filter((f) => !!f);
+  const seen = new Set;
+  for (const raw of candidates) {
+    const file = resolve7(raw);
+    if (seen.has(file))
+      continue;
+    seen.add(file);
     if (loaded.has(file))
       continue;
     loaded.add(file);
-    if (!existsSync10(file))
+    if (!existsSync11(file))
       continue;
-    const text = readFileSync6(file, "utf8");
-    for (const raw of text.split(`
-`)) {
-      if (!raw.trim() || raw.trim().startsWith("#"))
+    const text = readFileSync7(file, "utf8");
+    for (const rawLine of text.split(/\r?\n/)) {
+      if (!rawLine.trim() || rawLine.trim().startsWith("#"))
         continue;
-      const kv = envLine(raw);
+      const kv = envLine(rawLine);
       if (!kv)
         continue;
       const [key, value] = kv;
@@ -5842,7 +6278,273 @@ function loadDotEnv() {
 }
 
 // src/doctor.ts
-import { existsSync as existsSync11 } from "node:fs";
+import { existsSync as existsSync13 } from "node:fs";
+
+// src/checkpoint.ts
+import { createHash as createHash3 } from "node:crypto";
+import { copyFileSync as copyFileSync3, existsSync as existsSync12, mkdirSync as mkdirSync7, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync3, unlinkSync as unlinkSync2, writeFileSync as writeFileSync6 } from "node:fs";
+import { homedir as homedir8 } from "node:os";
+import { dirname as dirname9, join as join11, relative as relative2, resolve as resolve8 } from "node:path";
+import { spawnSync as spawnSync4 } from "node:child_process";
+var MAX_BLOB_BYTES = 16 * 1024 * 1024;
+function dataRoot2() {
+  const env = process.env.VIBECODER_SESSION_DIR;
+  return env || join11(homedir8(), ".vibecoder");
+}
+function checkpointsDir() {
+  return join11(dataRoot2(), "checkpoints");
+}
+function indexFile() {
+  return join11(checkpointsDir(), "index.json");
+}
+function indexPath() {
+  return indexFile();
+}
+async function isGitRepo(dir) {
+  const res = await spawnCollect({
+    cmd: ["git", "-C", dir, "rev-parse", "--is-inside-work-tree"],
+    timeoutMs: 5000
+  });
+  return res.exitCode === 0 && res.stdout.trim() === "true";
+}
+function statusEntries(cwd) {
+  const res = spawnSync4("git", ["-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all"], { encoding: "utf8", timeout: 15000, windowsHide: true });
+  if (res.status !== 0)
+    return [];
+  const fields = (res.stdout ?? "").split("\x00").filter((f) => f.length > 0);
+  const out = [];
+  for (let i = 0;i < fields.length; i++) {
+    const field = fields[i];
+    if (field.length < 4)
+      continue;
+    const status = field.slice(0, 2);
+    const path = field.slice(3);
+    if (status[0] === "R" || status[0] === "C" || status[1] === "R" || status[1] === "C")
+      i++;
+    out.push({ path: resolve8(cwd, path), untracked: status === "??" });
+  }
+  return out;
+}
+function dirtyFiles(cwd) {
+  const entries = statusEntries(cwd);
+  if (entries.length === 0 && !isGitDirSync(cwd))
+    return scanFiles(cwd);
+  return entries.map((e) => ({ ...e, sha: fileSha(e.path), blob: null }));
+}
+function isGitDirSync(cwd) {
+  const res = spawnSync4("git", ["-C", cwd, "rev-parse", "--git-dir"], {
+    encoding: "utf8",
+    timeout: 5000,
+    windowsHide: true
+  });
+  return res.status === 0;
+}
+var SCAN_IGNORED = new Set([".git", "node_modules", ".vibecoder", "dist", "build", ".next", "target", "__pycache__"]);
+function scanFiles(cwd) {
+  const out = [];
+  const walk = (dir, depth) => {
+    if (depth > 6 || out.length >= 5000)
+      return;
+    let items;
+    try {
+      items = readdirSync4(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const item of items) {
+      if (SCAN_IGNORED.has(item.name))
+        continue;
+      const full = join11(dir, item.name);
+      if (item.isDirectory())
+        walk(full, depth + 1);
+      else if (item.isFile())
+        out.push({ path: full, sha: fileSha(full), untracked: true, blob: null });
+    }
+  };
+  walk(cwd, 0);
+  return out;
+}
+function fileSha(abs) {
+  try {
+    return createHash3("sha256").update(readFileSync8(abs)).digest("hex").slice(0, 16);
+  } catch {
+    return "unreadable";
+  }
+}
+function readIndexFile() {
+  const f = indexFile();
+  if (!existsSync12(f))
+    return { lastId: 0, entries: [] };
+  try {
+    const parsed = JSON.parse(readFileSync8(f, "utf8"));
+    const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+    const fromEntries = entries.reduce((m, c) => Math.max(m, Number(c.id) || 0), 0);
+    return {
+      lastId: Math.max(Number(parsed?.lastId) || 0, fromEntries),
+      entries
+    };
+  } catch {
+    return { lastId: 0, entries: [] };
+  }
+}
+function readIndex() {
+  return readIndexFile().entries;
+}
+function writeIndexFile(index) {
+  mkdirSync7(checkpointsDir(), { recursive: true });
+  writeFileSync6(indexFile(), JSON.stringify(index, null, 2), "utf8");
+}
+async function createCheckpoint(params) {
+  const cwd = resolve8(params.cwd);
+  const label = (params.label ?? "").trim();
+  const gitRepo = await isGitRepo(cwd);
+  let gitSha = null;
+  if (gitRepo) {
+    const res = await spawnCollect({
+      cmd: ["git", "-C", cwd, "stash", "create", label ? `vibecoder checkpoint: ${label}` : "vibecoder checkpoint"],
+      timeoutMs: 30000
+    });
+    const sha = res.stdout.trim();
+    gitSha = res.exitCode === 0 && /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  }
+  const files = dirtyFiles(cwd);
+  for (const f of files) {
+    if (f.untracked)
+      f.blob = stashBlob(f.path);
+  }
+  const index = readIndexFile();
+  const id = String(++index.lastId);
+  const cp = {
+    id,
+    ts: new Date().toISOString(),
+    sessionId: params.sessionId,
+    label,
+    cwd,
+    gitSha,
+    files,
+    alreadyDirty: files.length > 0
+  };
+  index.entries.push(cp);
+  index.entries = index.entries.slice(-50);
+  writeIndexFile(index);
+  return cp;
+}
+function stashBlob(abs) {
+  try {
+    const st = statSync3(abs);
+    if (!st.isFile() || st.size > MAX_BLOB_BYTES)
+      return null;
+    const buf = readFileSync8(abs);
+    const sha = createHash3("sha256").update(buf).digest("hex");
+    const name = `${sha}.blob`;
+    const dest = join11(blobDir(), name);
+    if (!existsSync12(dest)) {
+      mkdirSync7(blobDir(), { recursive: true });
+      const tmp = `${dest}.${process.pid}.tmp`;
+      writeFileSync6(tmp, buf);
+      copyFileSync3(tmp, dest);
+      try {
+        unlinkSync2(tmp);
+      } catch {}
+    }
+    return name;
+  } catch {
+    return null;
+  }
+}
+function blobDir() {
+  return join11(checkpointsDir(), "blobs");
+}
+function listCheckpoints(sessionId) {
+  const all = readIndex();
+  return sessionId ? all.filter((c) => c.sessionId === sessionId) : all;
+}
+function getCheckpoint(id, sessionId) {
+  const want = id.trim();
+  return listCheckpoints(sessionId).find((c) => c.id === want) ?? listCheckpoints().find((c) => c.id === want) ?? null;
+}
+function diffAgainstCheckpoint(cp) {
+  const now = dirtyFiles(cp.cwd);
+  const thenMap = new Map(cp.files.map((f) => [f.path, f.sha]));
+  const nowMap = new Map(now.map((f) => [f.path, f.sha]));
+  const removed = cp.files.filter((f) => !existsSync12(f.path)).map((f) => f.path);
+  const drifted = now.filter((f) => existsSync12(f.path) && thenMap.has(f.path) && thenMap.get(f.path) !== f.sha).map((f) => f.path);
+  const added = now.filter((f) => !thenMap.has(f.path)).map((f) => f.path);
+  const clean = drifted.length === 0 && added.length === 0 && removed.length === 0;
+  return { id: cp.id, clean, drifted, added, removed };
+}
+async function restoreCheckpoint(cp) {
+  const tracked = cp.files.filter((f) => !f.untracked);
+  const untracked = cp.files.filter((f) => f.untracked && f.blob);
+  const restored = [];
+  const unrecoverable = [];
+  if (tracked.length) {
+    if (!cp.gitSha) {
+      return {
+        ok: false,
+        error: `checkpoint #${cp.id} recorded ${tracked.length} tracked file(s) but has no git object`,
+        hint: "the git object was pruned or gc'd. Use /revert to undo this session's writes, or recover the content from your own editor history."
+      };
+    }
+    const pathspecs = tracked.map((f) => relative2(cp.cwd, f.path) || f.path);
+    const res = await spawnCollect({
+      cmd: ["git", "-C", cp.cwd, "checkout", cp.gitSha, "--", ...pathspecs],
+      timeoutMs: 120000
+    });
+    if (res.exitCode !== 0) {
+      const detail = [res.stdout.trim(), res.stderr.trim()].filter(Boolean).join(`
+`);
+      return {
+        ok: false,
+        error: detail || `git checkout exited ${res.exitCode}`,
+        hint: "nothing was restored. Resolve the conflict by hand, or use /revert to undo just this session's writes."
+      };
+    }
+    restored.push(...tracked.map((f) => f.path));
+  }
+  for (const f of untracked) {
+    try {
+      const src = join11(blobDir(), f.blob);
+      if (!existsSync12(src)) {
+        unrecoverable.push(f.path);
+        continue;
+      }
+      mkdirSync7(dirname9(f.path), { recursive: true });
+      copyFileSync3(src, f.path);
+      restored.push(f.path);
+    } catch {
+      unrecoverable.push(f.path);
+    }
+  }
+  for (const f of cp.files) {
+    if (f.untracked && !f.blob)
+      unrecoverable.push(f.path);
+  }
+  return { ok: true, restored, unrecoverable };
+}
+function deleteCheckpoint(id, sessionId) {
+  const index = readIndexFile();
+  const next = index.entries.filter((c) => c.id !== id.trim() || sessionId !== undefined && c.sessionId !== sessionId);
+  if (next.length === index.entries.length)
+    return false;
+  index.entries = next;
+  writeIndexFile(index);
+  return true;
+}
+function describeCheckpoint(cp) {
+  const lines = [
+    `  #${cp.id}  ${cp.ts}${cp.label ? `  ${cp.label}` : ""}`,
+    `       ${cp.files.length} dirty file${cp.files.length === 1 ? "" : "s"}` + (cp.gitSha ? `  git object ${cp.gitSha.slice(0, 10)}` : "  (no git object — restore via /revert)")
+  ];
+  for (const f of cp.files.slice(0, 20))
+    lines.push(`         ${f.path.slice(cp.cwd.length + 1)}  ${f.sha}`);
+  if (cp.files.length > 20)
+    lines.push(`         … and ${cp.files.length - 20} more`);
+  return lines.join(`
+`);
+}
+
+// src/doctor.ts
 function maskKey(v) {
   if (!v)
     return "not set";
@@ -5864,7 +6566,7 @@ async function runDoctor() {
   const pkg = readPackageJson();
   const version = pkg?.version ?? "dev";
   const runtime = process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`;
-  const isTermux = process.platform === "android" && (existsSync11("/data/data/com.termux") || process.env.ANDROID_DATA !== undefined || process.env.EXTERNAL_STORAGE !== undefined);
+  const isTermux = process.platform === "android" && (existsSync13("/data/data/com.termux") || process.env.ANDROID_DATA !== undefined || process.env.EXTERNAL_STORAGE !== undefined);
   say("vibecoder doctor");
   say(`  version:   ${version}`);
   say(`  runtime:   ${runtime} (${process.platform}/${process.arch})${isTermux ? " · Android (Termux)" : ""}`);
@@ -5941,8 +6643,20 @@ async function runDoctor() {
   say(`  sessions:  ~/.vibecoder/sessions/  (saved conversations)`);
   say(`  queue:     ~/.vibecoder/queue.json (offline task queue)`);
   say(`  ledger:    ${ledgerPath()}`);
+  say(`  changes:   ${changeLogPath()}  (every file the agent writes, with pre-images)`);
+  say(`  checkpoints: ${indexPath()}  (restore points for /restore)`);
   say(`  user env:  ~/.vibecoder/.env      (optional API keys, e.g. GROQ_API_KEY=...)`);
-  const userCfgExists = existsSync11(userConfigFile());
+  const resolvedPerms = resolvePermissions(cfg, process.cwd());
+  out.push("");
+  say(`permissions (in force for ${process.cwd()})`);
+  say(`  destructive: ${resolvedPerms.destructive}` + (resolvedPerms.destructive === "deny" ? "  (rm, git reset, redirects and friends are refused)" : resolvedPerms.destructive === "ask" ? "  (you are prompted for each one)" : "  (unrestricted — rm and force-push run with no confirmation)"));
+  say(`  network:     ${resolvedPerms.network}`);
+  say(`  filesystem:  ${resolvedPerms.filesystem}`);
+  say(`  secrets:     ${resolvedPerms.exposeSecrets ? "EXPOSED to child processes" : "withheld from child processes"}`);
+  if (resolvedPerms.destructive === "allow" && resolvedPerms.filesystem === "full") {
+    say(`  note:        permissive defaults. --sandbox, or "permissions" in config.json, tightens this.`);
+  }
+  const userCfgExists = existsSync13(userConfigFile());
   const keysPresent = Object.keys(cfg.providers ?? {}).map((n) => cfg.providers[n].apiKeyEnv).filter(Boolean).some((k) => process.env[k]);
   out.push("");
   say("next steps");
@@ -5960,9 +6674,9 @@ async function runDoctor() {
 // src/setup.ts
 import { createInterface } from "node:readline/promises";
 import { stdin as stdinInput, stdout as stdoutOutput } from "node:process";
-import { appendFileSync as appendFileSync2, existsSync as existsSync12, mkdirSync as mkdirSync6 } from "node:fs";
-import { homedir as homedir7 } from "node:os";
-import { join as join10 } from "node:path";
+import { appendFileSync as appendFileSync3, existsSync as existsSync14, mkdirSync as mkdirSync8 } from "node:fs";
+import { homedir as homedir9 } from "node:os";
+import { join as join12 } from "node:path";
 var LOCAL_MODEL = "qwen2.5:1.5b";
 async function prompt(question, fallback, interactive) {
   if (!interactive)
@@ -5991,7 +6705,7 @@ async function runSetup(argv) {
   line();
   const builtinPath = resolvePackageFile("config.json");
   const builtin = builtinPath ? loadJsonFile(builtinPath) : null;
-  if (existsSync12(userConfigFile())) {
+  if (existsSync14(userConfigFile())) {
     line(`An existing customization file exists: ${userConfigFile()}`);
     if (!await confirm("Overwrite it? (n keeps your current config)", false, interactive)) {
       line("OK — leaving your config untouched. Run `vibecoder doctor` to inspect it.");
@@ -6037,13 +6751,13 @@ async function runSetup(argv) {
   }
   const written = writeUserConfig(cfg);
   if (groqKey || nvidiaKey) {
-    const envFile = join10(homedir7(), ".vibecoder", ".env");
-    mkdirSync6(join10(homedir7(), ".vibecoder"), { recursive: true });
+    const envFile = join12(homedir9(), ".vibecoder", ".env");
+    mkdirSync8(join12(homedir9(), ".vibecoder"), { recursive: true });
     if (groqKey)
-      appendFileSync2(envFile, `GROQ_API_KEY=${groqKey}
+      appendFileSync3(envFile, `GROQ_API_KEY=${groqKey}
 `);
     if (nvidiaKey)
-      appendFileSync2(envFile, `NVIDIA_API_KEY=${nvidiaKey}
+      appendFileSync3(envFile, `NVIDIA_API_KEY=${nvidiaKey}
 `);
     line(`  keys written to ${envFile} (chmod 600 recommended).`);
   }
@@ -6080,6 +6794,73 @@ FILES: <the files you intend to create or modify>
 RISKS: <risks, unknowns, and how you will verify the work>
 
 If the request is genuinely not a task you can act on, or is missing information, say so briefly instead of inventing a plan.`;
+
+// src/cost.ts
+var byTurn = [];
+var turnIndex = 0;
+var TOKEN_COSTS = {
+  groq: { input: 0, output: 0 },
+  openai: { input: 0.000005, output: 0.000015 },
+  anthropic: { input: 0.000003, output: 0.000015 },
+  nvidia: { input: 0.0000005, output: 0.0000015 },
+  ollama: { input: 0, output: 0 }
+};
+function rateFor(provider, _model) {
+  return TOKEN_COSTS[provider] ?? { input: 0.00001, output: 0.00003 };
+}
+function ratesPerMillion(provider, model) {
+  const r = rateFor(provider, model);
+  return { input: r.input * 1e6, output: r.output * 1e6, reasoning: r.reasoning };
+}
+function recordCost(params) {
+  const rate = rateFor(params.provider, params.model);
+  const inputCost = params.inputTokens * rate.input;
+  const outputCost = params.outputTokens * rate.output;
+  const reasoningCost = (params.reasoningTokens ?? 0) * (rate.reasoning ?? rate.output);
+  const event = {
+    turnIndex: turnIndex++,
+    provider: params.provider,
+    model: params.model,
+    inputTokens: params.inputTokens,
+    outputTokens: params.outputTokens,
+    reasoningTokens: params.reasoningTokens,
+    estimatedCostUsd: inputCost + outputCost + reasoningCost,
+    timestamp: Date.now()
+  };
+  byTurn.push(event);
+  return event;
+}
+function costSummary() {
+  const totalInput = byTurn.reduce((s, e) => s + e.inputTokens, 0);
+  const totalOutput = byTurn.reduce((s, e) => s + e.outputTokens, 0);
+  const totalReasoning = byTurn.reduce((s, e) => s + (e.reasoningTokens ?? 0), 0);
+  const totalCost = byTurn.reduce((s, e) => s + e.estimatedCostUsd, 0);
+  return {
+    turnCount: byTurn.length,
+    totalInputTokens: totalInput,
+    totalOutputTokens: totalOutput,
+    totalReasoningTokens: totalReasoning,
+    totalCostUsd: totalCost,
+    byTurn
+  };
+}
+function costReportText() {
+  const s = costSummary();
+  if (!s.turnCount)
+    return "  no cost data yet (this session)";
+  const lines = [
+    `  ${s.turnCount} turn(s)`,
+    `  input:  ${s.totalInputTokens.toLocaleString()} tokens`,
+    `  output: ${s.totalOutputTokens.toLocaleString()} tokens`,
+    `  reasoning: ${s.totalReasoningTokens.toLocaleString()} tokens`,
+    `  estimated cost: $${s.totalCostUsd.toFixed(6)} (this session, rough estimate)`,
+    ``,
+    `  per-turn breakdown:`,
+    ...s.byTurn.map((e) => `    turn ${e.turnIndex}: ${e.provider}/${e.model} · in ${e.inputTokens} · out ${e.outputTokens}${e.reasoningTokens ? ` · reasoning ${e.reasoningTokens}` : ""} · ~$${e.estimatedCostUsd.toFixed(6)}`)
+  ];
+  return lines.join(`
+`);
+}
 
 // src/ui/repl.ts
 var colors = {
@@ -6118,6 +6899,7 @@ var permissions = resolvePermissions({}, process.cwd());
 var sessionCwd = process.cwd();
 var planPhase = false;
 var planPhaseNextTurn = false;
+var pendingTask;
 function limitsFor(cfg) {
   return {
     maxInputTokens: cfg.maxInputTokens ?? (cfg.provider === "groq" ? 5000 : undefined),
@@ -6137,7 +6919,7 @@ function routeLabel() {
     return `router ${routerMode} · ${chat}/${shortId(chat, c.model)}`;
   return `router ${routerMode} · chat ${chat}/${shortId(chat, c.model)} ↔ heavy ${heavy}/${shortId(heavy, h.model)}`;
 }
-function currentSession() {
+function currentSession2() {
   return {
     id: sessionId || `session-${new Date().toISOString().slice(0, 10)}-${Date.now().toString(36)}`,
     title: sessionTitleFromMessages(),
@@ -6149,7 +6931,8 @@ function currentSession() {
     systemPrompt,
     messages,
     routerMode,
-    messageCount: messages.length
+    messageCount: messages.length,
+    pending: pendingTask
   };
 }
 function sessionTitleFromMessages() {
@@ -6159,7 +6942,7 @@ function sessionTitleFromMessages() {
 }
 function persistLast() {
   try {
-    saveLast(currentSession());
+    saveLast(currentSession2());
   } catch {}
 }
 function applySession(s) {
@@ -6168,6 +6951,8 @@ function applySession(s) {
   messages = s.messages.filter((m) => m && typeof m.role === "string");
   sessionId = s.id;
   taskActive = false;
+  pendingTask = s.pending;
+  setChangeSession(sessionId);
   if (s.routerMode)
     routerMode = s.routerMode;
   if (s.systemPrompt)
@@ -6191,6 +6976,7 @@ function banner(_provider, _model, _dir) {
 async function init() {
   const config = await loadConfig();
   rootConfig = config;
+  setRootConfig(config);
   setQueueFileOverride(config.queue?.file);
   permissions = resolvePermissions(config, sessionCwd);
   const resolved = createProvider(config);
@@ -6205,6 +6991,7 @@ async function init() {
   maxInputTokensPerMinute = limits.maxInputTokensPerMinute;
   providerStream = resolved.provider.streamChat.bind(resolved.provider);
   router = new ModelRouter(config, limits);
+  setChangeSession(sessionId || "startup");
   if (router.offlineIdentity()) {
     const oll = await ensureOllamaServe({
       readyTimeoutMs: 6000,
@@ -6358,6 +7145,10 @@ ${colors.bold}Commands${colors.reset}`);
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
     print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}next turn plans only — no writes, installs, or git changes${colors.reset}`);
     print(`  ${colors.green}/permissions${colors.reset}         ${colors.dim}show the active permission model${colors.reset}`);
+    print(`  ${colors.green}/diff${colors.reset}             ${colors.dim}files this session changed, plus its restore points${colors.reset}`);
+    print(`  ${colors.green}/revert [path…|all]${colors.reset}  ${colors.dim}undo those changes from pre-images${colors.reset}`);
+    print(`  ${colors.green}/checkpoint [label]${colors.reset}  ${colors.dim}take a restore point · list · drop <id>${colors.reset}`);
+    print(`  ${colors.green}/restore <id>${colors.reset}     ${colors.dim}put the workspace back to a restore point${colors.reset}`);
     print(`  ${colors.green}/save [name]${colors.reset}      save this conversation`);
     print(`  ${colors.green}/resume [name]${colors.reset}    resume a saved conversation (or the last one)`);
     print(`  ${colors.green}/list${colors.reset}             list saved conversations`);
@@ -6379,7 +7170,7 @@ ${colors.bold}Commands${colors.reset}`);
   if (line.startsWith("/save")) {
     const arg = line.slice(5).trim().replace(/^\/+/, "");
     try {
-      const s = currentSession();
+      const s = currentSession2();
       if (arg)
         s.id = arg;
       sessionId = s.id;
@@ -6407,6 +7198,8 @@ ${colors.bold}Commands${colors.reset}`);
       setStatus();
       print(`${colors.green}resumed "${resumed.id}"${colors.reset} ${colors.dim}· ${resumed.messages.length} messages · ${resumed.provider}/${resumed.model}${colors.reset}`);
       print(`  ${colors.dim}${resumed.title}${colors.reset}`);
+      if (resumed.pending)
+        printUnfinishedNote(resumed.pending, print);
     }
     return true;
   }
@@ -6442,6 +7235,8 @@ ${colors.bold}Saved conversations${colors.reset}`);
     messages = [];
     sessionId = "";
     taskActive = false;
+    pendingTask = undefined;
+    setChangeSession("");
     const config = await loadConfig();
     if (config.systemPrompt)
       systemPrompt = config.systemPrompt + SELF_EDIT_PROTOCOL;
@@ -6525,15 +7320,149 @@ ${colors.bold}Saved conversations${colors.reset}`);
   if (line.startsWith("/permissions")) {
     const p = permissions;
     print(`${colors.bold}permissions${colors.reset}  (workspace root: ${p.workspaceRoot})`);
-    print(`  destructive : ${p.destructive}`);
+    print(`  destructive : ${p.destructive}${p.destructive === "ask" ? ` ${colors.dim}(you are prompted for each guarded command)${colors.reset}` : ""}`);
     print(`  network     : ${p.network}`);
     print(`  filesystem  : ${p.filesystem}`);
     print(`  secrets     : ${p.exposeSecrets ? "exposed to child processes" : "withheld from child processes"}`);
     print(`${colors.dim}  set in config.json under "permissions", or per-run: --sandbox --deny-destructive --no-network${colors.reset}`);
     return true;
   }
+  if (line.startsWith("/diff")) {
+    const id = sessionId || currentSession2().id;
+    const diff = sessionDiff(id);
+    const cps = listCheckpoints(id);
+    print(`${colors.bold}changes in this session${colors.reset} ${colors.dim}(${id})${colors.reset}`);
+    print(`  ${describeDiff(diff)}`);
+    if (cps.length) {
+      print(`
+  ${colors.dim}restore points: ${cps.map((c) => "#" + c.id).join(" ")} — /restore <id>${colors.reset}`);
+    }
+    print(`${colors.dim}  /revert [path…] undoes these; /revert all undoes everything. Untracked by git, so this works with no commits.${colors.reset}`);
+    return true;
+  }
+  if (line.startsWith("/revert")) {
+    const arg = line.slice(7).trim();
+    const id = sessionId || currentSession2().id;
+    const all = !arg || arg === "all";
+    const paths = all ? [] : arg.split(/\s+/);
+    const res = revertSession(id, paths);
+    if (!res.ok) {
+      print(`${colors.red}${res.error}${colors.reset}`);
+      return true;
+    }
+    for (const r of res.restored)
+      print(`${colors.green}restored${colors.reset} ${r}`);
+    for (const d of res.deleted)
+      print(`${colors.green}deleted${colors.reset} ${d} ${colors.dim}(it did not exist before)${colors.reset}`);
+    for (const s of res.skipped)
+      print(`${colors.yellow}skipped${colors.reset} ${s}`);
+    print(res.restored.length || res.deleted.length ? `${colors.dim}reverted ${res.restored.length} modified and ${res.deleted.length} created file(s)${colors.reset}` : `${colors.yellow}nothing was reverted${colors.reset}`);
+    if (res.skipped.length)
+      print(`${colors.dim}  the change log still lists these — /diff shows what remains${colors.reset}`);
+    return true;
+  }
+  if (line.startsWith("/checkpoint")) {
+    const arg = line.slice(11).trim();
+    if (arg === "list") {
+      const cps = listCheckpoints(sessionId || undefined);
+      if (!cps.length) {
+        print(`${colors.dim}no restore points yet — /checkpoint [label] takes one${colors.reset}`);
+        return true;
+      }
+      print(`${colors.bold}restore points${colors.reset}`);
+      for (const c of cps)
+        print(describeCheckpoint(c));
+      print(`${colors.dim}  /restore <id> applies one back · /checkpoint drop <id> forgets it${colors.reset}`);
+      return true;
+    }
+    if (arg.startsWith("drop ")) {
+      const target = arg.slice(5).trim();
+      const cp = getCheckpoint(target, sessionId || undefined);
+      if (!cp) {
+        print(`${colors.red}no restore point #${target}${colors.reset}`);
+        return true;
+      }
+      deleteCheckpoint(cp.id, sessionId || undefined);
+      print(`${colors.green}forgot restore point #${cp.id}${colors.reset}${cp.gitSha ? ` ${colors.dim}(git object ${cp.gitSha.slice(0, 10)} left for gc)${colors.reset}` : ""}`);
+      return true;
+    }
+    const cp = await createCheckpoint({ sessionId: sessionId || currentSession2().id, cwd, label: arg });
+    print(`${colors.green}✓ checkpoint #${cp.id}${colors.reset}${cp.label ? ` ${colors.dim}${cp.label}${colors.reset}` : ""}`);
+    print(`  ${cp.files.length} dirty file${cp.files.length === 1 ? "" : "s"} recorded`);
+    if (cp.gitSha) {
+      print(`  ${colors.dim}git object ${cp.gitSha.slice(0, 10)} — /restore #${cp.id} puts the whole tree back, including shell-made changes${colors.reset}`);
+    } else {
+      print(`  ${colors.dim}not a git repo, or the tree was clean — /revert still covers everything the agent wrote${colors.reset}`);
+    }
+    if (pendingTask)
+      pendingTask.checkpointId = cp.id;
+    return true;
+  }
+  if (line.startsWith("/restore")) {
+    const rawArg = line.slice(8).trim();
+    const arg = rawArg.replace(/\byes\b/gi, "").trim() || rawArg.split(/\s+/)[0];
+    if (!arg) {
+      print(`${colors.red}usage: /restore <checkpoint-id>${colors.reset} ${colors.dim}— /checkpoint list to see them${colors.reset}`);
+      return true;
+    }
+    const cp = getCheckpoint(arg, sessionId || undefined);
+    if (!cp) {
+      print(`${colors.red}no restore point #${arg}${colors.reset}`);
+      return true;
+    }
+    const drift = diffAgainstCheckpoint(cp);
+    print(`${colors.bold}restore point #${cp.id}${colors.reset}${cp.label ? ` ${colors.dim}${cp.label}${colors.reset}` : ""} ${colors.dim}${cp.ts}${colors.reset}`);
+    if (drift.clean) {
+      print(`  ${colors.dim}workspace already matches this checkpoint — nothing to restore${colors.reset}`);
+      return true;
+    }
+    if (drift.drifted.length) {
+      print(`  ${colors.yellow}${drift.drifted.length} file(s) changed since this checkpoint — restoring discards those edits:${colors.reset}`);
+      for (const f of drift.drifted.slice(0, 15))
+        print(`      ${f.slice(cp.cwd.length + 1)}`);
+      if (drift.drifted.length > 15)
+        print(`      ${colors.dim}… and ${drift.drifted.length - 15} more${colors.reset}`);
+    }
+    if (drift.added.length)
+      print(`  ${drift.added.length} file(s) created since — they will remain`);
+    if (drift.removed.length)
+      print(`  ${drift.removed.length} file(s) deleted since — restoring recreates them`);
+    const forced = /\byes\b/i.test(rawArg);
+    if (tui === undefined && !forced) {
+      print(`${colors.red}refusing to restore without confirmation${colors.reset} ${colors.dim}— stdin is not a terminal, so there is nobody to ask${colors.reset}`);
+      print(`  ${colors.dim}run ${colors.reset}/restore ${cp.id} yes${colors.dim} to go ahead, after reading the file list above${colors.reset}`);
+      return true;
+    }
+    const proceed = tui !== undefined ? await tui.askConfirm(`restore the tree to #${cp.id}? this overwrites the changes above`) : true;
+    if (!proceed) {
+      print(`${colors.dim}left the workspace alone${colors.reset}`);
+      return true;
+    }
+    const res = await restoreCheckpoint(cp);
+    if (res.ok) {
+      for (const f of res.restored.slice(0, 20))
+        print(`${colors.green}restored${colors.reset} ${f.slice(cp.cwd.length + 1)}`);
+      if (res.restored.length > 20)
+        print(`${colors.dim}  … and ${res.restored.length - 20} more${colors.reset}`);
+      if (res.unrecoverable.length) {
+        print(`${colors.yellow}not restorable${colors.reset} ${res.unrecoverable.length} file(s) — too large or unreadable when the checkpoint was taken:`);
+        for (const f of res.unrecoverable.slice(0, 10))
+          print(`      ${f.slice(cp.cwd.length + 1)}`);
+      }
+      print(`${colors.dim}restored ${res.restored.length} file(s) to #${cp.id}. HEAD, the index and unrelated files were not touched.${colors.reset}`);
+    } else {
+      print(`${colors.red}restore failed${colors.reset} ${colors.dim}${res.error}${colors.reset}`);
+      print(`  ${colors.dim}${res.hint}${colors.reset}`);
+    }
+    return true;
+  }
   if (line.trim() === "/about") {
     print(await buildSelfReport());
+    const cs = costSummary();
+    print(cs.turnCount ? `
+  ${colors.bold}cost this session${colors.reset}
+${costReportText()}` : `
+  ${colors.dim}cost this session: no usage reported by the provider yet${colors.reset}`);
     const staged = selfFileDiffStat();
     print(staged ? `
   pending config diff (not yet live):
@@ -6638,8 +7567,10 @@ ${colors.bold}Task queue (${tasks.length})${colors.reset}${online ? "" : `${colo
 }
 async function runPrompt(userInput, tui) {
   messages.push({ role: "user", content: userInput });
+  pendingTask = { request: userInput, reason: "interrupted", toolCalls: 0, at: Date.now() };
   let turnProvider = providerStream;
   let turnModel = llmModel;
+  let turnProviderName = providerName;
   let turnMaxInput = maxInputTokens;
   let turnMaxInputPerMinute = maxInputTokensPerMinute;
   let heavyRoute = false;
@@ -6655,6 +7586,7 @@ async function runPrompt(userInput, tui) {
       const off = router.resolveOffline(userInput);
       turnProvider = off.provider.streamChat.bind(off.provider);
       turnModel = off.model;
+      turnProviderName = off.providerName;
       turnMaxInput = off.maxInputTokens;
       turnMaxInputPerMinute = off.maxInputTokensPerMinute;
       setRuntimeIdentity(off.providerName, off.model);
@@ -6663,11 +7595,17 @@ async function runPrompt(userInput, tui) {
       const route = await router.resolve(userInput, routerMode, taskActive);
       turnProvider = route.provider.streamChat.bind(route.provider);
       turnModel = route.model;
+      turnProviderName = route.providerName;
       turnMaxInput = route.maxInputTokens;
       turnMaxInputPerMinute = route.maxInputTokensPerMinute;
       heavyRoute = router.isHeavy(route);
       setRuntimeIdentity(route.providerName, route.model);
       routeNote = `→ ${heavyRoute ? "heavy" : "chat"}: ${route.providerName}/${route.model}`;
+      if (!heavyRoute) {
+        const why = classifyMessageWhy(userInput);
+        if (why.intent === "heavy")
+          routeNote += ` ${colors.yellow}(classifier said heavy: ${why.reason})${colors.reset}`;
+      }
     }
   }
   if (!tui) {
@@ -6713,7 +7651,9 @@ async function runPrompt(userInput, tui) {
         max_tokens: chatMaxTokens
       },
       maxInputTokens: turnMaxInput,
-      maxInputTokensPerMinute: turnMaxInputPerMinute
+      maxInputTokensPerMinute: turnMaxInputPerMinute,
+      maxCostUsd: rootConfig?.maxCostUsd,
+      costRates: ratesPerMillion(turnProviderName, turnModel)
     }, {
       maxSteps,
       onModelText: (t) => {
@@ -6760,10 +7700,13 @@ ${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.
           process.stdout.write(`${colors.dim}${note}${colors.reset}
 `);
       },
-      confirmTool: async (name, args) => {
-        if (!tui || tui.approveMode === "off")
+      confirmTool: async (name, args, reason) => {
+        if (!tui)
           return true;
-        const ans = await tui.askConfirm(`${colors.yellow}${name}${colors.reset} ${colors.gray}${brief(args)}${colors.reset}`);
+        if (tui.approveMode === "off" && !reason)
+          return true;
+        const why = reason ? ` ${colors.dim}— ${reason}${colors.reset}` : "";
+        const ans = await tui.askConfirm(`${colors.yellow}${name}${colors.reset} ${colors.gray}${brief(args)}${colors.reset}${why}`);
         if (ans === "all")
           tui.approveMode = "off";
         return ans !== "no";
@@ -6779,8 +7722,33 @@ ${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.
       taskActive = false;
     else
       taskActive = heavyRoute && result.toolCalls > 0;
+    if (result.usage) {
+      recordCost({
+        provider: turnProviderName,
+        model: turnModel,
+        inputTokens: result.usage.promptTokens,
+        outputTokens: result.usage.completionTokens,
+        reasoningTokens: result.usage.reasoningTokens
+      });
+    }
+    if (!result.aborted && result.finalText.trim()) {
+      pendingTask = undefined;
+    } else {
+      pendingTask = {
+        request: userInput,
+        reason: result.aborted ? "aborted" : "max_steps",
+        toolCalls: result.toolCalls,
+        at: Date.now()
+      };
+    }
+    if (result.toolCalls > 0 && pendingTask)
+      reportUnfinished(result, tui);
+    if (result.usage) {
+      printTurnCost(result.usage, result.toolCalls, { provider: turnProviderName, model: turnModel }, tui);
+    }
   } catch (err) {
     const msg = err?.message ?? String(err);
+    pendingTask = { request: userInput, reason: "error", toolCalls: 0, at: Date.now() };
     if (tui)
       tui.printToScrollback(`${colors.red}${msg}${colors.reset}`);
     else
@@ -6802,6 +7770,44 @@ ${colors.red}${msg}${colors.reset}
 `);
     }
   }
+}
+function printTurnCost(usage, toolCalls, pricedAs, tui) {
+  const rates = ratesPerMillion(pricedAs.provider, pricedAs.model);
+  const thisTurn = (usage.promptTokens * rates.input + usage.completionTokens * rates.output + usage.reasoningTokens * (rates.reasoning ?? rates.output)) / 1e6;
+  const s = costSummary();
+  const total = s.totalCostUsd;
+  const parts = [
+    `in ${usage.promptTokens.toLocaleString()}`,
+    `out ${usage.completionTokens.toLocaleString()}`
+  ];
+  if (usage.reasoningTokens)
+    parts.push(`reason ${usage.reasoningTokens.toLocaleString()}`);
+  if (toolCalls)
+    parts.push(`${toolCalls} tool call${toolCalls === 1 ? "" : "s"}`);
+  const msg = `${colors.dim}~$${thisTurn.toFixed(4)} this turn (${parts.join(" · ")}) · ` + `session $${total.toFixed(4)} over ${s.turnCount} turn${s.turnCount === 1 ? "" : "s"} · estimate${colors.reset}`;
+  if (tui)
+    tui.printToScrollback(msg);
+  else
+    process.stdout.write(msg + `
+`);
+}
+function reportUnfinished(result, tui) {
+  if (!pendingTask)
+    return;
+  const why = pendingTask.reason === "aborted" ? "was interrupted" : `hit the ${maxSteps}-step limit`;
+  const msg = `${colors.yellow}⚠ task ${why}${colors.reset} ${colors.dim}after ${result.toolCalls} tool call${result.toolCalls === 1 ? "" : "s"}. ` + `The session is saved as unfinished — /diff shows what changed, /revert undoes it, /checkpoint takes a restore point.${colors.reset}`;
+  if (tui)
+    tui.printToScrollback(msg);
+  else
+    process.stdout.write(msg + `
+`);
+}
+function printUnfinishedNote(p, print) {
+  const why = p.reason === "max_steps" ? `hit the step limit after ${p.toolCalls} tool call${p.toolCalls === 1 ? "" : "s"}` : p.reason === "aborted" ? "was interrupted" : p.reason === "error" ? "ended on an error" : p.reason === "cost_cap" ? "stopped at the cost cap" : "ended before finishing";
+  print(`  ${colors.yellow}⚠ unfinished${colors.reset} ${colors.dim}the last task ${why}. Nothing after it ran.${colors.reset}`);
+  print(`      ${colors.dim}request: ${p.request.slice(0, 120)}${colors.reset}`);
+  const changed = sessionDiff(sessionId).files.length;
+  print(`      ${colors.dim}/${changed ? `diff — ${changed} file(s) changed · ` : "diff — "}/checkpoint takes a restore point before you retry${colors.reset}`);
 }
 function mainTUI() {
   const tui = new TUI(24, 80, {
@@ -6894,9 +7900,13 @@ function printUsage() {
   console.log("");
   console.log("Environment:");
   console.log("  VIBECODER_CONFIG     exact config file to use (skips merge); otherwise ~/.vibecoder/config.json overrides defaults");
-  console.log("  VIBECODER_SESSION_DIR  where sessions/ and queue.json live (default ~/.vibecoder)");
+  console.log("  VIBECODER_SESSION_DIR  where sessions/, changes.jsonl and checkpoints live (default ~/.vibecoder)");
+  console.log("  VIBECODER_ENV_FILE   exact .env to read and write; otherwise <cwd>/.env, then ~/.vibecoder/.env");
+  console.log("  VIBECODER_MAX_OUTPUT  max chars of shell output per call (default 30000; excess is dropped from the middle)");
   console.log("  VIBECODER_NO_DOTENV=1   disable .env loading");
-  console.log("  GROQ_API_KEY / NVIDIA_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY  (in ~/.vibecoder/.env or your shell)");
+  console.log("  GROQ_API_KEY / NVIDIA_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY");
+  console.log("      a real shell variable always wins. Otherwise read from, in order:");
+  console.log("      $VIBECODER_ENV_FILE, <cwd>/.env (where `env_set` writes), ~/.vibecoder/.env");
 }
 async function main() {
   loadDotEnv();

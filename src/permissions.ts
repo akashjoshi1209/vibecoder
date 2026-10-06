@@ -493,33 +493,39 @@ export function parseCommands(command: string, depth = 0): SimpleCommand[] {
   return out;
 }
 
-export function checkDestructiveCommand(command: string, perms: Permissions): string | null {
-  if (perms.destructive === "allow") return null;
+/**
+ * Why a command is destructive, or null when it is not.
+ *
+ * Kept separate from checkDestructiveCommand so callers can decide what to do
+ * with a hit: "deny" formats a refusal, "ask" has to throw so the agent loop
+ * can actually prompt a human. Returning a preformatted "PENDING" string for
+ * both is what let "ask" silently do nothing.
+ */
+export function destructiveReason(command: string): string | null {
   for (const cmd of parseCommands(command)) {
     const reason = destructiveReasonFor(cmd);
-    if (reason) {
-      return perms.destructive === "deny"
-        ? `BLOCKED (${perms.destructive}): ${reason}`
-        : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
-    }
+    if (reason) return reason;
     // A redirect that can overwrite a file. `> /dev/null` and the tmp scratch
     // dirs are exempt, matching the previous behaviour.
     if (/(^|[^0-9<>])>{1,2}|\d>&/.test(cmd.raw)) {
       const target = cmd.raw.match(/>{1,2}\s*"?([^\s"';|&]+)"?/);
       const t = target?.[1] ?? "";
       const isScratch = t === "/dev/null" || t === "/dev/stdout" || t === "NUL" || t.startsWith("/tmp/") || t.startsWith("/var/tmp/") || t.startsWith("C:/Windows/Temp/") || t.startsWith("C:\\Windows\\Temp\\");
-      if (!isScratch) return perms.destructive === "deny"
-        ? `BLOCKED (${perms.destructive}): output redirection (may overwrite files)`
-        : `PENDING (${perms.destructive}): output redirection (may overwrite files) — awaiting approval`;
+      if (!isScratch) return "output redirection (may overwrite files)";
     }
     // `tee` writes through to a file just as a redirect does.
-    if (commandName(cmd.argv[0] ?? "") === "tee") {
-      return perms.destructive === "deny"
-        ? `BLOCKED (${perms.destructive}): tee writes to a file`
-        : `PENDING (${perms.destructive}): tee writes to a file — awaiting approval`;
-    }
+    if (commandName(cmd.argv[0] ?? "") === "tee") return "tee writes to a file";
   }
   return null;
+}
+
+export function checkDestructiveCommand(command: string, perms: Permissions): string | null {
+  if (perms.destructive === "allow") return null;
+  const reason = destructiveReason(command);
+  if (!reason) return null;
+  return perms.destructive === "deny"
+    ? `BLOCKED (${perms.destructive}): ${reason}`
+    : `PENDING (${perms.destructive}): ${reason} — awaiting approval`;
 }
 
 export function checkNetworkCommand(command: string, perms: Permissions): string | null {
