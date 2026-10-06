@@ -53,3 +53,19 @@ jobs:
       # global; this catches what isolation cannot (shared disk state, caches).
       - name: Tests (randomized order, seed 4242)
         run: bun test --isolate --randomize --seed=4242 --timeout=60000
+
+      # dist/ is no longer committed, so the tarball IS the distribution: pack
+      # it and install it into a clean project the way a user would. npm pack
+      # runs `prepare` (build) first, so this also proves a from-scratch build
+      # ships everything the bin needs.
+      - name: Pack + install-from-tarball smoke
+        run: |
+          npm pack
+          TARBALL=$(ls vibecoder-cli-*.tgz | head -1)
+          SMOKE=$(mktemp -d)
+          cd "$SMOKE"
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$TARBALL"
+          ./node_modules/.bin/vibecoder --version
+          ./node_modules/.bin/vibecoder --help | grep -q "Usage:"
+          echo "tarball smoke OK ($TARBALL)"

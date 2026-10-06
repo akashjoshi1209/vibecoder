@@ -23,6 +23,7 @@ scan-*.ts
 brag/
 
 # Generated output dirs
+dist/
 brag-output/
 graphify_out/
 demopilot/

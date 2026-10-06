@@ -1,0 +1,73 @@
+# Release: gate on a clean build+typecheck+test, publish to npm, and attach
+# the tarball + change log to a GitHub release.
+#
+# Triggers:
+#   - push of a v* tag (the normal path: `git tag v1.2.3 && git push --tags`)
+#   - workflow_dispatch (manual re-run; publish/release steps only run when the
+#     ref is a tag, so a branch dispatch is a gates-only dry run)
+#
+# The npm `prepublishOnly` script (build + typecheck + test) remains the
+# last-ditch gate inside `npm publish` itself — belt and braces.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release and upload assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun run test
+
+      - name: Build
+        run: bun run build
+
+      # A tag that does not match package.json would publish a version under
+      # the wrong name; fail before anything leaves the runner.
+      - name: Tag/version integrity check
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PKG_VERSION="v$(node -p 'require("./package.json").version')"
+          if [ "$PKG_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches package.json $PKG_VERSION"
+
+      - name: Pack
+        run: npm pack
+
+      - name: Publish to npm
+        if: ${{ startsWith(github.ref, 'refs/tags/') && secrets.NPM_TOKEN != '' }}
+        run: |
+          npm config set "//registry.npmjs.org/:_authToken" "$NPM_TOKEN"
+          npm publish --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: GitHub release (tarball + change log)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tgz
+            CHANGELOG.md
+          generate_release_notes: true

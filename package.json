@@ -40,6 +40,7 @@
     "dev": "bun run src/cli.ts",
     "start": "bun run src/cli.ts",
     "build": "bun run scripts/build.ts",
+    "prepare": "bun run build",
     "prepublishOnly": "bun run build && bun run typecheck && bun run test",
     "typecheck": "tsc --noEmit",
     "test": "bun test --isolate --timeout=60000",
