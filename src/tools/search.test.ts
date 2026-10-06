@@ -37,19 +37,56 @@ describe("grep", () => {
 
   test("does not execute shell metacharacters inside the pattern", async () => {
     const res = await executeTool("grep", { pattern: "alpha$(touch /tmp/vc-injected)" }, ctx());
-    expect(res).toBe("(no matches)");
+    expect(res).toContain("(no matches)");
+    expect(res).toContain("[engine:");
     const exists = await Bun.file("/tmp/vc-injected").exists();
     expect(exists).toBe(false);
   });
 
   test("handles a pattern starting with a dash", async () => {
     const res = await executeTool("grep", { pattern: "-alpha" }, ctx());
-    expect(res).toBe("(no matches)");
+    expect(res).toContain("(no matches)");
+    expect(res).toContain("[engine:");
   });
 
   test("reports a missing directory as an error", async () => {
     const res = await executeTool("grep", { pattern: "x", path: "/does/not/exist/xyz" }, ctx());
     expect(res).toMatch(/ERROR/i);
+  });
+});
+
+describe("grep engine selection", () => {
+  test("the shell engine states itself", async () => {
+    delete process.env.VIBECODER_NO_GREP;
+    const res = await executeTool("grep", { pattern: "alpha" }, ctx());
+    expect(res).toContain("a.txt");
+    expect(res).toContain("[engine: grep]");
+  });
+
+  test("VIBECODER_NO_GREP forces the in-process engine and the output says so", async () => {
+    process.env.VIBECODER_NO_GREP = "1";
+    try {
+      const res = await executeTool("grep", { pattern: "alpha" }, ctx());
+      expect(res).toContain("a.txt");
+      expect(res).toContain("b.ts");
+      expect(res).toContain("[engine: in-process fallback");
+    } finally {
+      delete process.env.VIBECODER_NO_GREP;
+    }
+  });
+
+  test("the fallback pages identically to the shell engine", async () => {
+    process.env.VIBECODER_NO_GREP = "1";
+    try {
+      const c = ctx();
+      const page1 = await executeTool("grep", { pattern: "alpha", limit: 1 }, c);
+      expect(page1).toContain("[engine: in-process fallback");
+      expect(page1).toContain("offset");
+      const page99 = await executeTool("grep", { pattern: "alpha", limit: 1, offset: 99 }, c);
+      expect(page99).toContain("you paged past the end");
+    } finally {
+      delete process.env.VIBECODER_NO_GREP;
+    }
   });
 });
 

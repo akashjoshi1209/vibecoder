@@ -283,6 +283,9 @@ async function init() {
   if (process.argv.includes("--no-network")) permissions.network = "deny";
   if (process.argv.includes("--sandbox")) permissions.filesystem = "workspace";
   if (process.argv.includes("--expose-secrets")) permissions.exposeSecrets = true;
+  // Search engine choice: --no-grep forces the bounded in-process fallback
+  // (also reachable as VIBECODER_NO_GREP=1 for CI/tests).
+  if (process.argv.includes("--no-grep")) process.env.VIBECODER_NO_GREP = "1";
   if (process.argv.includes("--plan")) {
     planPhase = true;
     planPhaseNextTurn = true;
@@ -1245,6 +1248,7 @@ function printUsage(): void {
   console.log("  --trace <file>      append a structured run trace (JSONL) for debugging");
   console.log("  --trace-anon        with --trace: scrub home/cwd paths and secrets (bug reports)");
   console.log("  --trace-replay <f>  print a recorded trace offline and exit (no model needed)");
+  console.log("  --no-grep           search with the in-process engine instead of shelling to grep");
   console.log("  --plan              run the first turn in plan mode (investigate + propose, no changes)");
   console.log("  --version, -v       print version");
   console.log("  --help, -h          this help");
