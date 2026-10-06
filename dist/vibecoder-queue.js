@@ -1799,6 +1799,14 @@ function killProcessGroup(child, signal = "SIGKILL") {
     } catch {}
   }
 }
+function killProcessTree(child, signal = "SIGKILL") {
+  if (child.pid === undefined || child.pid <= 0)
+    return;
+  killProcessGroup(child, signal);
+  try {
+    child.kill(signal);
+  } catch {}
+}
 function resolveCommand(cmd) {
   if (cmd.includes("/") || cmd.includes("\\"))
     return cmd;
@@ -1897,7 +1905,7 @@ function spawnCollect(opts) {
       timer = setTimeout(() => {
         timedOut = true;
         opts.onTimeout?.();
-        killProcessGroup(child);
+        killProcessTree(child);
         settle(-1);
       }, opts.timeoutMs);
     }

@@ -10,7 +10,8 @@ git clone https://github.com/akashjoshi1209/vibecoder.git
 cd vibecoder
 bun install          # installs dev deps (typescript, type defs)
 bun run typecheck    # tsc --noEmit
-bun test             # full suite (unit tests only; they never call an LLM)
+bun run test         # full suite (uses a 60s per-test timeout — spawns are
+                     # slow under Bun on Android/Termux/proot; Node is ~30ms/spawn)
 ```
 
 Run it from source:
@@ -56,14 +57,14 @@ config.json                built-in defaults (shipped with the package)
 
 1. Branch or fork with a descriptive name.
 2. Make the change small and focused; keep it Node-compatible.
-3. Run `bun run typecheck` and `bun test` — both must pass.
+3. Run `bun run typecheck` and `bun run test` — both must pass.
 4. For user-facing behavior, update `README.md` and the `--help` text in
    `src/ui/repl.ts`.
 
 ## Releasing
 
-Version bumps + `npm publish` are done from a maintainer account. CI runs
-`prepublishOnly` (build + typecheck + tests) before pack.
+Version bumps + `npm publish` are done from a maintainer account. `.github/workflows/ci.yml`
+runs build + typecheck + tests on every push/PR, and `prepublishOnly` repeats them before pack.
 
 ## Reporting issues
 

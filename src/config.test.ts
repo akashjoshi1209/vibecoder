@@ -1,8 +1,15 @@
 import { describe, expect, test, afterEach, beforeEach } from "bun:test";
-import { deepMerge, isPlainObject, loadConfig, configPaths, FALLBACK_CONFIG } from "./config";
+import { deepMerge, isPlainObject, loadConfig, configPaths, loadJsonFile, FALLBACK_CONFIG } from "./config";
+import { resolvePackageFile } from "./paths";
+import type { RootConfig } from "./llm/client";
 import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+// What `loadConfig` returns with no user file: the shipped package config.json,
+// or the hardcoded fallback when the package file is unavailable.
+const builtinFile = resolvePackageFile("config.json");
+const BUILTIN_CONFIG: RootConfig = builtinFile ? loadJsonFile<RootConfig>(builtinFile) : FALLBACK_CONFIG;
 
 let dir: string;
 
@@ -56,8 +63,8 @@ describe("loadConfig", () => {
   test("uses builtin defaults when no user file exists", async () => {
     process.env.VIBECODER_SESSION_DIR = dir;
     const cfg = await loadConfig();
-    expect(cfg.provider).toBe(FALLBACK_CONFIG.provider);
-    expect(cfg.model).toBe(FALLBACK_CONFIG.model);
+    expect(cfg.provider).toBe(BUILTIN_CONFIG.provider);
+    expect(cfg.model).toBe(BUILTIN_CONFIG.model);
   });
 
   test("VIBECODER_CONFIG is a full takeover, not a merge", async () => {
@@ -87,7 +94,7 @@ describe("loadConfig", () => {
     expect(info.merged).toBe(true);
     const cfg = await loadConfig();
     expect(cfg.model).toBe("merged-model");
-    expect(cfg.provider).toBe(FALLBACK_CONFIG.provider);
+    expect(cfg.provider).toBe(BUILTIN_CONFIG.provider);
   });
 
   test("missing user file is tolerated and reported as not merged", async () => {
@@ -96,6 +103,6 @@ describe("loadConfig", () => {
     expect(info.merged).toBe(false);
     expect(info.userFile).toBe(join(dir, "config.json"));
     const cfg = await loadConfig();
-    expect(cfg.provider).toBe(FALLBACK_CONFIG.provider);
+    expect(cfg.provider).toBe(BUILTIN_CONFIG.provider);
   });
 });

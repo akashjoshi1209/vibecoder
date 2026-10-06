@@ -6,6 +6,7 @@ import { enqueueTask, listTasks, setQueueFileOverride, type QueuedTask } from ".
 import { ensureOllamaServe } from "../ollama";
 import type { Message, ChatOptions, ChatChunk, StreamResult } from "../llm/types";
 import { runAgent } from "../agent/loop";
+import { PLAN_MODE_PROMPT, isPlanOutput, stripPlanEnvelope } from "../agent/plan-mode";
 import "../tools/bash";
 import "../tools/files";
 import "../tools/search";
@@ -30,7 +31,6 @@ import { runDoctor } from "../doctor";
 import { runSetup } from "../setup";
 import { readPackageJson } from "../paths";
 import { resolvePermissions, type Permissions } from "../permissions";
-import { PLAN_MODE_PROMPT } from "../agent/plan-mode";
 import { setRootConfig } from "../runtime";
 import { recordCost, costSummary, costReportText, ratesPerMillion } from "../cost";
 import {
@@ -229,7 +229,7 @@ async function init() {
       if (tuiRef) {
         const rl = routeLabel();
         tuiRef.setStatus(
-          `${onlineStatus()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`,
+          `${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`,
           8,
         );
       }
@@ -284,6 +284,10 @@ function onlineStatus(): string {
   if (online) return "";
   const off = router?.offlineIdentity();
   return off ? `offline (${off.provider}/${off.model}) · ` : "offline · ";
+}
+
+function planTag(): string {
+  return planPhaseNextTurn ? "plan · " : "";
 }
 
 /** Queue a task that was given while offline. Draft a plan note with the local
@@ -345,7 +349,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   const setStatus = () => {
     if (tui) {
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
   };
 
@@ -360,7 +364,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/model <id>${colors.reset}       switch model`);
     print(`  ${colors.green}/route [auto|chat|heavy]${colors.reset} ${colors.dim}model routing: auto-classify, or force chat/heavy model${colors.reset}`);
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
-  print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}next turn plans only — no writes, installs, or git changes${colors.reset}`);
+  print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}next turn plans only, then clears — no writes, installs, or git changes${colors.reset}`);
   print(`  ${colors.green}/permissions${colors.reset}         ${colors.dim}show the active permission model${colors.reset}`);
     print(`  ${colors.green}/diff${colors.reset}             ${colors.dim}files this session changed, plus its restore points${colors.reset}`);
     print(`  ${colors.green}/revert [path…|all]${colors.reset}  ${colors.dim}undo those changes from pre-images${colors.reset}`);
@@ -504,6 +508,25 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     }
     return true;
   }
+  if (line === "/plan" || line.startsWith("/plan ")) {
+    const arg = line.slice(5).trim().toLowerCase();
+    if (arg === "on") planPhase = true;
+    else if (arg === "off") {
+      planPhase = false;
+      planPhaseNextTurn = false;
+    } else if (!arg) planPhase = !planPhase;
+    else {
+      print(`${colors.red}usage: /plan [on|off]${colors.reset}`);
+      return true;
+    }
+    setStatus();
+    print(
+      planPhase
+        ? `${colors.green}plan mode on${colors.reset} ${colors.dim}— read-only: the agent investigates and returns a plan; write_file, edit_file, and destructive bash are blocked${colors.reset}`
+        : `${colors.dim}plan mode off — the agent may execute changes again${colors.reset}`,
+    );
+    return true;
+  }
   if (line.startsWith("/approve")) {
     const arg = line.slice(8).trim().toLowerCase();
     if (tui) {
@@ -513,21 +536,6 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
       setStatus();
       print(`${colors.dim}tool approval: ${tui.approveMode === "on" ? "on (you approve each tool call)" : "off (agents act freely)"}${colors.reset}`);
     }
-    return true;
-  }
-  if (line.startsWith("/plan")) {
-    const arg = line.slice(5).trim().toLowerCase();
-    if (arg === "on" || arg === "off") planPhase = arg === "on";
-    else if (arg === "") planPhase = !planPhase;
-    else {
-      print(`${colors.red}usage: /plan [on|off]${colors.reset}`);
-      return true;
-    }
-    planPhaseNextTurn = planPhase;
-    setStatus();
-    print(
-      `${colors.dim}plan mode: ${planPhase ? "on — the next turn investigates and plans only (no writes, no installs, no git changes)" : "off"}${colors.reset}`,
-    );
     return true;
   }
   if (line.startsWith("/permissions")) {
@@ -954,7 +962,8 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
       },
     );
 
-    messages.push({ role: "assistant", content: result.finalText });
+    const isPlan = thisTurnIsPlan && isPlanOutput(result.finalText);
+    messages.push({ role: "assistant", content: isPlan ? stripPlanEnvelope(result.finalText) : result.finalText });
     if (result.aborted) taskActive = false;
     else taskActive = heavyRoute && result.toolCalls > 0;
     void aborted;
@@ -971,7 +980,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     }
     // Distinguish "the model finished" from "we ran out of road". Only the
     // former should clear the pending marker, and only when the model actually
-    // said something — a silent step-limit stop is not a finished task.
+    // said something - a silent step-limit stop is not a finished task.
     if (!result.aborted && result.finalText.trim()) {
       pendingTask = undefined;
     } else {
@@ -989,6 +998,16 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     if (result.usage) {
       printTurnCost(result.usage, result.toolCalls, { provider: turnProviderName, model: turnModel }, tui);
     }
+    // Say when a plan is ready for review. This came from the Node-porting branch,
+    // as did the plan-envelope stripping just above: the model wraps a plan in a
+    // fenced <plan> envelope that is stripped before the transcript keeps it, so
+    // without an explicit marker a plan reply reads like an ordinary answer and
+    // nobody gets told the agent can now go execute it.
+    if (isPlan) {
+      const note = "plan ready - review it, then ask for the work (plan mode cleared itself, so the next turn can execute)";
+      if (tui) tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
+      else process.stdout.write(`\n${colors.dim}${note}${colors.reset}\n`);
+    }
   } catch (err: any) {
     const msg = err?.message ?? String(err);
     pendingTask = { request: userInput, reason: "error", toolCalls: 0, at: Date.now() };
@@ -1002,7 +1021,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
     if (tui) {
       tui.busy = false;
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     } else {
       process.stdout.write("\n");
     }
@@ -1100,7 +1119,7 @@ function mainTUI(): void {
 
   tui.start();
   const rl0 = routeLabel();
-  tui.setStatus(`${onlineStatus()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
+  tui.setStatus(`${onlineStatus()}${planTag()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
 }
 
 function mainLine(): void {
@@ -1150,6 +1169,7 @@ function printUsage(): void {
   console.log("  --provider <name>   pick provider (groq, ollama, openai, anthropic, nvidia…)");
   console.log("  --model <id>        pick model");
   console.log("  --resume [name]     resume last (or named) conversation");
+  console.log("  --plan              plan mode: investigate and return a plan without changing anything");
   console.log("  --max-steps <n>     cap the agent loop (default 40)");
   console.log("  --cwd <path>        work from another directory");
   console.log("  --sandbox           restrict file tools + bash to --cwd");

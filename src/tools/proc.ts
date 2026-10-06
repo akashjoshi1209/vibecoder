@@ -80,6 +80,24 @@ export function killProcessGroup(
 
 type SpawnedChild = { pid?: number; kill: (signal?: NodeJS.Signals) => boolean };
 
+/**
+ * Kill the process group first (covers grandchildren such as a `sleep` spawned
+ * by the shell), then the child itself as a fallback for platforms where
+ * process groups are unavailable.
+ */
+export function killProcessTree(
+  child: { pid?: number; kill: (signal?: NodeJS.Signals) => boolean },
+  signal: NodeJS.Signals = "SIGKILL",
+): void {
+  if (child.pid === undefined || child.pid <= 0) return;
+  killProcessGroup(child, signal);
+  try {
+    child.kill(signal);
+  } catch {
+    // already gone
+  }
+}
+
 export function killChildGroup(child: SpawnedChild, signal: NodeJS.Signals = "SIGKILL"): void {
   killProcessGroup(child, signal);
 }
@@ -193,7 +211,7 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
       timer = setTimeout(() => {
         timedOut = true;
         opts.onTimeout?.();
-        killProcessGroup(child);
+        killProcessTree(child);
         // Return whatever we have now. `close` waits for the stdout/stderr pipes
         // to close, and a surviving grandchild (Windows tree-kill failure, or a
         // process that outlived SIGKILL) would hold them open for as long as it

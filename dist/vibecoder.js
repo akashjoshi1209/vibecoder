@@ -1764,6 +1764,14 @@ function killProcessGroup(child, signal = "SIGKILL") {
     } catch {}
   }
 }
+function killProcessTree(child, signal = "SIGKILL") {
+  if (child.pid === undefined || child.pid <= 0)
+    return;
+  killProcessGroup(child, signal);
+  try {
+    child.kill(signal);
+  } catch {}
+}
 function resolveCommand(cmd) {
   if (cmd.includes("/") || cmd.includes("\\"))
     return cmd;
@@ -1862,7 +1870,7 @@ function spawnCollect(opts) {
       timer = setTimeout(() => {
         timedOut = true;
         opts.onTimeout?.();
-        killProcessGroup(child);
+        killProcessTree(child);
         settle(-1);
       }, opts.timeoutMs);
     }
@@ -3921,7 +3929,67 @@ async function ensureOllamaServe(opts = {}) {
   return { running: false, started: true, error: msg };
 }
 
+// src/agent/plan-mode.ts
+var PLAN_MODE_PROMPT = `You are in PLAN MODE. This entire turn is ONLY for understanding and planning — you MUST NOT change anything. write_file and edit_file are disabled, and destructive bash commands are rejected; any attempt is blocked and reported to the human.
+
+RULES:
+- Use read-only tools to actually investigate before you say anything: list_dir, read_file, and non-destructive bash (ls, find, grep, cat, git status/diff/log, running tests is fine). Do NOT guess — base every line of the plan on what you observed.
+- Figure out the current state: what already exists, how the pieces fit together, what the task really needs, and what could break if you changed things.
+- Do not write code files, do not run installs, do not mutate git, sockets, processes, or permissions.
+
+Finish by producing a plan in EXACTLY this format:
+
+UNDERSTAND: <2-4 sentences: the current state you observed + what the task requires>
+PLAN:
+1. <concrete step>
+2. <concrete step>
+...
+FILES: <the files you intend to create or modify>
+RISKS: <risks, unknowns, and how you will verify the work>
+
+If the request is genuinely not a task you can act on, or is missing information, say so briefly instead of inventing a plan.`;
+function isPlanOutput(text) {
+  return /PLAN\s*:/.test(text) || /UNDERSTAND\s*:/.test(text);
+}
+function stripPlanEnvelope(text) {
+  const t = text.trim();
+  const i = t.indexOf("UNDERSTAND:");
+  const j = t.indexOf("PLAN:");
+  const start = i === -1 ? j === -1 ? 0 : j : i;
+  const nofence = t.slice(start).replace(/(^|\n)```(\w*)\n?/, "$1").replace(/\n?```$/, "").trim();
+  return nofence || t;
+}
+
 // src/tools/termux.ts
+var ENV = () => ({ ...process.env, NO_COLOR: "1" });
+async function runTermux(cmd, ctx, opts = {}) {
+  const res = await spawnCollect({
+    cmd,
+    env: ENV(),
+    timeoutMs: opts.timeoutMs ?? 30000,
+    signal: ctx.signal
+  });
+  if (res.exitCode < 0) {
+    return `ERROR: ${cmd[0]} failed: ${res.stderr.trim() || "could not be spawned"} (is termux-api installed? pkg install termux-api)`;
+  }
+  let output = "";
+  if (res.stdout)
+    output += res.stdout;
+  if (res.stderr)
+    output += res.stderr ? (output ? `
+` : "") + res.stderr : "";
+  if (res.timedOut)
+    output += (output ? `
+` : "") + "[killed: timed out]";
+  if (res.aborted)
+    output += (output ? `
+` : "") + "[killed: interrupted]";
+  if (!res.timedOut && !res.aborted && res.exitCode !== 0) {
+    output += (output ? `
+` : "") + `[exit code: ${res.exitCode}]`;
+  }
+  return output || opts.emptyText || `(ran ${cmd[0]})`;
+}
 registerTool({
   definition: {
     type: "function",
@@ -3931,8 +3999,8 @@ registerTool({
       parameters: {
         type: "object",
         properties: {
-          title: { type: "string", description: "Notification title (short)" },
-          message: { type: "string", description: "Notification body (optional, defaults to title)" }
+          title: { type: "string", description: "Notification title (short, ≤100 chars)" },
+          message: { type: "string", description: "Notification body (optional, ≤500 chars; defaults to title)" }
         },
         required: ["title"]
       }
@@ -3943,40 +4011,50 @@ registerTool({
     const message = String(args.message ?? title).slice(0, 500);
     if (!title)
       return "ERROR: title is required";
-    const proc = Bun.spawn({
-      cmd: [
-        "termux-notification",
-        "--title",
-        title,
-        "--content",
-        message
-      ],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true
+    return runTermux(["termux-notification", "--title", title, "--content", message], ctx, {
+      emptyText: `notification pushed: "${title}"`
     });
-    try {
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited
-      ]);
-      let output = "";
-      if (stdout)
-        output += stdout;
-      if (stderr)
-        output += stderr ? (output ? `
-` : "") + stderr : "";
-      if (exitCode !== 0)
-        output += (output ? `
-` : "") + `[exit code: ${exitCode}]`;
-      return output || `notification pushed: "${title}"`;
-    } catch (err) {
-      return `ERROR: termux-notification failed: ${err?.message ?? String(err)} (is termux-api installed? pkg install termux-api)`;
-    }
   }
 });
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "termux_wake_lock",
+      description: "Acquire or release a Termux wake lock (termux-wake-lock / termux-wake-unlock). Keeps the phone awake during a long agent run so it does not sleep mid-task. Without args or acquire=true acquires the lock; pass acquire=false to release. Inert when the binary isn't installed.",
+      parameters: {
+        type: "object",
+        properties: {
+          acquire: { type: "boolean", description: "true to acquire (default), false to release" }
+        }
+      }
+    }
+  },
+  async run(args, ctx) {
+    const acquire = args.acquire !== false;
+    return runTermux(acquire ? ["termux-wake-lock"] : ["termux-wake-unlock"], ctx, {
+      emptyText: acquire ? "wake lock acquired" : "wake lock released"
+    });
+  }
+});
+registerTool({
+  definition: {
+    type: "function",
+    function: {
+      name: "termux_battery",
+      description: "Get battery status via Termux:API (termux-battery-status): level, status (charging/discharging/full), temperature, voltage. Check before long tasks to confirm the phone is charging. Inert when the binary isn't installed.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  async run(_args, ctx) {
+    return runTermux(["termux-battery-status"], ctx, { emptyText: "(no battery output)" });
+  }
+});
+
+// src/tools/spawn.ts
+function spawnCollect2(opts) {
+  return spawnCollect(opts);
+}
 
 // src/tools/network.ts
 registerTool({
@@ -3995,48 +4073,20 @@ registerTool({
   },
   async run(args, ctx) {
     const host = String(args.host ?? "").trim();
-    let hasBin = false;
-    try {
-      const bin = Bun.spawn({
-        cmd: ["which", "tailscale"],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal
-      });
-      const [whichOut, whichErr, whichExit] = await Promise.all([
-        new Response(bin.stdout).text(),
-        new Response(bin.stderr).text(),
-        bin.exited
-      ]);
-      hasBin = whichExit === 0 && whichOut.trim().length > 0;
-    } catch {
-      hasBin = false;
-    }
+    const env = { ...process.env, NO_COLOR: "1" };
+    const which = await spawnCollect2({ cmd: ["which", "tailscale"], env, timeoutMs: 15000, signal: ctx.signal });
+    const hasBin = which.exitCode === 0 && which.stdout.trim().length > 0;
     if (!hasBin) {
       return "NOTE: tailscale not found on PATH. Install it: https://tailscale.com/download (or pkg install tailscale on Termux).";
     }
     let lastErr = "";
     async function tryJson() {
-      const proc = Bun.spawn({
-        cmd: ["tailscale", "status", "--json"],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited
-      ]);
-      lastErr = stderr || "(no stderr)";
-      if (exitCode !== 0 || !stdout.trim())
+      const proc = await spawnCollect2({ cmd: ["tailscale", "status", "--json"], env, timeoutMs: 30000, signal: ctx.signal });
+      lastErr = proc.stderr || "(no stderr)";
+      if (proc.exitCode !== 0 || !proc.stdout.trim())
         return null;
       try {
-        const j = JSON.parse(stdout.trim());
+        const j = JSON.parse(proc.stdout.trim());
         if (host) {
           const peer = j.Peers?.[host];
           if (!peer) {
@@ -4051,7 +4101,7 @@ ${known || "(none)"}`;
         const hostname = j.HostInfo?.HostName ?? "(unknown hostname)";
         const selfIps = (j.Self?.TailscaleIPs ?? []).filter(Boolean);
         const peers = j.Peers ?? {};
-        const peerList = Object.entries(peers).filter(([k, p]) => !!k).map(([k, p]) => `  ${k} → ${(p.TailscaleIPs ?? []).join(", ") || "(no IP)"} ${p.Online ? "" : "(offline)"}`).join(`
+        const peerList = Object.entries(peers).filter(([k]) => !!k).map(([k, p]) => `  ${k} → ${(p.TailscaleIPs ?? []).join(", ") || "(no IP)"} ${p.Online ? "" : "(offline)"}`).join(`
 `);
         const connected = j.BackendState === "Running" || j.CanCarryPossibly === true;
         if (!peerList)
@@ -4077,28 +4127,24 @@ ${known || "(none)"}`;
     const jsonOut = await tryJson();
     if (jsonOut)
       return jsonOut;
-    const plain = Bun.spawn({
-      cmd: ["tailscale", "status"],
-      stdout: "pipe",
-      stderr: "pipe",
-      env: { ...process.env, NO_COLOR: "1" },
-      detached: true,
-      signal: ctx.signal
-    });
-    const [pOut, pErr, pExit] = await Promise.all([
-      new Response(plain.stdout).text(),
-      new Response(plain.stderr).text(),
-      plain.exited
-    ]);
+    const plain = await spawnCollect2({ cmd: ["tailscale", "status"], env, timeoutMs: 30000, signal: ctx.signal });
     let text = "";
-    if (pOut)
-      text += pOut;
-    if (pErr)
+    if (plain.stdout)
+      text += plain.stdout;
+    if (plain.stderr)
       text += (text ? `
-` : "") + pErr;
-    if (pExit !== 0)
+` : "") + plain.stderr;
+    if (plain.timedOut)
       text += (text ? `
-` : "") + `[exit code: ${pExit}]`;
+` : "") + "[killed: timed out]";
+    if (plain.aborted)
+      text += (text ? `
+` : "") + "[killed: interrupted]";
+    if (plain.exitCode < 0)
+      return `ERROR: tailscale status failed: ${plain.stderr.trim() || "could not be spawned"}`;
+    if (!plain.timedOut && !plain.aborted && plain.exitCode !== 0)
+      text += (text ? `
+` : "") + `[exit code: ${plain.exitCode}]`;
     if (text)
       return text;
     return lastErr || "(no output)";
@@ -4123,33 +4169,31 @@ registerTool({
     const host = String(args.host ?? "").trim();
     if (!host)
       return "ERROR: host is required";
-    try {
-      const proc = Bun.spawn({
-        cmd: ["ping", "-c", "3", "-W", "5", host],
-        stdout: "pipe",
-        stderr: "pipe",
-        env: { ...process.env, NO_COLOR: "1" },
-        detached: true,
-        signal: ctx.signal
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited
-      ]);
-      let out = "";
-      if (stdout)
-        out += stdout;
-      if (stderr)
-        out += (out ? `
-` : "") + stderr;
-      if (exitCode !== 0)
-        out += (out ? `
-` : "") + `[exit code: ${exitCode}]`;
-      return out || `(ping ${host})`;
-    } catch (err) {
-      return `NOTE: ping not available: ${err?.message ?? String(err)}`;
-    }
+    const env = { ...process.env, NO_COLOR: "1" };
+    const proc = await spawnCollect2({
+      cmd: ["ping", "-c", "3", "-W", "5", host],
+      env,
+      timeoutMs: 20000,
+      signal: ctx.signal
+    });
+    if (proc.exitCode < 0)
+      return `NOTE: ping not available: ${proc.stderr.trim() || "could not be spawned"}`;
+    let out = "";
+    if (proc.stdout)
+      out += proc.stdout;
+    if (proc.stderr)
+      out += (out ? `
+` : "") + proc.stderr;
+    if (proc.timedOut)
+      out += (out ? `
+` : "") + "[killed: timed out]";
+    if (proc.aborted)
+      out += (out ? `
+` : "") + "[killed: interrupted]";
+    if (!proc.timedOut && !proc.aborted && proc.exitCode !== 0)
+      out += (out ? `
+` : "") + `[exit code: ${proc.exitCode}]`;
+    return out || `(ping ${host})`;
   }
 });
 
@@ -6775,26 +6819,6 @@ async function runSetup(argv) {
   return 0;
 }
 
-// src/agent/plan-mode.ts
-var PLAN_MODE_PROMPT = `You are in PLAN MODE. This entire turn is ONLY for understanding and planning — you MUST NOT change anything. write_file and edit_file are disabled, and destructive bash commands are rejected; any attempt is blocked and reported to the human.
-
-RULES:
-- Use read-only tools to actually investigate before you say anything: list_dir, read_file, and non-destructive bash (ls, find, grep, cat, git status/diff/log, running tests is fine). Do NOT guess — base every line of the plan on what you observed.
-- Figure out the current state: what already exists, how the pieces fit together, what the task really needs, and what could break if you changed things.
-- Do not write code files, do not run installs, do not mutate git, sockets, processes, or permissions.
-
-Finish by producing a plan in EXACTLY this format:
-
-UNDERSTAND: <2-4 sentences: the current state you observed + what the task requires>
-PLAN:
-1. <concrete step>
-2. <concrete step>
-...
-FILES: <the files you intend to create or modify>
-RISKS: <risks, unknowns, and how you will verify the work>
-
-If the request is genuinely not a task you can act on, or is missing information, say so briefly instead of inventing a plan.`;
-
 // src/cost.ts
 var byTurn = [];
 var turnIndex = 0;
@@ -7011,7 +7035,7 @@ async function init() {
     online = now;
     if (tuiRef) {
       const rl = routeLabel();
-      tuiRef.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
+      tuiRef.setStatus(`${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tuiRef.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     }
     if (online)
       inAppDrain();
@@ -7063,6 +7087,9 @@ function onlineStatus() {
     return "";
   const off = router?.offlineIdentity();
   return off ? `offline (${off.provider}/${off.model}) · ` : "offline · ";
+}
+function planTag() {
+  return planPhaseNextTurn ? "plan · " : "";
 }
 async function queueOfflineTask(userInput, tui) {
   if (!router || !rootConfig)
@@ -7127,7 +7154,7 @@ async function handleCommand(line, tui) {
   const setStatus = () => {
     if (tui) {
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? `provider ${providerName} · model ${llmModel} · ${rl}` : `provider ${providerName} · model ${llmModel}`}`, 8);
     }
   };
   if (["exit", "quit", "/exit", "/quit"].includes(line.trim())) {
@@ -7143,7 +7170,7 @@ ${colors.bold}Commands${colors.reset}`);
     print(`  ${colors.green}/model <id>${colors.reset}       switch model`);
     print(`  ${colors.green}/route [auto|chat|heavy]${colors.reset} ${colors.dim}model routing: auto-classify, or force chat/heavy model${colors.reset}`);
     print(`  ${colors.green}/approve [on|off]${colors.reset} ${colors.dim}toggle tool approval prompts (default off = no limits)${colors.reset}`);
-    print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}next turn plans only — no writes, installs, or git changes${colors.reset}`);
+    print(`  ${colors.green}/plan [on|off]${colors.reset}     ${colors.dim}next turn plans only, then clears — no writes, installs, or git changes${colors.reset}`);
     print(`  ${colors.green}/permissions${colors.reset}         ${colors.dim}show the active permission model${colors.reset}`);
     print(`  ${colors.green}/diff${colors.reset}             ${colors.dim}files this session changed, plus its restore points${colors.reset}`);
     print(`  ${colors.green}/revert [path…|all]${colors.reset}  ${colors.dim}undo those changes from pre-images${colors.reset}`);
@@ -7288,6 +7315,23 @@ ${colors.bold}Saved conversations${colors.reset}`);
     }
     return true;
   }
+  if (line === "/plan" || line.startsWith("/plan ")) {
+    const arg = line.slice(5).trim().toLowerCase();
+    if (arg === "on")
+      planPhase = true;
+    else if (arg === "off") {
+      planPhase = false;
+      planPhaseNextTurn = false;
+    } else if (!arg)
+      planPhase = !planPhase;
+    else {
+      print(`${colors.red}usage: /plan [on|off]${colors.reset}`);
+      return true;
+    }
+    setStatus();
+    print(planPhase ? `${colors.green}plan mode on${colors.reset} ${colors.dim}— read-only: the agent investigates and returns a plan; write_file, edit_file, and destructive bash are blocked${colors.reset}` : `${colors.dim}plan mode off — the agent may execute changes again${colors.reset}`);
+    return true;
+  }
   if (line.startsWith("/approve")) {
     const arg = line.slice(8).trim().toLowerCase();
     if (tui) {
@@ -7300,21 +7344,6 @@ ${colors.bold}Saved conversations${colors.reset}`);
       setStatus();
       print(`${colors.dim}tool approval: ${tui.approveMode === "on" ? "on (you approve each tool call)" : "off (agents act freely)"}${colors.reset}`);
     }
-    return true;
-  }
-  if (line.startsWith("/plan")) {
-    const arg = line.slice(5).trim().toLowerCase();
-    if (arg === "on" || arg === "off")
-      planPhase = arg === "on";
-    else if (arg === "")
-      planPhase = !planPhase;
-    else {
-      print(`${colors.red}usage: /plan [on|off]${colors.reset}`);
-      return true;
-    }
-    planPhaseNextTurn = planPhase;
-    setStatus();
-    print(`${colors.dim}plan mode: ${planPhase ? "on — the next turn investigates and plans only (no writes, no installs, no git changes)" : "off"}${colors.reset}`);
     return true;
   }
   if (line.startsWith("/permissions")) {
@@ -7717,7 +7746,8 @@ ${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.
         aborted = res.finishReason === "aborted";
       }
     });
-    messages.push({ role: "assistant", content: result.finalText });
+    const isPlan = thisTurnIsPlan && isPlanOutput(result.finalText);
+    messages.push({ role: "assistant", content: isPlan ? stripPlanEnvelope(result.finalText) : result.finalText });
     if (result.aborted)
       taskActive = false;
     else
@@ -7746,6 +7776,15 @@ ${colors.yellow}⚡ ${name}${colors.reset} ${colors.gray}${brief(args)}${colors.
     if (result.usage) {
       printTurnCost(result.usage, result.toolCalls, { provider: turnProviderName, model: turnModel }, tui);
     }
+    if (isPlan) {
+      const note = "plan ready - review it, then ask for the work (plan mode cleared itself, so the next turn can execute)";
+      if (tui)
+        tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
+      else
+        process.stdout.write(`
+${colors.dim}${note}${colors.reset}
+`);
+    }
   } catch (err) {
     const msg = err?.message ?? String(err);
     pendingTask = { request: userInput, reason: "error", toolCalls: 0, at: Date.now() };
@@ -7764,7 +7803,7 @@ ${colors.red}${msg}${colors.reset}
     if (tui) {
       tui.busy = false;
       const rl = routeLabel();
-      tui.setStatus(`${onlineStatus()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
+      tui.setStatus(`${onlineStatus()}${planTag()}${rl ? rl + " · " : ""}approve ${tui.approveMode === "on" ? "on" : "off"}${taskActive ? " · task in progress" : ""} · PgUp/PgDn scroll`, 8);
     } else {
       process.stdout.write(`
 `);
@@ -7837,7 +7876,7 @@ function mainTUI() {
   });
   tui.start();
   const rl0 = routeLabel();
-  tui.setStatus(`${onlineStatus()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
+  tui.setStatus(`${onlineStatus()}${planTag()}${rl0 ? `provider ${providerName} · model ${llmModel} · ${rl0} · approve off · PgUp/PgDn scroll` : `provider ${providerName} · model ${llmModel} · approve off · PgUp/PgDn scroll`}`, 0);
 }
 function mainLine() {
   console.log(banner(providerName, llmModel, cwd).join(`
@@ -7887,6 +7926,7 @@ function printUsage() {
   console.log("  --provider <name>   pick provider (groq, ollama, openai, anthropic, nvidia…)");
   console.log("  --model <id>        pick model");
   console.log("  --resume [name]     resume last (or named) conversation");
+  console.log("  --plan              plan mode: investigate and return a plan without changing anything");
   console.log("  --max-steps <n>     cap the agent loop (default 40)");
   console.log("  --cwd <path>        work from another directory");
   console.log("  --sandbox           restrict file tools + bash to --cwd");
