@@ -25,6 +25,25 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # Process-layer guard: spawn-bearing tools go through src/tools/spawn.ts
+      # (the mockable seam over proc.ts). A direct Bun.spawn anywhere, or a raw
+      # child_process import inside a tool, bypasses the seam and cannot be
+      # stubbed per-tool. App-layer sync/stream utilities (git one-shots in
+      # checkpoint/self-edit, ollama daemon start, stty) are intentionally
+      # outside this guard — they are not tool call paths.
+      - name: Process-layer guard (spawn only via the seam)
+        run: |
+          if grep -rn "Bun\.spawn" src --include="*.ts" --exclude="*.test.ts"; then
+            echo "::error::Bun.spawn found — use src/tools/spawn.ts instead"
+            exit 1
+          fi
+          if grep -rln '"node:child_process"' src/tools --include="*.ts" --exclude="*.test.ts" \
+              | grep -v "^src/tools/proc.ts$" | grep -v "^src/tools/spawn.ts$"; then
+            echo "::error::direct child_process import inside src/tools — use ./spawn"
+            exit 1
+          fi
+          echo "process-layer guard OK"
+
       - name: Tests
         run: bun run test
 

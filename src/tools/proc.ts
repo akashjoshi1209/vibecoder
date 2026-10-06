@@ -6,6 +6,7 @@ import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { platform } from "node:os";
 import type { ChildProcess } from "node:child_process";
+import { numberSetting } from "../runtime";
 
 export interface SpawnCollectOptions {
   cmd: string[];
@@ -17,6 +18,17 @@ export interface SpawnCollectOptions {
   signal?: AbortSignal;
   /** Called exactly once when the timeout fires (before the kill). */
   onTimeout?: () => void;
+  /**
+   * Opt-in settle grace after a timeout kill, in ms.
+   *
+   * When > 0 the result waits up to this long for `close` after the tree kill
+   * so a clean exit code and fully flushed pipes win over an immediate -1.
+   * The timeout remains the contract: if `close` does not arrive, we settle
+   * ourselves when the grace expires. 0 (default) preserves the round-2
+   * behaviour of settling immediately. Overrides the `settleGraceMs` config
+   * value — the config knob is the project-wide default, this is per call.
+   */
+  settleGraceMs?: number;
 }
 
 export interface SpawnCollectResult {
@@ -177,7 +189,13 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
         cwd: opts.cwd,
         env: opts.env,
         stdio: ["ignore", "pipe", "pipe"],
-        detached: opts.detached ?? true,
+        // POSIX: detached makes the child a group leader, which is what lets
+        // `process.kill(-pid)` reach the whole tree. Windows has no such
+        // groups — taskkill /T is the tree kill — and PowerShell 5.1 under
+        // DETACHED_PROCESS silently loses its stdout (and can exit before its
+        // -Command finishes), so the default there is attached. Either way the
+        // caller can override explicitly.
+        detached: opts.detached ?? platform() !== "win32",
       });
     } catch (err: unknown) {
       const msg = err && typeof err === "object" && "message" in err ? String((err as Record<string, unknown>).message) : String(err);
@@ -195,11 +213,13 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
     let settled = false;
     let spawnError = "";
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
     const settle = (exitCode: number) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       if (spawnError) {
         stderr = (stderr ? stderr + "\n" : "") + `spawn error: ${spawnError}`;
@@ -218,6 +238,17 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
         // runs — so waiting for `close` is what let a 120s timeout stretch into
         // minutes. The timeout is the contract; honour it whether or not the
         // kernel cooperates.
+        //
+        // settleGraceMs (opt-in, default 0 = off) is the deliberate exception:
+        // a bounded window — timeout + grace, never more — for `close` to land
+        // after the kill, so callers that prefer a clean exit code and flushed
+        // pipes can ask for it without reintroducing the unbounded wait. If
+        // close does not come, we settle ourselves when the grace expires.
+        const graceMs = opts.settleGraceMs ?? numberSetting("settleGraceMs", 0, 0);
+        if (graceMs > 0) {
+          graceTimer = setTimeout(() => settle(-1), graceMs);
+          return;
+        }
         settle(-1);
       }, opts.timeoutMs);
     }

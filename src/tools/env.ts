@@ -3,7 +3,7 @@ import { join as pathJoin, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile, writeFile, rename } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawnCollect } from "./spawn";
 import { registerTool as _registerTool } from "./registry";
 
 /** Plan mode is a read-only investigation phase. env_set writes to disk, so it
@@ -143,19 +143,10 @@ function mask(v: string): string {
 
 async function whichBin(name: string): Promise<boolean> {
   try {
-    const child = spawn("which", [name], {
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
-    });
-    let stdout = "";
-    let stderr = "";
-    const p = new Promise<void>((resolve) => {
-      child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
-      child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
-      child.on("close", () => resolve());
-    });
-    await p;
-    return child.exitCode === 0 && stdout.trim().length > 0;
+    // Through the spawn seam (./spawn), not node:child_process directly: it
+    // keeps this tool mockable in tests without stubbing ./proc for everyone.
+    const res = await spawnCollect({ cmd: ["which", name], timeoutMs: 10_000 });
+    return res.exitCode === 0 && res.stdout.trim().length > 0;
   } catch {
     return false;
   }
