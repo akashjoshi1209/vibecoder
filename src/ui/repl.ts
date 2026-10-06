@@ -94,6 +94,9 @@ let planPhaseNextTurn = false;
 /** Set while a task is unfinished, cleared when a turn completes normally.
  *  Persisted with the session so `--resume` can see the task never landed. */
 let pendingTask: PendingTask | undefined;
+/** Compaction digest carried across turns and into resumed sessions — the
+ *  durable half of summarizing compaction (see AgentResult.compactionSummary). */
+let compactionDigest: string | undefined;
 
 function limitsFor(cfg: RootConfig): { maxInputTokens?: number; maxInputTokensPerMinute?: number } {
   return {
@@ -129,6 +132,7 @@ function currentSession(): SessionData {
     routerMode,
     messageCount: messages.length,
     pending: pendingTask,
+    compaction: compactionDigest,
   };
 }
 
@@ -154,6 +158,8 @@ function applySession(s: SessionData | null): boolean {
   // Carry the unfinished marker across so /resume can say why the transcript
   // stops where it does, instead of leaving the model to guess.
   pendingTask = s.pending;
+  // And the compaction digest, so resumed findings are not re-lost.
+  compactionDigest = s.compaction;
   setChangeSession(sessionId);
   if (s.routerMode) routerMode = s.routerMode;
   if (s.systemPrompt) systemPrompt = s.systemPrompt;
@@ -454,6 +460,9 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     sessionId = "";
     taskActive = false;
     pendingTask = undefined;
+    // A new conversation has no history to summarize — carrying the old
+    // digest would inject findings about a task that no longer exists.
+    compactionDigest = undefined;
     // A fresh conversation gets a fresh trail: /diff and /revert are scoped to
     // the current session, and silently mixing the old session's writes into the
     // new one would make /revert undo files the user never saw changed.
@@ -757,6 +766,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
   if (line.trim() === "/clear") {
     messages = [];
     taskActive = false;
+    compactionDigest = undefined;
     tui?.clearScrollback();
     if (tui) {
       // presentation-only: wordmark is owned by tui.ts centered idle choke; banner() stays, but must NOT be re-emitted to scrollback (accumulates per refresh/keyboard cycle)
@@ -909,6 +919,7 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
         // rates it needs to evaluate it.
         maxCostUsd: rootConfig?.maxCostUsd,
         costRates: ratesPerMillion(turnProviderName, turnModel),
+        compactionSummary: compactionDigest,
       },
       {
         maxSteps,
@@ -941,6 +952,11 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
           if (tui) tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
           else process.stdout.write(`${colors.dim}${note}${colors.reset}\n`);
         },
+        onCompact: (info) => {
+          const note = `(compacted: folded ${info.foldedMessages} older message(s) into a summary — earlier findings stay available, /resume carries the summary forward)`;
+          if (tui) tui.printToScrollback(`${colors.dim}${note}${colors.reset}`);
+          else process.stdout.write(`${colors.dim}${note}${colors.reset}\n`);
+        },
         confirmTool: async (name, args, reason) => {
           // A permission-model request (destructive: "ask") prompts even when
           // blanket approval is off. The user opted into being consulted for
@@ -964,6 +980,9 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
 
     const isPlan = thisTurnIsPlan && isPlanOutput(result.finalText);
     messages.push({ role: "assistant", content: isPlan ? stripPlanEnvelope(result.finalText) : result.finalText });
+    // Keep the freshest digest; an aborted/failed turn still returns whatever
+    // was folded before the stop, and losing that would re-fold it next turn.
+    if (result.compactionSummary) compactionDigest = result.compactionSummary;
     if (result.aborted) taskActive = false;
     else taskActive = heavyRoute && result.toolCalls > 0;
     void aborted;

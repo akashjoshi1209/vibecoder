@@ -47,6 +47,11 @@ export interface SessionData extends SessionMeta {
   /** Set while a turn is in flight and at most one, so an interrupted run is
    *  visibly unfinished. Cleared when a turn completes normally. */
   pending?: PendingTask;
+  /** Compaction digest from the last turn (see AgentResult.compactionSummary).
+   *  Older findings live here once their messages are folded away, so a
+   *  resumed session starts with them instead of re-discovering the context
+   *  it already paid to learn. */
+  compaction?: string;
 }
 
 let _root: string | null = null;

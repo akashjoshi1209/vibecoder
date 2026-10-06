@@ -55,7 +55,8 @@ function cloneMessage(m: Message): Message {
 
 // Atomic blocks: a tool-use assistant message plus the tool results that answer
 // it must stay together, or the provider rejects the sequence (tool_use_failed).
-function splitBlocks(nonSystem: Message[]): number[][] {
+// Exported for compact.ts, which folds history at whole-block boundaries.
+export function splitBlocks(nonSystem: Message[]): number[][] {
   const blocks: number[][] = [];
   let i = 0;
   while (i < nonSystem.length) {

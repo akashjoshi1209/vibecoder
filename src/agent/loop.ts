@@ -7,6 +7,14 @@ import {
 } from "../tools/approval";
 import { normalizeToolCalls, parseToolCalls, type ParsedToolCall } from "./tool-call";
 import { estimateTokens, estimateMessagesTokens, trimMessages, type TrimResult } from "../llm/tokens";
+import {
+  DEFAULT_WATERMARK,
+  buildWorkingSet,
+  planFold,
+  summarizeHistory,
+  type CompactionState,
+} from "../llm/compact";
+import { numberSetting } from "../runtime";
 import { RatePacer, paceWait } from "../llm/pace";
 
 export interface AgentCallbacks {
@@ -23,6 +31,9 @@ export interface AgentCallbacks {
   maxSteps?: number;
   /** If trimmed, a short note is passed through this callback. */
   onTrimmed?: (trimmed: number, truncatedChars: number) => void;
+  /** Fired after a summarizing compaction folds older messages into a digest,
+   *  so the UI can say so instead of context silently shrinking. */
+  onCompact?: (info: { foldedMessages: number; foldedTokens: number; summaryTokens: number }) => void;
   /** Called at the start of each step with the current step index (1-based) and
    *  the running total of tool calls executed so far. UI can use this to show
    *  live progress in a status bar. */
@@ -41,6 +52,10 @@ export interface AgentResult {
   usage?: { promptTokens: number; completionTokens: number; reasoningTokens: number };
   /** Set when the turn stopped because maxCostUsd was reached. */
   costCapHit?: { limitUsd: number; spentUsd: number };
+  /** The compaction digest after this turn, when one exists. Persist it with
+   *  the session and hand it back as `compactionSummary` on the next turn so
+   *  folded-away findings survive resume instead of evaporating. */
+  compactionSummary?: string;
 }
 
 /**
@@ -113,11 +128,32 @@ export async function runAgent(
      *  these the cap cannot be evaluated and is skipped — an unenforceable cap
      *  that claims to be enforced is worse than none, so it reports why. */
     costRates?: { input: number; output: number; reasoning?: number };
+    /** Digest carried over from a previous turn (see AgentResult.compactionSummary).
+     *  Older findings then live in the digest rather than being re-lost the
+     *  moment the fresh turn's context fills. */
+    compactionSummary?: string;
   },
   callbacks: AgentCallbacks = {},
 ): Promise<AgentResult> {
   const maxSteps = callbacks.maxSteps ?? 40;
-  const messages: Message[] = [{ role: "system", content: options.systemPrompt }, ...options.initialMessages];
+  // `history` is the full conversation and is never trimmed; `messages` is the
+  // working set actually sent to the provider, rebuilt from history at each
+  // attempt as [system, firstUser, digest?, ...unfolded tail]. Keeping the two
+  // apart is what makes summarizing compaction possible: trimming used to
+  // mutate the only copy, so dropped messages could never be summarized after
+  // the fact.
+  const history: Message[] = [{ role: "system", content: options.systemPrompt }, ...options.initialMessages];
+  let messages: Message[] = history;
+  // A digest carried in from a previous turn starts covering nothing in this
+  // array (foldedCount = 1: system only); its content speaks for history that
+  // is no longer present. The first in-turn fold merges new material into it.
+  let compaction: CompactionState | null = options.compactionSummary
+    ? { summary: options.compactionSummary, foldedCount: 1 }
+    : null;
+  // Clamp the watermark from config rather than trusting it blindly: below ~0.5
+  // it would compact every step, above ~0.97 it would never relieve pressure.
+  const rawWatermark = numberSetting("compactionWatermark", DEFAULT_WATERMARK, 0.3);
+  const watermark = rawWatermark > 0.97 ? DEFAULT_WATERMARK : rawWatermark;
   const toolDefs = listTools();
   let toolCalls = 0;
 
@@ -167,6 +203,54 @@ export async function runAgent(
         1_000_000
       : 0;
 
+  /**
+   * Fold the oldest foldable range of `history` into the digest.
+   *
+   * `force` (ContextTooLargeError) skips the watermark check. Any failure —
+   * no foldable range, summarizer error, empty digest — returns false and
+   * leaves behaviour exactly as it was: trim drops the range. Compaction is an
+   * improvement over dropping, never a prerequisite for working.
+   */
+  const compactNow = async (force: boolean): Promise<boolean> => {
+    if (!options.maxInputTokens) return false;
+    const plan = planFold(history, compaction, {
+      budgetTokens: effectiveBudget(),
+      watermark,
+      force,
+    });
+    if (!plan) return false;
+    const source = history.slice(plan.start, plan.end);
+    // The summarizer call is a real request on the same per-minute budget.
+    await paceWait(pacer, plan.tokens, options.signal);
+    const summary = await summarizeHistory(options.provider, {
+      model: options.model,
+      source,
+      existing: compaction?.summary,
+      budgetTokens: effectiveBudget(),
+      signal: options.signal,
+    });
+    if (pacer) pacer.record(plan.tokens);
+    if (!summary) return false;
+    // The summarizer is billed like any other call; count it into the turn.
+    if (summary.usage) {
+      sawUsage = true;
+      promptTokens += summary.usage.promptTokens ?? 0;
+      completionTokens += summary.usage.completionTokens ?? 0;
+      reasoningTokens += summary.usage.reasoningTokens ?? 0;
+    }
+    compaction = { summary: summary.text, foldedCount: plan.end };
+    callbacks.onCompact?.({
+      foldedMessages: plan.end - plan.start,
+      foldedTokens: plan.tokens,
+      summaryTokens: estimateTokens(summary.text),
+    });
+    return true;
+  };
+
+  /** Every exit path carries the digest out so the caller can persist it. */
+  const withState = (r: AgentResult): AgentResult =>
+    compaction ? { ...r, compactionSummary: compaction.summary } : r;
+
   for (let step = 0; step < maxSteps; step++) {
     // Cost cap, evaluated before the next provider call is billed. Checked at the
     // top of the step rather than the bottom so a turn that overshoots stops
@@ -179,18 +263,18 @@ export async function runAgent(
         `or split the task. This is an estimate from token counts, so treat it as close, not exact.)`;
       callbacks.onModelText?.(`\n${msg}\n`);
       callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "cost_cap" });
-      return {
+      return withState({
         finalText: msg,
         toolCalls,
         steps: step,
         aborted: false,
         usage: usageOrUndefined(),
         costCapHit: { limitUsd: costCap, spentUsd: spent },
-      };
+      });
     }
     if (options.signal?.aborted) {
       callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
-      return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
+      return withState({ finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true, usage: usageOrUndefined() });
     }
     callbacks.onStepUpdate?.(step + 1, toolCalls, maxSteps);
 
@@ -201,15 +285,27 @@ export async function runAgent(
     // MAX_STEP_RETRIES times before counting as a consecutive failure.
     for (let attempt = 0; attempt <= MAX_STEP_RETRIES && !stepOk; attempt++) {
       retryBudgetDelta = 0;
+      // One soft (watermark) and one hard (ContextTooLarge) compaction attempt
+      // per call attempt — enough to relieve pressure, bounded so a broken
+      // summarizer cannot loop.
+      let watermarkTried = false;
+      let forceTried = false;
       // ContextTooLarge retry: try once more with a tighter budget before giving up.
       for (;;) {
+        // Rebuild the working set from history every attempt: this is where a
+        // fold from this or a previous attempt (or a carried-in digest) takes
+        // effect. With no compaction state the rebuild is a no-op by content.
+        messages = buildWorkingSet(history, compaction);
+        if (options.maxInputTokens && !watermarkTried) {
+          watermarkTried = true;
+          if (await compactNow(false)) messages = buildWorkingSet(history, compaction);
+        }
         if (options.maxInputTokens) {
           const trim = trimMessages(messages, {
             budgetTokens: effectiveBudget(),
             reservedTokens: effectiveReserved(),
           });
-          messages.length = 0;
-          messages.push(...trim.messages);
+          messages = trim.messages;
           if (trim.trimmed > 0 && retryBudgetDelta === 0) callbacks.onTrimmed?.(trim.trimmed, trim.truncatedChars);
         }
 
@@ -242,13 +338,23 @@ export async function runAgent(
           }
           break; // success
         } catch (err: any) {
-          if (err instanceof ContextTooLargeError && retryBudgetDelta === 0) {
-            retryBudgetDelta = 512;
-            continue;
+          if (err instanceof ContextTooLargeError) {
+            // Hard overflow: folding the middle into a digest shrinks the
+            // request for real (a tighter trim delta only squeezes harder on
+            // what is left). Try that before falling back to the old
+            // delta-512 retry.
+            if (!forceTried) {
+              forceTried = true;
+              if (await compactNow(true)) continue; // rebuilt at loop top
+            }
+            if (retryBudgetDelta === 0) {
+              retryBudgetDelta = 512;
+              continue;
+            }
           }
           if (options.signal?.aborted || err?.name === "AbortError") {
             callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
-            return { finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true, usage: usageOrUndefined() };
+            return withState({ finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true, usage: usageOrUndefined() });
           }
           // For transient errors, let the step-retry loop handle it.
           break; // will retry if attempts remain
@@ -269,13 +375,13 @@ export async function runAgent(
         const finalMsg = `(stopped after ${consecutiveFailures} consecutive LLM failures — check your network and provider status.${summary})`;
         callbacks.onModelText?.(`${finalMsg}\n`);
         callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "error" });
-        return {
+        return withState({
           finalText: finalMsg,
           toolCalls,
           steps: step,
           aborted: false,
           usage: usageOrUndefined(),
-        };
+        });
       }
       // Skip this step but continue the loop (transient glitch).
       continue;
@@ -285,15 +391,15 @@ export async function runAgent(
     consecutiveFailures = 0;
 
     if (result.text) {
-      messages.push({ role: "assistant", content: result.text });
+      history.push({ role: "assistant", content: result.text });
     } else if (result.toolCalls.length === 0) {
-      messages.push({ role: "assistant", content: null });
+      history.push({ role: "assistant", content: null });
     }
 
     if (result.toolCalls.length === 0) {
       // No tool calls: conversation finished
       callbacks.onDone?.(result);
-      return { finalText: result.text, toolCalls, steps: step + 1, aborted: false, usage: usageOrUndefined() };
+      return withState({ finalText: result.text, toolCalls, steps: step + 1, aborted: false, usage: usageOrUndefined() });
     }
 
     // Normalize tool-call ids so the assistant message and its tool results
@@ -306,10 +412,10 @@ export async function runAgent(
       tool_calls: normalizedCalls.map((tc) => ({ ...tc })),
     };
     // If we already pushed it above without tool_calls, replace it
-    if (messages[messages.length - 1]?.role === "assistant") {
-      messages[messages.length - 1] = assistantMsg;
+    if (history[history.length - 1]?.role === "assistant") {
+      history[history.length - 1] = assistantMsg;
     } else {
-      messages.push(assistantMsg);
+      history.push(assistantMsg);
     }
 
     const parsed = parseToolCalls(normalizedCalls);
@@ -410,7 +516,7 @@ export async function runAgent(
     }
 
     for (const r of results) {
-      messages.push(r.message);
+      history.push(r.message);
     }
 
     // Track what happened this step for the progress summary.
@@ -434,5 +540,5 @@ export async function runAgent(
       : `(reached max steps without completion. ${toolCalls} tool call(s) were attempted.)`;
   callbacks.onModelText?.(`\n${maxMsg}\n`);
   callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "max_steps" });
-  return { finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false, usage: usageOrUndefined() };
+  return withState({ finalText: maxMsg, toolCalls, steps: maxSteps, aborted: false, usage: usageOrUndefined() });
 }
