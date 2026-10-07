@@ -89,6 +89,15 @@ read the reason line before approving:
 6. **Out-of-band channels.** Anything not mediated by a tool call (network
    stacks of already-approved programs, other processes on the machine) is
    outside this model entirely.
+7. **Extensions are trusted code.** Local plugins (`plugins` in config,
+   `"vibecoder.extension"` in a project `package.json`, `~/.vibecoder/plugins/`)
+   and MCP servers (`config.mcpServers`) run with this process's full
+   privileges and expose tools the model calls like built-ins — they are
+   *unlisted* in the permission table, so nothing gates them at decision time
+   (proxied MCP tools at least refuse in plan mode). Install them exactly as
+   you would a dependency; they are the dependency. `--no-plugins` /
+   `--no-mcp`, or `VIBECODER_NO_PLUGINS=1` / `VIBECODER_NO_MCP=1`, disable both
+   wholesale.
 
 ## How to verify
 

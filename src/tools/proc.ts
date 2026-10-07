@@ -18,6 +18,10 @@ export interface SpawnCollectOptions {
   signal?: AbortSignal;
   /** Called exactly once when the timeout fires (before the kill). */
   onTimeout?: () => void;
+  /** Windows only: pass through to spawn so `cmd.exe /d /s /c` wrappers keep
+   *  their argument semantics (needed for .cmd shims like npm.cmd — Node's
+   *  CVE-2024-27980 guard rejects spawning them directly). */
+  windowsVerbatimArguments?: boolean;
   /**
    * Opt-in settle grace after a timeout kill, in ms.
    *
@@ -180,6 +184,146 @@ function join2(a: string, b: string): string {
 
 const pathSep = process.platform === "win32" ? ";" : ":";
 
+/** A long-lived child with line-oriented stdin/stdout — the shape MCP stdio
+ *  (and anything else newline-delimited JSON-RPC) needs. spawnCollect is
+ *  one-shot; this keeps the child alive between messages. Same process-layer
+ *  rules apply: resolveCommand for PATH-less platforms, killProcessTree for
+ *  teardown (the CI guard keeps spawn itself inside this file). */
+export interface SpawnSessionOptions {
+  cmd: string[];
+  cwd?: string;
+  /** Full environment (ProcessEnv — undefined values mean "omit"). */
+  env?: NodeJS.ProcessEnv;
+  /** Each line the child writes to stderr (MCP servers log there). */
+  onStderr?: (line: string) => void;
+}
+
+export interface SpawnSession {
+  readonly pid: number | undefined;
+  /** False once the child exited or failed to spawn. */
+  readonly alive: boolean;
+  /** Append one line (a trailing \n) to the child's stdin. False when the pipe is gone. */
+  write(line: string): boolean;
+  /** Handle one stdout line (newline-delimited; the tail partial line is buffered). */
+  onLine(cb: (line: string) => void): void;
+  /** Called once on exit — replayed immediately when the child already exited. */
+  onExit(cb: (code: number | null) => void): void;
+  /** End stdin (lets a well-behaved server exit on EOF), then kill the tree. */
+  close(): void;
+}
+
+export function spawnSession(opts: SpawnSessionOptions): SpawnSession {
+  let child: ChildProcess;
+  try {
+    child = spawn(resolveCommand(opts.cmd[0]), opts.cmd.slice(1), {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      // Same split as spawnCollect: group leader on POSIX for tree kills;
+      // Windows uses taskkill /T.
+      detached: platform() !== "win32",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    opts.onStderr?.(`spawn error: ${msg}`);
+    return {
+      pid: undefined,
+      alive: false,
+      write: () => false,
+      onLine: () => {},
+      onExit: (cb) => cb(null), // already dead — replay immediately
+      close: () => {},
+    };
+  }
+
+  let alive = true;
+  let exited = false;
+  let exitCode: number | null = null;
+  let lineCb: ((line: string) => void) | null = null;
+  const exitCbs: Array<(code: number | null) => void> = [];
+  let outBuf = "";
+  let errBuf = "";
+  // Writing to a pipe whose reader is gone (crashed server, ENOENT race)
+  // surfaces as a stream 'error' — unhandled, that takes the process down.
+  child.stdin?.on("error", () => {});
+  child.stdout?.on("error", () => {});
+
+  child.stdout?.on("data", (d: Buffer) => {
+    outBuf += d.toString();
+    let i: number;
+    while ((i = outBuf.indexOf("\n")) !== -1) {
+      const line = outBuf.slice(0, i).replace(/\r$/, "");
+      outBuf = outBuf.slice(i + 1);
+      if (line.trim()) lineCb?.(line);
+    }
+  });
+  child.stderr?.on("data", (d: Buffer) => {
+    errBuf += d.toString();
+    let i: number;
+    while ((i = errBuf.indexOf("\n")) !== -1) {
+      const line = errBuf.slice(0, i).replace(/\r$/, "");
+      errBuf = errBuf.slice(i + 1);
+      if (line.trim()) opts.onStderr?.(line);
+    }
+  });
+
+  const settle = (code: number | null) => {
+    if (exited) return;
+    exited = true;
+    alive = false;
+    exitCode = code;
+    for (const cb of exitCbs) {
+      try {
+        cb(code);
+      } catch {
+        /* listener errors must not break teardown */
+      }
+    }
+  };
+  child.on("close", (code) => settle(code ?? null));
+  child.on("error", (err: Error) => {
+    opts.onStderr?.(`spawn error: ${err.message}`);
+    settle(null);
+  });
+
+  return {
+    get pid() {
+      return child.pid;
+    },
+    get alive() {
+      return alive;
+    },
+    write(line: string): boolean {
+      if (!alive || !child.stdin?.writable) return false;
+      try {
+        child.stdin.write(line + "\n");
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    onLine(cb) {
+      lineCb = cb;
+    },
+    onExit(cb) {
+      if (exited) {
+        cb(exitCode);
+        return;
+      }
+      exitCbs.push(cb);
+    },
+    close() {
+      try {
+        child.stdin?.end();
+      } catch {
+        /* already closed */
+      }
+      if (!exited) killProcessTree(child);
+      settle(null);
+    },
+  };
+}
+
 export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectResult> {
   return new Promise<SpawnCollectResult>((resolvePromise) => {
     let child: ChildProcess | null = null;
@@ -189,6 +333,7 @@ export function spawnCollect(opts: SpawnCollectOptions): Promise<SpawnCollectRes
         cwd: opts.cwd,
         env: opts.env,
         stdio: ["ignore", "pipe", "pipe"],
+        windowsVerbatimArguments: opts.windowsVerbatimArguments,
         // POSIX: detached makes the child a group leader, which is what lets
         // `process.kill(-pid)` reach the whole tree. Windows has no such
         // groups — taskkill /T is the tree kill — and PowerShell 5.1 under

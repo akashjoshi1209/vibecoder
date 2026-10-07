@@ -2,6 +2,8 @@ import { createProvider, loadConfig, type RootConfig } from "../llm/client";
 import { ModelRouter, classifyMessage, classifyMessageWhy, type RoutingMode } from "../llm/router";
 import { createConnectivityPoller, type ConnectivityPoller } from "../llm/connectivity";
 import { draftPlanNote, drainQueue, runChildLoop, type QueueRunnerDeps } from "../queue-runner";
+import { loadPlugins } from "../tools/plugins";
+import { connectConfigMcpServers, closeAllMcpClients, runMcpCli } from "../mcp";
 import { enqueueTask, listTasks, setQueueFileOverride, type QueuedTask } from "../queue";
 import { ensureOllamaServe } from "../ollama";
 import type { Message, ChatOptions, ChatChunk, StreamResult } from "../llm/types";
@@ -187,6 +189,33 @@ function banner(_provider: string, _model: string, _dir: string): string[] {
   return [];
 }
 
+/** Load local plugins and connect configured MCP servers — both startup-only
+ *  (they register tools; /reload-config deliberately does not re-run them) and
+ *  both failure-tolerant: a broken plugin or unreachable server degrades to a
+ *  printed line, never a dead startup. --no-plugins / --no-mcp skip them. */
+async function loadExtensions(config: RootConfig, wsCwd: string): Promise<void> {
+  if (!process.argv.includes("--no-plugins")) {
+    const report = await loadPlugins({ cwd: wsCwd, plugins: config.plugins });
+    for (const l of report.loaded) {
+      process.stdout.write(`${colors.dim}plugin: ${l.source} → ${l.tools.join(", ") || "(no tools registered)"}${colors.reset}\n`);
+    }
+    for (const e of report.errors) {
+      process.stdout.write(`${colors.red}plugin error: ${e.source}: ${e.error}${colors.reset}\n`);
+    }
+  }
+  if (process.argv.includes("--no-mcp")) return;
+  const mcp = await connectConfigMcpServers(config, { cwd: wsCwd });
+  for (const l of mcp.loaded) {
+    process.stdout.write(`${colors.dim}mcp: ${l.name} → ${l.tools.join(", ") || "(no tools)"}${colors.reset}\n`);
+  }
+  for (const e of mcp.errors) {
+    process.stdout.write(`${colors.red}mcp error: ${e.source}: ${e.error}${colors.reset}\n`);
+  }
+  // Servers are children of this process; on a clean exit end their stdin so
+  // they exit themselves, and kill the tree as the fallback.
+  process.once("exit", closeAllMcpClients);
+}
+
 async function init() {
   const config = await loadConfig();
   rootConfig = config;
@@ -271,6 +300,12 @@ async function init() {
   // can move the session after the first resolution in init().
   sessionCwd = cwd;
   permissions = resolvePermissions(config, sessionCwd);
+
+  // ── extensions: local plugins + MCP servers ────────────────────────────────
+  // Startup-only by design: both paths register tools, and re-running them on
+  // /reload-config would collide on names. Restart to pick up new extensions.
+  await loadExtensions(config, sessionCwd);
+  // ──────────────────────────────────────────────────────────────────────────
 
   const stepsIdx = process.argv.indexOf("--max-steps");
   if (stepsIdx !== -1 && process.argv[stepsIdx + 1]) {
@@ -1309,6 +1344,7 @@ function printUsage(): void {
   console.log("  vibecoder setup --yes        same, without prompts");
   console.log("  vibecoder doctor             check install, config, providers, connectivity");
   console.log("  vibecoder queue [start|status|stop]   run the queue daemon (vibecoder-queue)");
+  console.log("  vibecoder mcp            serve this install's tools over MCP stdio (JSON-RPC, for MCP hosts)");
   console.log("");
   console.log("Options:");
   console.log("  --provider <name>   pick provider (groq, ollama, openai, anthropic, nvidia…)");
@@ -1326,6 +1362,8 @@ function printUsage(): void {
   console.log("  --trace-anon        with --trace: scrub home/cwd paths and secrets (bug reports)");
   console.log("  --trace-replay <f>  print a recorded trace offline and exit (no model needed)");
   console.log("  --no-grep           search with the in-process engine instead of shelling to grep");
+  console.log("  --no-plugins        skip local plugin packages (vibecoder.extension, ~/.vibecoder/plugins)");
+  console.log("  --no-mcp            skip MCP servers declared in config.mcpServers");
   console.log("  --plan              run the first turn in plan mode (investigate + propose, no changes)");
   console.log("  --version, -v       print version");
   console.log("  --help, -h          this help");
@@ -1336,6 +1374,7 @@ function printUsage(): void {
   console.log("  VIBECODER_ENV_FILE   exact .env to read and write; otherwise <cwd>/.env, then ~/.vibecoder/.env");
   console.log("  VIBECODER_MAX_OUTPUT  max chars of shell output per call (default 30000; excess is dropped from the middle)");
   console.log("  VIBECODER_NO_DOTENV=1   disable .env loading");
+  console.log("  VIBECODER_NO_PLUGINS=1 / VIBECODER_NO_MCP=1   don't load extensions at startup");
   console.log("  GROQ_API_KEY / NVIDIA_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY");
   console.log("      a real shell variable always wins. Otherwise read from, in order:");
   console.log("      $VIBECODER_ENV_FILE, <cwd>/.env (where `env_set` writes), ~/.vibecoder/.env");
@@ -1359,6 +1398,13 @@ async function main() {
   }
   if (first === "--help" || first === "-h" || first === "help") {
     printUsage();
+    return;
+  }
+  if (first === "mcp") {
+    // Serve every registered tool over MCP stdio (newline-delimited JSON-RPC),
+    // then exit. Handled before init(): no TUI, no model, no session — just
+    // the config-driven permission model and the tool registry.
+    process.exitCode = await runMcpCli();
     return;
   }
 

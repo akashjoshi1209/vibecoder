@@ -184,6 +184,33 @@ export function validateConfig(cfg: unknown): string[] {
       }
     }
   }
+  if (o.plugins !== undefined) {
+    if (!Array.isArray(o.plugins) || o.plugins.some((p) => typeof p !== "string" || !p)) {
+      errors.push('config.plugins must be an array of non-empty strings (entry files or package dirs)');
+    }
+  }
+  if (o.mcpServers !== undefined) {
+    if (!isPlainObject(o.mcpServers)) {
+      errors.push("config.mcpServers must be an object mapping server names to spawn specs");
+    } else {
+      for (const [name, spec] of Object.entries(o.mcpServers as Record<string, unknown>)) {
+        if (!isPlainObject(spec) || typeof (spec as Record<string, unknown>).command !== "string" || !(spec as Record<string, unknown>).command) {
+          errors.push(`config.mcpServers."${name}".command must be a non-empty string`);
+          continue;
+        }
+        const s = spec as Record<string, unknown>;
+        if (s.args !== undefined && (!Array.isArray(s.args) || s.args.some((a) => typeof a !== "string"))) {
+          errors.push(`config.mcpServers."${name}".args must be an array of strings`);
+        }
+        if (s.env !== undefined && !isPlainObject(s.env)) {
+          errors.push(`config.mcpServers."${name}".env must be an object`);
+        }
+        if (s.timeoutMs !== undefined && (typeof s.timeoutMs !== "number" || !Number.isFinite(s.timeoutMs) || s.timeoutMs < 1)) {
+          errors.push(`config.mcpServers."${name}".timeoutMs must be a positive number`);
+        }
+      }
+    }
+  }
   if (o.maxToolOutputChars !== undefined) {
     const n = Number(o.maxToolOutputChars);
     if (!Number.isFinite(n) || n < 2000) {

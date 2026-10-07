@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "../llm/types";
 import { isApprovalRequired } from "./approval";
+import { validateTool, TOOL_SCHEMA_VERSION, type ToolCostMeta, type ToolTraceEvent } from "./schema";
 
 export interface ToolContext {
   cwd: string;
@@ -25,13 +26,27 @@ export interface ToolContext {
 }
 
 export interface Tool {
+  /** Locked schema (TOOL_SCHEMA_VERSION): name + JSON-schema inputs. */
   definition: ToolDefinition;
+  /** Declared cost hints — the cost hook, read by the host, never computed here. */
+  cost?: ToolCostMeta;
+  /** Trace hook: called after every execution with wall time and outcome, so a
+   *  tool can attribute internal cost or append domain context to the run
+   *  trace. Must not throw (exceptions are swallowed). */
+  onTrace?: (event: ToolTraceEvent) => void;
+  /** Typed output: resolves the tool's string result (see schema.ts). */
   run(args: Record<string, unknown>, ctx: ToolContext): Promise<string>;
 }
 
 const registry = new Map<string, Tool>();
 
 export function registerTool(tool: Tool): void {
+  // The schema lock: every registration path (built-ins, plugins, MCP proxies)
+  // validates here, so a malformed tool can never reach a provider.
+  const errors = validateTool(tool);
+  if (errors.length) {
+    throw new Error(`Tool fails the schema lock (v${TOOL_SCHEMA_VERSION}):\n  - ${errors.join("\n  - ")}`);
+  }
   const name = tool.definition.function.name;
   const prior = registry.get(name);
   if (prior) {
@@ -57,9 +72,21 @@ export async function executeTool(name: string, args: Record<string, unknown>, c
   if (!tool) {
     throw new Error(`Unknown tool "${name}". Available: ${[...registry.keys()].join(", ")}`);
   }
+  const startedAt = Date.now();
+  const emitTrace = (ok: boolean) => {
+    if (!tool.onTrace) return;
+    try {
+      tool.onTrace({ tool: name, args, ms: Date.now() - startedAt, ok });
+    } catch {
+      // A tracing hook must never take down the call it is tracing.
+    }
+  };
   try {
-    return await tool.run(args, ctx);
+    const out = await tool.run(args, ctx);
+    emitTrace(!/^(ERROR|BLOCKED)/.test(out));
+    return out;
   } catch (err: any) {
+    emitTrace(false);
     // An approval request is control flow, not an error to flatten into a
     // string. Swallowing it here is exactly what made permissions.destructive
     // "ask" a silent no-op — the loop never saw a request, so nothing prompted.

@@ -19,6 +19,17 @@ export interface ConnectivityConfig {
   timeoutMs?: number;
 }
 
+/** How to spawn one MCP stdio server (declared in config.json). The command
+ *  runs with this process's privileges — it is trusted local code. */
+export interface McpServerSpec {
+  command: string;
+  args?: string[];
+  /** Extra/override environment for the server process. */
+  env?: Record<string, string>;
+  /** Per-call timeout in ms (default 30000). */
+  timeoutMs?: number;
+}
+
 export interface RootConfig {
   provider: string;
   model: string;
@@ -43,6 +54,15 @@ export interface RootConfig {
     maxSearchResults?: number;
   /** Plan mode: task turns investigate + produce a plan for human approval before executing. */
   planMode?: boolean;
+  /** Local plugin entry files/packages to load at startup (trusted local code;
+   *  see src/tools/plugins.ts). Also discoverable via package.json
+   *  `vibecoder.extension` or ~/.vibecoder/plugins/. VIBECODER_NO_PLUGINS=1
+   *  disables all of it. */
+  plugins?: string[];
+  /** MCP stdio servers to connect at startup. Their tools are registered
+   *  namespaced as `mcp_<server>_<tool>` with `[mcp:<server>]` provenance in
+   *  the description. VIBECODER_NO_MCP=1 disables all of it. */
+  mcpServers?: Record<string, McpServerSpec>;
   queue?: QueueConfig;
   connectivity?: ConnectivityConfig;
   /** Permission model for tool execution. Controls what the agent is allowed to do. */

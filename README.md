@@ -210,7 +210,10 @@ src/
 
 ## Extending
 
-- **Add a tool:** drop a file in `src/tools/` calling `registerTool({ definition, run })` and import it in `src/ui/repl.ts`. Tools can shell out to any language.
+- **Add a tool:** drop a file in `src/tools/` calling `registerTool({ definition, run })` and import it in `src/ui/repl.ts`. Tools can shell out to any language. Every registration passes the locked tool schema (`src/tools/schema.ts`, `TOOL_SCHEMA_VERSION`): a lowercase name, JSON-schema inputs of type `object`, a string result (`ERROR:`/`BLOCKED` prefixes for failures/refusals), and optional `cost` hints + an `onTrace` hook the host calls after each execution.
+- **Ship a tool without forking:** a **local plugin** — an npm package or plain `.mjs` file exporting `tools: Tool[]` (or `register(registerTool)`, or a default array). Discovered from `plugins: [...]` in `config.json`, a `"vibecoder.extension"` entry in the project's `package.json` (string or array, file or package dir), or `~/.vibecoder/plugins/`. Same schema lock; a broken or colliding plugin is a printed error at startup, never a crash. Skip with `--no-plugins` or `VIBECODER_NO_PLUGINS=1`. These are trusted local code — see [THREAT_MODEL.md](THREAT_MODEL.md).
+- **Consume vibecoder as an MCP server:** `vibecoder mcp` serves the entire tool registry over MCP stdio (newline-delimited JSON-RPC 2.0: `initialize`, `tools/list`, `tools/call`, `ping`) — point Claude Desktop or any MCP host at it.
+- **Consume MCP servers:** declare `mcpServers: { <name>: { command, args?, env?, timeoutMs? } }` in `config.json`. Their tools register as `mcp_<server>_<tool>` with `[mcp:<server>]` provenance in the description, are refused in plan mode, and time out per call (default 30s). Skip with `--no-mcp` or `VIBECODER_NO_MCP=1`.
 - **Add a provider:** add an entry in `config.json` (any OpenAI-compatible URL works) or implement `LLMProvider` in `src/llm/providers/`.
 - **Change behavior:** edit `systemPrompt` in `config.json`, or anywhere under `src/` — you own the loop.
 

@@ -39,6 +39,35 @@ file to the GitHub release.
   through the spawn seam (enforced by a CI guard); fixed Windows `detached`
   default that silently swallowed PowerShell stdout.
 
+### Extension point: schema lock, local plugins, MCP (plan item 8)
+- **Tool schema lock**: `src/tools/schema.ts` — `TOOL_SCHEMA_VERSION` with
+  `validateTool()` (lowercase name shape, non-empty description, JSON-schema
+  inputs of type `object`, string output contract, optional `cost`/`onTrace`
+  hooks). `registerTool()` enforces it, so every path — built-in, plugin, MCP
+  proxy — passes the same contract, and `executeTool()` now times each call
+  and fires the tool's `onTrace` hook (`{ tool, args, ms, ok }`), isolated so
+  a throwing hook cannot break the call.
+- **Local plugins** (`src/tools/plugins.ts`): load tools from packages that
+  opt in via `plugins: [...]` in config, a `"vibecoder.extension"` field in
+  the project `package.json`, or `~/.vibecoder/plugins/`. Validation-gated,
+  failure-tolerant (a broken or colliding plugin reports, never crashes
+  startup), `--no-plugins` / `VIBECODER_NO_PLUGINS=1` to skip.
+- **MCP adapter** (`src/mcp.ts`, zero dependencies): `vibecoder mcp` serves
+  the whole registry over MCP stdio (newline-delimited JSON-RPC 2.0:
+  initialize / tools/list / tools/call / ping, ordered responses). And
+  `config.mcpServers` spawns local MCP servers, registering their tools
+  namespaced as `mcp_<server>_<tool>` with `[mcp:<server>]` provenance,
+  plan-mode refusal, per-call timeouts and process-tree teardown —
+  `--no-mcp` / `VIBECODER_NO_MCP=1` to skip. Both are startup-only;
+  `/reload-config` does not re-run them (restart to pick up changes).
+- `spawnSession()` joins the process layer (`proc.ts`): a long-lived,
+  line-oriented child for MCP stdio — same resolveCommand/killtree rules as
+  `spawnCollect`, with pipe-error suppression so a dead server cannot take
+  the host down.
+- Config: `plugins`, `mcpServers` (+ `validateConfig` checks). Usage,
+  README "Extending" and THREAT_MODEL.md document the trust boundary:
+  extensions are trusted local code, exactly like a dependency.
+
 ### Subagents: `task` fan-out + `/task`
 - New `task` tool: run 1–4 independent sub-tasks in **isolated child loops**
   (fresh context, per-child step budget and wall-clock timeout, workspace-scope
