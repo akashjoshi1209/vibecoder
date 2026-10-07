@@ -1,0 +1,7 @@
+# Line-ending policy lives in the repository, not on each machine:
+# normalize on checkin (LF in the index — which is what it already holds),
+# follow the platform on checkout. Without this file the checkin filter
+# depended on the clone's core.autocrlf (true system-wide on this Windows
+# box), so a "git touch" rewrote CRLF/LF in place — the phantom
+# whole-file diffs behind issue #13 (vibecoder_issues_and_fixes.md).
+* text=auto
