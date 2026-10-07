@@ -122,6 +122,7 @@ Commands:
 - `/provider <name>` and `/model <id>` — switch on the fly
 - `/route [auto|chat|heavy]` — model routing mode (see below)
 - `/approve [on|off]` — toggle per-tool approval prompts. Default **off** = no limits (agents act freely).
+- `/task <prompt> ;; <prompt>` — run prompts as **isolated child loops in parallel** (max 4), each with its own 12-step budget, 120s timeout, unattended workspace-scope permissions and — with `--trace` — a sibling trace file (`…task-N.jsonl`). Parallel is safe for disjoint files / read-only work; anything mutating shared state (same files, git, `.env`, the queue) must stay serial. The model-facing `task` tool fans out the same way from inside a turn.
 - `/save [name]`, `/resume [name]`, `/list`, `/delete <name>`, `/new`, `/clear`
 - `/about` — who vibecoder is: model card, provider, config, tools
 - `/reload-config` — apply staged `config.json` edits made by the agent

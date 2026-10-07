@@ -22,6 +22,7 @@ export type TraceKind =
   | "trim"
   | "compact"
   | "turn.end"
+  | "task"
   | "note";
 
 export interface TraceRecord {
@@ -89,6 +90,13 @@ export class RunTrace {
     private opts: TraceOptions = {},
   ) {}
 
+  /** A sibling trace for an isolated child run (a fan-out task): same
+   *  options, file `<this-file>.<label>.jsonl`. */
+  subTrace(label: string): RunTrace {
+    const base = this.file.replace(/\.(jsonl|ndjson|log)$/i, "");
+    return new RunTrace(`${base}.${label}.jsonl`, { ...this.opts });
+  }
+
   write(rec: Omit<TraceRecord, "t">): void {
     try {
       const max = this.opts.truncateChars ?? DEFAULT_TRUNCATE;
@@ -112,6 +120,8 @@ export interface ReplaySummary {
   permissionDenials: number;
   compactions: number;
   trims: number;
+  tasks: number;
+  failedTasks: number;
   costUsd: number;
   skipped: number;
 }
@@ -136,6 +146,8 @@ export function replayTrace(file: string): { lines: string[]; summary: ReplaySum
     permissionDenials: 0,
     compactions: 0,
     trims: 0,
+    tasks: 0,
+    failedTasks: 0,
     costUsd: 0,
     skipped: 0,
   };
@@ -214,6 +226,14 @@ export function replayTrace(file: string): { lines: string[]; summary: ReplaySum
             `${typeof r.costUsd === "number" ? ` · $${r.costUsd.toFixed(4)}` : ""}`,
         );
         break;
+      case "task":
+        summary.tasks++;
+        if (!r.ok) summary.failedTasks++;
+        lines.push(
+          `${at} task ${r.label ?? "?"} ${r.ok ? "ok" : "FAILED"} · ${r.steps ?? 0} steps · ${r.ms ?? 0}ms` +
+            `${r.error ? ` — ${r.error}` : ""}`,
+        );
+        break;
       case "note":
         lines.push(`${at} ${r.text ?? ""}`);
         break;
@@ -228,6 +248,6 @@ export function formatReplaySummary(s: ReplaySummary): string {
   return [
     `  ${s.turns} turn(s) · ${s.steps} llm step(s) · ${s.tools} tool call(s)`,
     `  ${s.approvals} approval(s) · ${s.denials} declined · ${s.permissions} permission decision(s) · ${s.permissionDenials} denied`,
-    `  ${s.compactions} compaction(s) · ${s.trims} trim(s) · $${s.costUsd.toFixed(4)} · ${s.skipped} malformed line(s)`,
+    `  ${s.compactions} compaction(s) · ${s.trims} trim(s) · ${s.tasks} child task(s) · ${s.failedTasks} failed · $${s.costUsd.toFixed(4)} · ${s.skipped} malformed line(s)`,
   ].join("\n");
 }

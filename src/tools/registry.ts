@@ -13,6 +13,15 @@ export interface ToolContext {
    *  check matches it (see approvalSig) so an approved call runs exactly once
    *  instead of asking again on its own re-run. */
   approval?: { tool: string; sig: string; at: number };
+  /** Run trace for this run (--trace); tools may append their own records, and
+   *  fan-out children get sibling files via trace.subTrace(). */
+  trace?: import("../trace").RunTrace;
+  /** Isolated child-loop runner, injected by the REPL. Absent in contexts with
+   *  no model access (tests, daemon), where the `task` tool refuses. Type-only
+   *  import: queue-runner pulls in this module at runtime, so keep it erased. */
+  runChild?: (spec: import("../queue-runner").ChildLoopSpec) => Promise<
+    import("../queue-runner").ChildLoopResult
+  >;
 }
 
 export interface Tool {

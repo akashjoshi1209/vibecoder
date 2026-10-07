@@ -39,6 +39,20 @@ file to the GitHub release.
   through the spawn seam (enforced by a CI guard); fixed Windows `detached`
   default that silently swallowed PowerShell stdout.
 
+### Subagents: `task` fan-out + `/task`
+- New `task` tool: run 1–4 independent sub-tasks in **isolated child loops**
+  (fresh context, per-child step budget and wall-clock timeout, workspace-scope
+  unattended permissions) and join the results. One child failing, timing out
+  or demanding human approval is reported in its result — it never takes the
+  parent or its siblings down, and never blocks on a prompt.
+- Children run through the same routing/compaction/retry/permission pipeline
+  as queued tasks (`runChildLoop` in `queue-runner.ts`), record into sibling
+  trace files (`…task-N.jsonl` via `RunTrace.subTrace`), and leave one `task`
+  record per child in the parent trace (replay reports `N child task(s)`).
+- `/task <prompt> ;; <prompt> …` does the same from the REPL; `/task` alone
+  documents when parallelism is safe (disjoint files, read-only) versus when
+  it must stay serial (shared mutation: same files, git, `.env`, the queue).
+
 ### Permission model consolidation
 - Policy-free parsing/classification in `src/permissions/parse.ts`, a single
   `decide()` core with a bounded audit ring in `src/permissions.ts`, and a

@@ -1,7 +1,7 @@
 import { createProvider, loadConfig, type RootConfig } from "../llm/client";
 import { ModelRouter, classifyMessage, classifyMessageWhy, type RoutingMode } from "../llm/router";
 import { createConnectivityPoller, type ConnectivityPoller } from "../llm/connectivity";
-import { draftPlanNote, drainQueue, type QueueRunnerDeps } from "../queue-runner";
+import { draftPlanNote, drainQueue, runChildLoop, type QueueRunnerDeps } from "../queue-runner";
 import { enqueueTask, listTasks, setQueueFileOverride, type QueuedTask } from "../queue";
 import { ensureOllamaServe } from "../ollama";
 import type { Message, ChatOptions, ChatChunk, StreamResult } from "../llm/types";
@@ -11,6 +11,8 @@ import "../tools/bash";
 import "../tools/files";
 import "../tools/search";
 import "../tools/net";
+import "../tools/task";
+import "../tools/repo-install";
 import "../tools/termux";
 // tools/tailscale.ts was deleted: it also registered "tailscale_status" and was
 // shadowing network.ts, which is the better implementation.
@@ -420,6 +422,7 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/clear${colors.reset}            clear conversation + screen`);
     print(`  ${colors.green}/queue${colors.reset}            list queued offline tasks (auto-run when online)`);
     print(`  ${colors.green}/run-now${colors.reset}          drain the task queue now`);
+    print(`  ${colors.green}/task <p> ;; <p>${colors.reset} ${colors.dim}run prompts as isolated child loops in parallel (see /task)${colors.reset}`);
     print(`  ${colors.green}/help${colors.reset}             this help`);
     print(`  ${colors.dim}PageUp/PageDown${colors.reset}       scroll back through the conversation`);
     print(`  ${colors.green}ctrl-c${colors.reset}            interrupt running task · clear input · exit\n`);
@@ -838,6 +841,52 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     }
     return true;
   }
+  if (line.startsWith("/task")) {
+    const arg = line.slice("/task".length).trim();
+    if (!arg) {
+      print(`\n${colors.bold}Usage:${colors.reset} ${colors.green}/task <prompt> ;; <prompt> …${colors.reset}`);
+      print(`  Runs ${colors.bold}one isolated child loop per prompt${colors.reset}, in parallel (max 4).`);
+      print(`  Each child: its own budget (12 steps), a 120s timeout, unattended permissions`);
+      print(`  (workspace scope, nothing to prompt for), and — with --trace — a sibling`);
+      print(`  trace file (…task-N.jsonl) it records into.`);
+      print(`\n  ${colors.bold}Parallel is safe${colors.reset}:  disjoint files or areas, read-only work, research.`);
+      print(`  ${colors.bold}Keep it serial${colors.reset}:   anything mutating shared state — same files, git,`);
+      print(`  .env, the queue. Run /task once per prompt, one at a time, instead.`);
+      return true;
+    }
+    if (!router || !rootConfig) {
+      print(`${colors.red}router not initialised — try again in a moment${colors.reset}`);
+      return true;
+    }
+    const prompts = arg.split(";;").map((s) => s.trim()).filter(Boolean);
+    if (prompts.length > 4) {
+      print(`${colors.red}at most 4 prompts per /task — run the rest in a follow-up call${colors.reset}`);
+      return true;
+    }
+    print(`${colors.dim}running ${prompts.length} child loop(s) in parallel…${colors.reset}`);
+    const deps: QueueRunnerDeps = { config: rootConfig, router };
+    const startedAt = Date.now();
+    const results = await Promise.all(
+      prompts.map((p, i) =>
+        runChildLoop({ prompt: p, cwd, trace: trace?.subTrace(`task-${i + 1}`) ?? undefined }, deps),
+      ),
+    );
+    for (const [i, r] of results.entries()) {
+      const badge = r.ok ? `${colors.green}ok` : `${colors.red}FAILED`;
+      const why = r.error ? ` · ${r.error}` : "";
+      print(
+        `\n${colors.bold}child ${i + 1}${colors.reset} ${badge}${colors.reset} ` +
+          `${colors.dim}${r.steps} step(s) · ${r.toolCalls} tool call(s) · ${(r.ms / 1000).toFixed(1)}s${why}${colors.reset}`,
+      );
+      const body = (r.finalText || (r.error ? `error: ${r.error}` : "(no output)")).trim();
+      for (const l of body.split("\n")) print(`  ${l}`);
+    }
+    const okCount = results.filter((r) => r.ok).length;
+    print(
+      `\n${colors.dim}${okCount}/${results.length} children succeeded in ${((Date.now() - startedAt) / 1000).toFixed(1)}s${colors.reset}`,
+    );
+    return true;
+  }
   if (line.trim() === "/run-now" || line.trim() === "/drain") {
     if (!router || !rootConfig) {
       print(`${colors.red}router not initialised — try again in a moment${colors.reset}`);
@@ -954,7 +1003,21 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
         systemPrompt: turnSystemPrompt,
         model: turnModel,
         initialMessages: messages,
-        toolCtx: { cwd, signal: ac.signal, permissions, planPhase: thisTurnIsPlan },
+        toolCtx: {
+          cwd,
+          signal: ac.signal,
+          permissions,
+          planPhase: thisTurnIsPlan,
+          trace: trace ?? undefined,
+          // Fan-out children: built per call so a null router/config is a
+          // refusal inside the tool ("child loops not available"), not a crash.
+          runChild: (spec) => {
+            if (!router || !rootConfig) {
+              throw new Error("router not initialised");
+            }
+            return runChildLoop(spec, { config: rootConfig, router });
+          },
+        },
         signal: ac.signal,
         chatOptions: {
           temperature: chatTemperature,
@@ -967,6 +1030,20 @@ async function runPrompt(userInput: string, tui?: TUI): Promise<void> {
         // rates it needs to evaluate it.
         maxCostUsd: rootConfig?.maxCostUsd,
         costRates: ratesPerMillion(turnProviderName, turnModel),
+        // Mid-turn failover: when the active provider hits a daily quota or dies
+        // repeatedly, continue the turn on another configured side instead of
+        // stranding a half-built task. Cost rates travel with the switch so the
+        // cap keeps being evaluated against the model actually answering.
+        onProviderFailover: async () => {
+          if (!router || !rootConfig) return null;
+          const fb = router.fallbackSide({ providerName: turnProviderName, model: turnModel });
+          if (!fb) return null;
+          return {
+            provider: fb.provider.streamChat.bind(fb.provider),
+            model: fb.model,
+            costRates: ratesPerMillion(fb.providerName, fb.model),
+          };
+        },
         compactionSummary: compactionDigest,
         trace: trace ?? undefined,
       },
