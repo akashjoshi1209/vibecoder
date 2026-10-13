@@ -35,3 +35,4 @@ ellix-connect-stub/
 package-lock.json
 site/package-lock.json
 site/package.json
+.aider*

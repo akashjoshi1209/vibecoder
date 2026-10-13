@@ -1,6 +1,6 @@
-import { ContextTooLargeError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig, type TokenUsage } from "../types";
+import { ContextTooLargeError, RateLimitError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig, type TokenUsage } from "../types";
 import { withTimeout, LLMTimeoutError, type TimeoutSpec } from "../timeout";
-import { isTransientRateLimit, parseRetryAfter, sleepAbortable } from "../retry";
+import { isTransientRateLimit, isLongRateLimitWindow, parseRetryAfter, sleepAbortable } from "../retry";
 
 export class OpenAICompatibleProvider implements LLMProvider {
   constructor(private config: ProviderConfig) {}
@@ -60,6 +60,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
           });
           if (isTransientRateLimit(res.status)) {
             const text = await res.text().catch(() => "");
+            // A quota window measured in minutes-to-hours (daily/hourly token
+            // caps) cannot be out-slept by in-process retries: fail fast with
+            // a typed error so the caller can fail over to another provider.
+            if (res.status === 429 && isLongRateLimitWindow(text)) {
+              throw new RateLimitError(res.status, `Rate limited (HTTP ${res.status}): ${text.slice(0, 400)}`, true);
+            }
             if (attempt === maxAttempts - 1) {
               throw new Error(`Rate limited (HTTP ${res.status}) after ${maxAttempts} attempts: ${text.slice(0, 400)}`);
             }

@@ -30,6 +30,7 @@ import { setRuntimeIdentity, buildSelfReport, SELF_EDIT_PROTOCOL } from "../self
 import { appendLedger, restoreSelfFiles, selfFileDiffStat, ledgerSummary } from "../self-edit";
 import "../self-knowledge";
 import { createInterface } from "node:readline";
+import { copyUnlessForeign, normalizeForPrompt, readClipboard, writeClipboard } from "./clipboard";
 import { loadDotEnv } from "../env";
 import { runDoctor } from "../doctor";
 import { runSetup } from "../setup";
@@ -458,9 +459,29 @@ async function handleCommand(line: string, tui?: TUI): Promise<boolean> {
     print(`  ${colors.green}/queue${colors.reset}            list queued offline tasks (auto-run when online)`);
     print(`  ${colors.green}/run-now${colors.reset}          drain the task queue now`);
     print(`  ${colors.green}/task <p> ;; <p>${colors.reset} ${colors.dim}run prompts as isolated child loops in parallel (see /task)${colors.reset}`);
+    print(`  ${colors.green}/copy${colors.reset}             ${colors.dim}copy the reply to the clipboard (replaces what's there)${colors.reset}`);
     print(`  ${colors.green}/help${colors.reset}             this help`);
     print(`  ${colors.dim}PageUp/PageDown${colors.reset}       scroll back through the conversation`);
-    print(`  ${colors.green}ctrl-c${colors.reset}            interrupt running task · clear input · exit\n`);
+    print(
+      `  ${colors.green}ctrl-c${colors.reset}            ${
+        tui ? "interrupt running task · clear input · exit" : "interrupt a run · copy the line/reply · press twice to exit"
+      }\n`,
+    );
+    return true;
+  }
+  if (line.trim() === "/copy") {
+    const reply = lastAssistantText();
+    if (!reply) {
+      print(`${colors.dim}nothing to copy yet${colors.reset}`);
+      return true;
+    }
+    print(`${colors.dim}copying the reply (${reply.length} chars)…${colors.reset}`);
+    const ok = await writeClipboard(reply);
+    print(
+      ok
+        ? `${colors.green}copied the reply${colors.reset} ${colors.dim}(${reply.length} chars — replaces whatever was on the clipboard)${colors.reset}`
+        : `${colors.red}copy failed — clipboard unavailable${colors.reset}`,
+    );
     return true;
   }
   if (line.startsWith("/save")) {
@@ -1306,15 +1327,116 @@ function mainLine(): void {
   console.log(banner(providerName, llmModel, cwd).join("\n"));
 }
 
+/** Most recent assistant reply in the transcript — what Ctrl+C copies when the
+ *  prompt line is empty. */
+function lastAssistantText(): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant" && typeof m.content === "string" && m.content.trim()) return m.content.trim();
+  }
+  return null;
+}
+
 function mainLineInteractive(): void {
+  const PROMPT = `${colors.green}❯${colors.reset} `;
   console.log(banner(providerName, llmModel, cwd).join("\n"));
   const rl = createInterface({
     input: process.stdin,
     output: process.stdout,
   });
 
-  const ask = () =>
-    rl.question(`${colors.green}❯${colors.reset} `, async (input) => {
+  // readline's interface properties are not in the public type surface, but
+  // they are what its own echo/redraw logic is built on, and we need them to
+  // repaint the prompt line around a status message.
+  const typed = () => (rl as unknown as { line?: string }).line ?? "";
+  const cursorAt = () => (rl as unknown as { cursor?: number }).cursor ?? typed().length;
+  let asking = false;
+  let lastCtrlC = 0;
+
+  /** Print a one-line status without derailing the prompt being edited. */
+  const say = (msg: string): void => {
+    const dimmed = `${colors.dim}${msg}${colors.reset}`;
+    if (asking) {
+      const line = typed();
+      const back = line.length - cursorAt();
+      process.stdout.write(`\r\x1b[2K${dimmed}\r\n${PROMPT}${line}`);
+      if (back > 0) process.stdout.write(`\x1b[${back}D`);
+    } else {
+      process.stdout.write(`${dimmed}\r\n`);
+    }
+  };
+
+  const pasteFromClipboard = async (): Promise<void> => {
+    say("pasting…");
+    const raw = await readClipboard();
+    if (raw === null) {
+      say("clipboard unavailable");
+      return;
+    }
+    const text = normalizeForPrompt(raw);
+    if (!text) {
+      say("clipboard is empty");
+      return;
+    }
+    rl.write(text);
+    say(`pasted ${text.length} chars`);
+  };
+
+  // Ctrl+V. Terminals with their own paste binding (Windows Terminal, VS Code,
+  // xterm) deliver the text directly and never reach us; the legacy console
+  // and others send ^V (0x16), which readline ignores — so watch for it on the
+  // raw stream and pull the clipboard ourselves.
+  process.stdin.on("data", (buf: Buffer) => {
+    if (buf.includes(0x16)) void pasteFromClipboard();
+  });
+
+  // Ctrl+C used to fall through to readline's default — no SIGINT listener
+  // means "close the interface", and our close handler exits. Now it copies:
+  // the typed prompt line, or the last reply when the line is empty; twice in
+  // a row exits; during a run it interrupts, as before. The copy is guarded
+  // (copyUnlessForeign): terminals hand Ctrl+C to the app whenever no
+  // selection is active, so a stray press here used to overwrite whatever
+  // the user had copied from elsewhere — their next paste then delivered our
+  // reply instead of their own text. Now we keep their clipboard and say so.
+  rl.on("SIGINT", () => {
+    if (activeAbort) {
+      activeAbort.abort();
+      lastCtrlC = 0;
+      say("interrupting…");
+      return;
+    }
+    const now = Date.now();
+    if (now - lastCtrlC < 1500) {
+      rl.close();
+      return;
+    }
+    lastCtrlC = now;
+    const typedLine = typed().trim();
+    const payload = typedLine || lastAssistantText();
+    if (!payload) {
+      say("nothing to copy yet — ctrl+c again to exit");
+      return;
+    }
+    const what = typedLine ? "your typed line" : "the last reply";
+    say(`copying ${what} (${payload.length} chars)…`);
+    void copyUnlessForeign(payload).then((res) => {
+      if (res.action === "copied") {
+        say(`copied ${what} (${res.chars} chars) — ctrl+c again to exit`);
+      } else if (res.action === "kept") {
+        say(
+          `kept the ${res.chars} chars you copied · ctrl+c again to exit` +
+            (typedLine ? "" : " · /copy replaces them with the reply"),
+        );
+      } else {
+        say("copy failed — clipboard unavailable");
+      }
+    });
+  });
+
+  const ask = () => {
+    asking = true;
+    rl.question(PROMPT, async (input) => {
+      asking = false;
       const line = input.trim();
       if (!line) return ask();
       try {
@@ -1325,6 +1447,7 @@ function mainLineInteractive(): void {
       }
       ask();
     });
+  };
   rl.on("close", () => {
     process.stdout.write("\n");
     process.exit(0);
@@ -1345,6 +1468,13 @@ function printUsage(): void {
   console.log("  vibecoder doctor             check install, config, providers, connectivity");
   console.log("  vibecoder queue [start|status|stop]   run the queue daemon (vibecoder-queue)");
   console.log("  vibecoder mcp            serve this install's tools over MCP stdio (JSON-RPC, for MCP hosts)");
+  console.log("");
+  console.log("Keys:");
+  console.log("  Ctrl+C   copy — the line you typed, or the last reply if it's empty; it never");
+  console.log("           replaces text you copied elsewhere (/copy forces it); press twice");
+  console.log("           to exit; during a run it interrupts instead");
+  console.log("  Ctrl+V   paste the clipboard into the prompt (newlines become spaces)");
+  console.log("  Ctrl+U   clear the prompt · Ctrl+D or /exit quits");
   console.log("");
   console.log("Options:");
   console.log("  --provider <name>   pick provider (groq, ollama, openai, anthropic, nvidia…)");

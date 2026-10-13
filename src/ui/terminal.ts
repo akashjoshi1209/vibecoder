@@ -3,7 +3,7 @@ import fs from "node:fs";
 
 export type KeyEvent =
   | { kind: "char"; char: string }
-  | { kind: "enter" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" | "tab" | "esc" | "ctrl-c" | "ctrl-l" | "ctrl-w" | "ctrl-u" | "ctrl-right" | "ctrl-left" }
+  | { kind: "enter" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown" | "tab" | "esc" | "ctrl-c" | "ctrl-v" | "ctrl-l" | "ctrl-w" | "ctrl-u" | "ctrl-right" | "ctrl-left" }
   | { kind: "scrollup" | "scrolldown" }
   | { kind: "unknown"; raw: string };
 
@@ -303,6 +303,8 @@ function singleKey(b: number): KeyEvent {
       return { kind: "tab" };
     case 0x03:
       return { kind: "ctrl-c" };
+    case 0x16:
+      return { kind: "ctrl-v" };
     case 0x0c:
       return { kind: "ctrl-l" };
     case 0x17:

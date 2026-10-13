@@ -1,4 +1,4 @@
-import { ContextTooLargeError, type ChatOptions, type Message, type StreamResult, type ToolCall } from "../llm/types";
+import { ContextTooLargeError, RateLimitError, type ChatOptions, type Message, type StreamResult, type ToolCall } from "../llm/types";
 import { listTools, executeTool, needsApproval, type ToolContext } from "../tools/registry";
 import {
   approvalSig,
@@ -17,6 +17,7 @@ import {
 } from "../llm/compact";
 import { numberSetting } from "../runtime";
 import { RatePacer, paceWait } from "../llm/pace";
+import { parseContextGap } from "../llm/retry";
 import type { RunTrace } from "../trace";
 
 export interface AgentCallbacks {
@@ -58,6 +59,8 @@ export interface AgentResult {
    *  the session and hand it back as `compactionSummary` on the next turn so
    *  folded-away findings survive resume instead of evaporating. */
   compactionSummary?: string;
+  /** Model the turn failed over to, when onProviderFailover fired. */
+  failoverTo?: string;
 }
 
 /**
@@ -146,6 +149,17 @@ export async function runAgent(
     compactionSummary?: string;
     /** Structured run trace (JSONL); written best-effort, never throws. */
     trace?: RunTrace;
+    /** Mid-turn provider failover. Called at most once per turn, when the
+     *  active provider hits a long rate-limit window (daily/hourly quota) or
+     *  exhausts its consecutive-failure budget. Return the replacement
+     *  provider + model (and cost rates, since pricing is per-provider) or
+     *  null to keep reporting failures on the primary. The loop has no
+     *  provider knowledge of its own, so the wiring lives with the caller. */
+    onProviderFailover?: (reason: string, lastError: string) => Promise<{
+      provider: (opts: ChatOptions, onChunk: (c: any) => void) => Promise<StreamResult>;
+      model: string;
+      costRates?: { input: number; output: number; reasoning?: number };
+    } | null>;
   },
   callbacks: AgentCallbacks = {},
 ): Promise<AgentResult> {
@@ -196,6 +210,17 @@ export async function runAgent(
   const MAX_STEP_RETRIES = 2;
   const MAX_CONSECUTIVE_FAILURES = 3;
   let consecutiveFailures = 0;
+  // The provider's own words for the last failed step. The old loop counted
+  // failures but discarded the reason, so "stopped after 3 consecutive LLM
+  // failures" was all the user ever saw — indistinguishable between a daily
+  // token quota and a dead network.
+  let lastStepError = "";
+  let lastRateLimitLong = false;
+  let failoverTried = false;
+  let failoverTo: string | undefined;
+  // Active provider/model for the turn; swapped by the failover path below.
+  let activeProvider = options.provider;
+  let activeModel = options.model;
   const stepSummaries: string[] = [];
 
   // Running token totals for the whole turn. Accumulated per successful step
@@ -208,7 +233,10 @@ export async function runAgent(
   const usageOrUndefined = () =>
     sawUsage ? { promptTokens, completionTokens, reasoningTokens } : undefined;
   const costCap = options.maxCostUsd;
-  const rates = options.costRates;
+  // `let` so a mid-turn failover can swap in the fallback provider's rates:
+  // pricing is per-provider and the cap must keep being evaluated against the
+  // model actually answering, not the one the turn started on.
+  let rates = options.costRates;
   const spentUsd = () =>
     rates
       ? (promptTokens * rates.input +
@@ -244,8 +272,8 @@ export async function runAgent(
     const source = history.slice(plan.start, plan.end);
     // The summarizer call is a real request on the same per-minute budget.
     await paceWait(pacer, plan.tokens, options.signal);
-    const summary = await summarizeHistory(options.provider, {
-      model: options.model,
+    const summary = await summarizeHistory(activeProvider, {
+      model: activeModel,
       source,
       existing: compaction?.summary,
       budgetTokens: effectiveBudget(),
@@ -283,7 +311,8 @@ export async function runAgent(
       costCapHit: r.costCapHit ?? null,
       costUsd: sawUsage ? spentUsd() : null,
     });
-    return compaction ? { ...r, compactionSummary: compaction.summary } : r;
+    const out = compaction ? { ...r, compactionSummary: compaction.summary } : r;
+    return failoverTo ? { ...out, failoverTo } : out;
   };
 
   options.trace?.write({ kind: "turn.start", model: options.model, cwd: options.toolCtx.cwd });
@@ -320,13 +349,17 @@ export async function runAgent(
 
     // Step-level retry: transient network/provider errors are retried up to
     // MAX_STEP_RETRIES times before counting as a consecutive failure.
-    for (let attempt = 0; attempt <= MAX_STEP_RETRIES && !stepOk; attempt++) {
+    // Labeled so a long-window rate limit can abandon ALL attempts at once:
+    // a bare break would only exit the inner rebuild loop and the outer
+    // attempt loop would re-request a still-exhausted endpoint.
+    attemptLoop: for (let attempt = 0; attempt <= MAX_STEP_RETRIES && !stepOk; attempt++) {
       retryBudgetDelta = 0;
       // One soft (watermark) and one hard (ContextTooLarge) compaction attempt
       // per call attempt — enough to relieve pressure, bounded so a broken
       // summarizer cannot loop.
       let watermarkTried = false;
       let forceTried = false;
+      let gapTried = false;
       // ContextTooLarge retry: try once more with a tighter budget before giving up.
       for (;;) {
         // Rebuild the working set from history every attempt: this is where a
@@ -350,7 +383,7 @@ export async function runAgent(
         }
 
         const chatOpts: ChatOptions = {
-          model: options.model,
+          model: activeModel,
           messages,
           tools: toolDefs,
           signal: options.signal,
@@ -361,7 +394,7 @@ export async function runAgent(
         try {
           await paceWait(pacer, estimateRequestTokens(), options.signal);
 
-          result = await options.provider(chatOpts, (chunk) => {
+          result = await activeProvider(chatOpts, (chunk) => {
             if (chunk.reasoning) callbacks.onReasoning?.(chunk.reasoning);
             if (chunk.content) callbacks.onModelText?.(chunk.content);
           });
@@ -387,11 +420,26 @@ export async function runAgent(
           });
           break; // success
         } catch (err: any) {
+          // Keep the provider's own reason for the failure report and the
+          // failover decision below.
+          lastStepError = err?.message ?? String(err);
+          if (err instanceof RateLimitError && err.longWindow) lastRateLimitLong = true;
           if (err instanceof ContextTooLargeError) {
-            // Hard overflow: folding the middle into a digest shrinks the
-            // request for real (a tighter trim delta only squeezes harder on
-            // what is left). Try that before falling back to the old
-            // delta-512 retry.
+            // Hard overflow. The provider often says exactly how much to shed
+            // ("Limit 8000, Requested 9555"): shrink the request by the gap +
+            // headroom instead of a blind 512 that never catches up when a big
+            // write just landed in history.
+            if (!gapTried) {
+              gapTried = true;
+              const gap = parseContextGap(lastStepError);
+              if (gap) {
+                retryBudgetDelta = Math.min(12_000, Math.ceil(gap * 1.15) + 256);
+                continue; // rebuilt at loop top with the tighter budget
+              }
+            }
+            // No usable gap figures: fold the middle into a digest, which
+            // shrinks the request for real (a tighter trim delta only squeezes
+            // harder on what is left).
             if (!forceTried) {
               forceTried = true;
               if (await compactNow(true)) continue; // rebuilt at loop top
@@ -405,6 +453,13 @@ export async function runAgent(
             callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "aborted" });
             return withState({ finalText: "\n[interrupted]", toolCalls, steps: step, aborted: true, usage: usageOrUndefined() });
           }
+          // A long quota window cannot be out-slept by in-process retries:
+          // abandon every remaining attempt so the failover decision below
+          // happens on the FIRST failure, not after MAX_STEP_RETRIES pointless
+          // re-requests of a still-exhausted endpoint.
+          if (err instanceof RateLimitError && err.longWindow) {
+            break attemptLoop;
+          }
           // For transient errors, let the step-retry loop handle it.
           break; // will retry if attempts remain
         }
@@ -414,14 +469,40 @@ export async function runAgent(
     if (!stepOk || !result) {
       // All step-level retries exhausted for this step.
       consecutiveFailures++;
-      // Show the error to the user so failures are never silent.
-      const failMsg = `[step ${step + 1}: LLM call failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} consecutive)]`;
+      // Show the error to the user so failures are never silent — including
+      // the provider's own reason, which used to be dropped on the floor.
+      const failMsg = `[step ${step + 1}: LLM call failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES} consecutive): ${lastStepError || "unknown error"}]`;
       callbacks.onModelText?.(`\n${failMsg}\n`);
+      // Mid-turn failover: a long quota window (daily/hourly token cap) or
+      // repeated consecutive failures will not heal by retrying the same
+      // endpoint. At most one switch per turn, and only when the caller
+      // supplied a fallback provider.
+      if (
+        !failoverTried &&
+        options.onProviderFailover &&
+        (lastRateLimitLong || consecutiveFailures >= MAX_CONSECUTIVE_FAILURES)
+      ) {
+        failoverTried = true;
+        const why = lastRateLimitLong ? "rate limit" : "repeated LLM failures";
+        const fb = await options.onProviderFailover(why, lastStepError);
+        if (fb) {
+          activeProvider = fb.provider;
+          activeModel = fb.model;
+          if (fb.costRates) rates = fb.costRates;
+          failoverTo = fb.model;
+          consecutiveFailures = 0;
+          lastRateLimitLong = false;
+          const note = `[switched to ${fb.model} after ${why}${lastStepError ? ` — ${lastStepError}` : ""}]`;
+          callbacks.onModelText?.(`\n${note}\n`);
+          options.trace?.write({ kind: "note", text: note });
+          continue;
+        }
+      }
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         const summary = stepSummaries.length
           ? `\nLast steps: ${stepSummaries.slice(-3).join("; ")}`
           : "";
-        const finalMsg = `(stopped after ${consecutiveFailures} consecutive LLM failures — check your network and provider status.${summary})`;
+        const finalMsg = `(stopped after ${consecutiveFailures} consecutive LLM failures — last error: ${lastStepError || "unknown"}.${summary})`;
         callbacks.onModelText?.(`${finalMsg}\n`);
         callbacks.onDone?.({ text: "", toolCalls: [], finishReason: "error" });
         return withState({

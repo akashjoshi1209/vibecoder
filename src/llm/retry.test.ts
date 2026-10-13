@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseRetryAfter, sleepAbortable, isTransientRateLimit } from "./retry";
+import { parseRetryAfter, sleepAbortable, isTransientRateLimit, isLongRateLimitWindow, parseContextGap } from "./retry";
 
 describe("parseRetryAfter", () => {
   test("honors the Retry-After header", () => {
@@ -19,6 +19,35 @@ describe("parseRetryAfter", () => {
     expect(parseRetryAfter(res, "no hint")).toBe(5000);
     expect(parseRetryAfter(res, "try again in 12345s")).toBe(60_000);
     expect(parseRetryAfter(res, "try again in 0.2s")).toBe(1000);
+  });
+
+  test("parses minute-composite windows (Groq TPD wording)", () => {
+    const res = { headers: { get: () => null } };
+    // The exact wording from a real Groq daily-quota 429. The old parser read
+    // this as 22 seconds and burned every retry against a 27-minute window.
+    const body =
+      "Rate limit reached for model `qwen/qwen3.8-27b` on tokens per day (TPD): Limit 200000, Used 199314. Please try again in 27m22.464s.";
+    expect(parseRetryAfter(res, body)).toBe(60_000); // clamped max
+  });
+
+  test("parses hour-composite windows", () => {
+    const res = { headers: { get: () => null } };
+    expect(parseRetryAfter(res, "try again in 2h5m30s")).toBe(60_000); // clamped max
+  });
+
+  test("bare-minute windows parse as minutes, not seconds", () => {
+    const res = { headers: { get: () => null } };
+    expect(parseRetryAfter(res, "try again in 5m")).toBe(60_000); // clamped max
+    expect(parseRetryAfter(res, "try again in 0.5m")).toBe(30_000);
+  });
+
+  test("millisecond windows parse as milliseconds, not minutes", () => {
+    const res = { headers: { get: () => null } };
+    // Real Groq TPM wording. Parsed as 825 minutes it falsely triggered the
+    // long-window fail-over for a hiccup that heals in under a second.
+    expect(parseRetryAfter(res, "Please try again in 825ms. Need more tokens?")).toBe(1000);
+    expect(parseRetryAfter(res, "try again in 1500ms")).toBe(1500);
+    expect(isLongRateLimitWindow("Please try again in 825ms.")).toBe(false);
   });
 });
 
@@ -54,5 +83,36 @@ describe("isTransientRateLimit", () => {
     expect(isTransientRateLimit(200)).toBe(false);
     expect(isTransientRateLimit(401)).toBe(false);
     expect(isTransientRateLimit(500)).toBe(false);
+  });
+});
+
+describe("parseContextGap", () => {
+  test("parses Requested/Limit out of a real Groq 413 body", () => {
+    const body =
+      'Request too large for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 8000, Requested 9555, please reduce your message size and try again.';
+    expect(parseContextGap(body)).toBe(1555);
+  });
+
+  test("returns null when the request actually fits", () => {
+    expect(parseContextGap("Limit 8000, Requested 7100")).toBeNull();
+    expect(parseContextGap("Limit 8000, Requested 8000")).toBeNull();
+  });
+
+  test("returns null when figures are missing or malformed", () => {
+    expect(parseContextGap("no numbers here")).toBeNull();
+    expect(parseContextGap("Requested abc, Limit 8000")).toBeNull();
+    expect(parseContextGap("Requested 9555")).toBeNull();
+  });
+});
+
+describe("isLongRateLimitWindow", () => {
+  test("flags daily/hourly quota wording as a long window", () => {
+    expect(isLongRateLimitWindow("Please try again in 27m22.464s.")).toBe(true);
+    expect(isLongRateLimitWindow("Please try again in 2h5m.")).toBe(true);
+  });
+
+  test("short windows are not long", () => {
+    expect(isLongRateLimitWindow("Please try again in 19.02s.")).toBe(false);
+    expect(isLongRateLimitWindow("no hint at all")).toBe(false);
   });
 });

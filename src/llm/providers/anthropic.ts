@@ -1,6 +1,6 @@
-import { ContextTooLargeError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig } from "../types";
+import { ContextTooLargeError, RateLimitError, type ChatOptions, type ChatChunk, type StreamResult, type ToolCall, type LLMProvider, type ProviderConfig } from "../types";
 import { withTimeout, LLMTimeoutError, type TimeoutSpec } from "../timeout";
-import { isTransientRateLimit, parseRetryAfter, sleepAbortable } from "../retry";
+import { isTransientRateLimit, isLongRateLimitWindow, parseRetryAfter, sleepAbortable } from "../retry";
 import { parseToolArguments } from "../args";
 
 export function mapToAnthropic(messages: ChatOptions["messages"]): any[] {
@@ -100,6 +100,11 @@ export class AnthropicProvider implements LLMProvider {
           });
           if (isTransientRateLimit(res.status)) {
             const text = await res.text().catch(() => "");
+            // Same fail-fast as the OpenAI-compatible provider: a quota window
+            // measured in minutes-to-hours is hopeless to out-sleep.
+            if (res.status === 429 && isLongRateLimitWindow(text)) {
+              throw new RateLimitError(res.status, `Rate limited (HTTP ${res.status}): ${text.slice(0, 400)}`, true);
+            }
             if (attempt === maxAttempts - 1) {
               throw new Error(`Rate limited (HTTP ${res.status}) after ${maxAttempts} attempts: ${text.slice(0, 400)}`);
             }

@@ -257,6 +257,30 @@ export class ModelRouter {
     return { provider: this.heavy.providerName, model: this.heavy.model };
   }
 
+  /** A provider to fail over to mid-turn when the active side dies — the
+   *  other cloud routing side when there is one, the offline/local model only
+   *  as a last resort. Used by the agent loop's onProviderFailover: a daily
+   *  token quota or a dead endpoint must not end a heavy task that another
+   *  configured model could finish. `from` is the side that failed
+   *  (providerName + model), so it is never handed back; null when no distinct
+   *  side exists to switch to. */
+  fallbackSide(from?: { providerName?: string; model?: string }): {
+    provider: LLMProvider;
+    providerName: string;
+    model: string;
+  } | null {
+    const same = (side: { providerName: string; model: string }) =>
+      !!from && side.providerName === from.providerName && side.model === from.model;
+    // Cloud first: the offline model is a plan-B that often cannot actually
+    // do heavy coding work, so it must not be preferred over a cloud peer.
+    const candidates = [this.heavy, this.chat, this.offline];
+    for (const side of candidates) {
+      if (!side || same(side)) continue;
+      return { ...side };
+    }
+    return null;
+  }
+
   offlineIdentity(): { provider: string; model: string } | null {
     if (!this.offline) return null;
     return { provider: this.offline.providerName, model: this.offline.model };

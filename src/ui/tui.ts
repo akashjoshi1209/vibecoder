@@ -1,4 +1,5 @@
 import { KeyReader, type KeyEvent, ansi, disableMouse, displayWidth, enableMouse, enableRawMode, getSize, out, paint, restoreTerminal, wrapAnsi, wrapText } from "./terminal";
+import { normalizeForPrompt, readClipboard } from "./clipboard";
 import { theme } from "./present/theme";
 
 export type ConfirmAnswer = "yes" | "no" | "all";
@@ -41,7 +42,7 @@ export class TUI {
   approveMode: "off" | "on" = "off";
   private running = true;
   private keyHandler: ((ev: KeyEvent) => void) | null = null;
-  private commands = ["help", "clear", "provider", "model", "approve", "exit"];
+  private commands = ["help", "copy", "clear", "provider", "model", "approve", "exit"];
   private promptOverride: string | null = null;
 
   constructor(rows: number, cols: number, private callbacks: TUICallbacks) {
@@ -191,6 +192,20 @@ export class TUI {
           this.close();
           process.exit(0);
         }
+        break;
+      case "ctrl-v":
+        // Paste: terminals with a native paste binding send the text directly
+        // (and it lands char-by-char through "char"); ^V arrives here instead.
+        void readClipboard().then((raw) => {
+          const text = raw === null ? null : normalizeForPrompt(raw);
+          if (text) {
+            this.input = this.input.slice(0, this.cursor) + text + this.input.slice(this.cursor);
+            this.cursor += text.length;
+          } else {
+            this.setStatus(raw === null ? "clipboard unavailable" : "clipboard is empty", 8);
+          }
+          this.render();
+        });
         break;
       case "ctrl-l":
         this.render();

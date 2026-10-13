@@ -92,3 +92,17 @@ export class ContextTooLargeError extends Error {
     this.status = status;
   }
 }
+
+/** A 429 that survived every in-process retry. `longWindow` marks a daily/
+ *  hourly quota (reset in minutes-to-hours) — retrying the same endpoint is
+ *  hopeless, so callers fail over to another provider or surface the error. */
+export class RateLimitError extends Error {
+  readonly status: number;
+  readonly longWindow: boolean;
+  constructor(status: number, message: string, longWindow: boolean) {
+    super(message);
+    this.name = "RateLimitError";
+    this.status = status;
+    this.longWindow = longWindow;
+  }
+}
